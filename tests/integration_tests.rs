@@ -28,24 +28,48 @@ fn should_ignore_session(session: &Session) -> bool {
 // ==================== Layout Restoration Tests ====================
 // NOTE: Detach/attach only works for remote sessions (not local)
 
-// TODO: Detach/attach tests disabled - terminals from activate aren't getting
-// the "i3mux-terminal" mark, causing detach to fail with "No i3mux terminals found"
-// even though windows exist. This needs investigation in i3mux's terminal marking
-// logic for remote sessions.
-//
-// #[test]
-// #[ignore]
-// fn test_remote_detach_attach_hsplit() -> Result<()> {
-//     // Test would verify detach saves session, workspace empties, and attach restores
-//     Ok(())
-// }
+#[test]
+fn test_remote_detach_attach() -> Result<()> {
+    // Test detach/attach with remote session
+    let env = TestEnvironment::new()?;
 
-// #[test]
-// #[ignore]
-// fn test_remote_detach_attach_complex() -> Result<()> {
-//     // Test would verify detach/attach with multi-terminal layouts
-//     Ok(())
-// }
+    env.cleanup_workspace("11")?;
+    env.i3_exec("workspace 11")?;
+
+    // Activate remote i3mux session (gives us first terminal via SSH)
+    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "11")?;
+    std::thread::sleep(Duration::from_secs(3)); // Wait for SSH terminal
+
+    // Get initial window count (should be 1 from activate)
+    let initial_windows = env.get_workspace_windows()?;
+    let initial_count = initial_windows.len();
+    assert!(initial_count >= 1, "Should have at least 1 terminal from activate");
+
+    // Detach session (this saves layout and kills terminals)
+    env.i3mux_detach("ws11")?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify workspace is now empty
+    let windows_after_detach = env.get_workspace_windows()?;
+    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
+
+    // Attach session back (this should restore layout)
+    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws11")?;
+    std::thread::sleep(Duration::from_secs(3)); // Wait for restoration
+
+    // Verify windows are restored
+    let windows_after_attach = env.get_workspace_windows()?;
+    assert_eq!(
+        windows_after_attach.len(),
+        initial_count,
+        "Should restore same number of windows"
+    );
+
+    println!("✓ Remote detach/attach test passed (detached {} terminals, restored {})",
+        initial_count, windows_after_attach.len());
+
+    Ok(())
+}
 
 // ==================== Remote Session Tests ====================
 // NOTE: Remote session tests are handled via parameterized tests above

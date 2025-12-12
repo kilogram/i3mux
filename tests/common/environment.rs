@@ -165,6 +165,14 @@ impl TestEnvironment {
         Ok(windows)
     }
 
+    pub fn get_window_info(&self, window_id: u64) -> Result<String> {
+        let output = self.container_mgr.exec_in_xephyr(&format!(
+            r#"DISPLAY=:99 i3-msg -t get_tree | jq -r '.. | select(.window? == {}) | {{name: .name, marks: .marks}}'"#,
+            window_id
+        ))?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     // ==================== Screenshot Operations ====================
 
     /// Capture a screenshot of the Xephyr display

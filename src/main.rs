@@ -461,14 +461,10 @@ fn terminal() -> Result<()> {
         return launch_normal_terminal();
     }
 
-    // Check focused window type
-    if is_i3mux_terminal(&mut conn)? {
-        launch_i3mux_terminal(&ws_name)?;
-    } else if is_terminal_window(&mut conn)? {
-        launch_normal_terminal()?;
-    } else {
-        launch_normal_terminal()?;
-    }
+    // Workspace is i3mux-bound - always launch i3mux terminal
+    // (The old logic checked focused window type, but that doesn't make sense:
+    //  if the workspace is bound to i3mux, ALL terminals should be i3mux terminals)
+    launch_i3mux_terminal(&ws_name)?;
 
     Ok(())
 }
@@ -606,12 +602,22 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
             format!("{}{}:{}{}", MARKER, ws_state.host, socket, MARKER)
         };
 
+        // Escape the title for use in PROMPT_COMMAND (needs extra escaping for SSH)
+        let title_for_prompt = title.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$");
+
         let attach_cmd = if ws_state.session_type == "local" {
-            format!("abduco -A /tmp/{} bash", socket)
-        } else {
+            // Local: Use --norc to prevent bashrc from overriding title, and set PROMPT_COMMAND
+            let prompt_cmd_val = format!("echo -ne \\\"\\\\033]0;{}\\\\007\\\"", title_for_prompt);
             format!(
-                "TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'abduco -A /tmp/{} bash'",
-                ws_state.host, socket
+                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} bash --norc""#,
+                prompt_cmd_val, socket
+            )
+        } else {
+            // Remote: Set PROMPT_COMMAND to maintain title through SSH, use --norc to prevent bashrc from overriding
+            let remote_prompt_cmd = format!("\\\\033]0;{}\\\\007", title_for_prompt);
+            format!(
+                r#"TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'export PROMPT_COMMAND='"'"'echo -ne \"{}\"'"'"'; exec abduco -A /tmp/{} bash --norc'"#,
+                ws_state.host, remote_prompt_cmd, socket
             )
         };
 
@@ -655,10 +661,23 @@ ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p {host} "
 
     state.save()?;
 
-    let wrapper = format!(
-        r#"echo -ne '\033]0;{}\007'; {}; {}echo 'Session ended.'"#,
-        title, attach_cmd, cleanup_cmd
-    );
+    let ws_state = state.workspaces.get(ws_name).unwrap();
+
+    // Create wrapper script
+    // For remote sessions, set PROMPT_COMMAND to maintain title through SSH
+    // For local sessions, just set title once at start
+    let wrapper = if ws_state.session_type == "remote" {
+        let title_escape = format!("\\033]0;{}\\007", title);
+        format!(
+            r#"export PROMPT_COMMAND='echo -ne "{}"'; echo -ne '\033]0;{}\007'; {}; {}echo 'Session ended.'"#,
+            title_escape, title, attach_cmd, cleanup_cmd
+        )
+    } else {
+        format!(
+            r#"echo -ne '\033]0;{}\007'; {}; {}echo 'Session ended.'"#,
+            title, attach_cmd, cleanup_cmd
+        )
+    };
 
     Command::new(get_terminal_command())
         .arg("-T")
@@ -670,10 +689,29 @@ ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p {host} "
         .spawn()
         .context("Failed to launch i3mux terminal")?;
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
+    // Wait for window to appear and mark it
+    // For SSH connections, this can take longer, so retry with backoff
     let mut conn = I3Connection::connect()?;
-    conn.run_command(&format!("[title=\"{}\"] mark --add i3mux-terminal", title))?;
+    let mut attempts = 0;
+    let max_attempts = 20; // Up to 2 seconds (20 * 100ms)
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Try to mark the window
+        let mark_cmd = format!("[title=\"{}\"] mark --add i3mux-terminal", title);
+        let result = conn.run_command(&mark_cmd)?;
+
+        // Check if the command succeeded (window was found)
+        if result.outcomes.iter().any(|o| o.success) {
+            break;
+        }
+
+        attempts += 1;
+        if attempts >= max_attempts {
+            anyhow::bail!("Failed to find window with title '{}' after {} attempts", title, attempts);
+        }
+    }
 
     Ok(())
 }
@@ -716,9 +754,24 @@ fn restore_layout(
             .arg(&wrapper)
             .spawn()?;
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wait for window to appear with retry logic (SSH connections can be slow)
+        let mut attempts = 0;
+        let max_attempts = 20; // Up to 2 seconds
 
-        conn.run_command(&format!("[title=\"{}\"] mark --add i3mux-terminal", title))?;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let result = conn.run_command(&format!("[title=\"{}\"] mark --add i3mux-terminal", title))?;
+
+            if result.outcomes.iter().any(|o| o.success) {
+                break;
+            }
+
+            attempts += 1;
+            if attempts >= max_attempts {
+                anyhow::bail!("Failed to find window with title '{}' during layout restore", title);
+            }
+        }
 
         // Execute layout command if available
         if i < commands.len() {

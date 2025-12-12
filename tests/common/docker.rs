@@ -41,6 +41,9 @@ impl ContainerManager {
         // Copy i3mux binary and test scripts into containers
         mgr.setup_container_files()?;
 
+        // Setup networking - add remote container to xephyr's hosts file
+        mgr.setup_networking()?;
+
         Ok(mgr)
     }
 
@@ -82,6 +85,80 @@ impl ContainerManager {
 
         self.exec_in_xephyr("chmod +x /opt/i3mux-test/color-scripts/color-fill.sh")?;
 
+        // Copy SSH keys for remote connections
+        self.exec_in_xephyr("mkdir -p /root/.ssh/sockets")?;
+
+        let ssh_key = PathBuf::from(manifest_dir).join("tests/docker/ssh-keys/id_rsa");
+        let ssh_pub = PathBuf::from(manifest_dir).join("tests/docker/ssh-keys/id_rsa.pub");
+
+        Command::new(&docker_cmd)
+            .args(&[
+                "cp",
+                ssh_key.to_str().unwrap(),
+                &format!("{}:/root/.ssh/id_rsa", xvfb_id),
+            ])
+            .status()
+            .context("Failed to copy SSH private key to xvfb container")?;
+
+        Command::new(&docker_cmd)
+            .args(&[
+                "cp",
+                ssh_pub.to_str().unwrap(),
+                &format!("{}:/root/.ssh/id_rsa.pub", xvfb_id),
+            ])
+            .status()
+            .context("Failed to copy SSH public key to xvfb container")?;
+
+        // Set proper permissions for SSH keys
+        self.exec_in_xephyr("chmod 600 /root/.ssh/id_rsa")?;
+        self.exec_in_xephyr("chmod 644 /root/.ssh/id_rsa.pub")?;
+        self.exec_in_xephyr("chmod 700 /root/.ssh")?;
+
+        // Create SSH config (overwrite the one from Dockerfile to ensure proper settings)
+        let ssh_config = r#"
+Host i3mux-remote-ssh
+  HostName i3mux-remote-ssh
+  User testuser
+  Port 22
+  IdentityFile /root/.ssh/id_rsa
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  ControlMaster auto
+  ControlPath /root/.ssh/sockets/%r@%h:%p
+  ControlPersist 600
+"#;
+
+        let config_cmd = format!(
+            "cat > /root/.ssh/config << 'EOF'\n{}EOF\nchmod 600 /root/.ssh/config",
+            ssh_config
+        );
+        self.exec_in_xephyr(&config_cmd)?;
+
+        // Copy public key to remote container for SSH authentication
+        let remote_id = self.remote_container.id();
+
+        // Create .ssh directory for testuser
+        Command::new(&docker_cmd)
+            .args(&["exec", remote_id, "bash", "-c", "mkdir -p /home/testuser/.ssh && chown testuser:testuser /home/testuser/.ssh && chmod 700 /home/testuser/.ssh"])
+            .status()
+            .context("Failed to create .ssh directory in remote container")?;
+
+        // Copy public key to remote container
+        Command::new(&docker_cmd)
+            .args(&[
+                "cp",
+                ssh_pub.to_str().unwrap(),
+                &format!("{}:/home/testuser/.ssh/authorized_keys", remote_id),
+            ])
+            .status()
+            .context("Failed to copy public key to remote container")?;
+
+        // Set proper permissions on authorized_keys
+        Command::new(&docker_cmd)
+            .args(&["exec", remote_id, "bash", "-c", "chown testuser:testuser /home/testuser/.ssh/authorized_keys && chmod 600 /home/testuser/.ssh/authorized_keys"])
+            .status()
+            .context("Failed to set permissions on authorized_keys in remote container")?;
+
         Ok(())
     }
 
@@ -117,6 +194,40 @@ impl ContainerManager {
         } else {
             println!("✓ Using cached container images");
         }
+
+        Ok(())
+    }
+
+    fn setup_networking(&self) -> Result<()> {
+        let docker_cmd = Self::get_docker_cmd();
+        let remote_id = self.remote_container.id();
+
+        // Get the IP address of the remote container
+        let inspect_output = Command::new(&docker_cmd)
+            .args(&[
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                remote_id,
+            ])
+            .output()
+            .context("Failed to inspect remote container")?;
+
+        let remote_ip = String::from_utf8_lossy(&inspect_output.stdout)
+            .trim()
+            .to_string();
+
+        if remote_ip.is_empty() {
+            anyhow::bail!("Could not get IP address of remote container");
+        }
+
+        // Add the remote container's IP to xephyr's /etc/hosts
+        let hosts_entry = format!("{} i3mux-remote-ssh", remote_ip);
+        let add_hosts_cmd = format!("echo '{}' >> /etc/hosts", hosts_entry);
+
+        self.exec_in_xephyr(&add_hosts_cmd)?;
+
+        println!("✓ Configured network: {} -> {}", "i3mux-remote-ssh", remote_ip);
 
         Ok(())
     }
