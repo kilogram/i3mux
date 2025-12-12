@@ -141,8 +141,19 @@ impl TestEnvironment {
 
     /// Get list of window IDs in current workspace
     pub fn get_workspace_windows(&self) -> Result<Vec<u64>> {
+        // Get focused workspace number first
+        let ws_output = self.container_mgr.exec_in_xephyr(
+            "DISPLAY=:99 i3-msg -t get_workspaces | jq -r '.[] | select(.focused==true) | .num'"
+        )?;
+
+        let ws_num = String::from_utf8_lossy(&ws_output.stdout)
+            .trim()
+            .parse::<i32>()
+            .context("Failed to get focused workspace number")?;
+
+        // Get windows in that workspace
         let output = self.container_mgr.exec_in_xephyr(
-            "DISPLAY=:99 i3-msg -t get_tree | grep -Po '\"window\":\\K[0-9]+'"
+            &format!(r#"DISPLAY=:99 i3-msg -t get_tree | jq -r '.. | select(.type? == "workspace" and .num? == {}) | .. | select(.window? != null and .window? != 0) | .window'"#, ws_num)
         )?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);

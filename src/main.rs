@@ -39,6 +39,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Activate i3mux for current workspace
+    Activate {
+        /// Remote host (for remote sessions)
+        #[arg(short, long)]
+        remote: Option<String>,
+
+        /// Session name (optional)
+        #[arg(short, long)]
+        session: Option<String>,
+    },
+
     /// Detach current workspace and save session to remote
     Detach {
         /// Session name to save as
@@ -152,6 +163,9 @@ fn main() -> Result<()> {
         None => {
             // Default: activate current workspace
             activate(cli.remote, cli.session)
+        }
+        Some(Commands::Activate { remote, session }) => {
+            activate(remote.or(cli.remote), session.or(cli.session))
         }
         Some(Commands::Detach { session }) => detach(session),
         Some(Commands::Attach {
