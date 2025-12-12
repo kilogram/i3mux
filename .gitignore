@@ -3,3 +3,10 @@ Cargo.lock
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Test artifacts
+/tests/test-output/
+/tests/screenshots/
+
+# Backup files
+*.bak

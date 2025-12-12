@@ -1,0 +1,8 @@
+name = "Simple comparison (fuzzy only)"
+
+# No exact regions - just fuzzy matching across entire image
+
+[fuzzy_boundaries]
+tolerance_px = 5
+max_diff_pixels = 5000
+max_diff_percentage = 3.0

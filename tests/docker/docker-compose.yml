@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  i3mux-test-xephyr:
+    build:
+      context: .
+      dockerfile: Dockerfile.xephyr
+    container_name: i3mux-test-xephyr
+    hostname: i3mux-test-xephyr
+    networks:
+      - i3mux-test-net
+    environment:
+      - DISPLAY=:99
+      - XAUTHORITY=/tmp/.Xauthority
+    volumes:
+      - ../../target/debug/i3mux:/usr/local/bin/i3mux:ro,z
+      - ../color-scripts:/opt/i3mux-test/color-scripts:ro,z
+      - ../screenshots:/tmp/screenshots:z
+      - ./ssh-keys:/root/.ssh:ro,z
+    tmpfs:
+      - /tmp:exec
+    command: /opt/i3mux-test/start-xephyr.sh
+    stdin_open: true
+    tty: true
+
+  i3mux-remote-ssh:
+    build:
+      context: .
+      dockerfile: Dockerfile.remote
+    container_name: i3mux-remote-ssh
+    hostname: i3mux-remote-ssh
+    networks:
+      - i3mux-test-net
+    cap_add:
+      - NET_ADMIN  # For tc/iptables network manipulation
+    volumes:
+      - ../color-scripts:/opt/i3mux-test/color-scripts:ro,z
+      - ./ssh-keys/id_rsa.pub:/home/testuser/.ssh/authorized_keys:ro,z
+    tmpfs:
+      - /tmp:exec
+    ports:
+      - "2222:22"
+    stdin_open: true
+    tty: true
+
+networks:
+  i3mux-test-net:
+    driver: bridge

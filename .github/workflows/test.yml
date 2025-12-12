@@ -1,0 +1,72 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            docker-compose \
+            podman \
+            podman-compose
+
+      - name: Build i3mux binary
+        run: cargo build --release
+
+      - name: Build test containers
+        run: |
+          cd tests/docker
+          docker-compose build
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run integration tests
+        run: |
+          # Run basic infrastructure test
+          cargo test --test integration_tests test_basic_infrastructure -- --nocapture
+
+          # Run local session tests
+          cargo test --test integration_tests test_local -- --nocapture
+
+      - name: Check for uncommitted golden images
+        run: |
+          if ! git diff --quiet --exit-code tests/golden/; then
+            echo "ERROR: Golden images have uncommitted changes!"
+            echo "If you updated goldens, please commit them."
+            echo ""
+            echo "Changed files:"
+            git diff --name-only tests/golden/
+            exit 1
+          fi
+
+      - name: Upload test failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-failures
+          path: tests/test-output/failures/
+          if-no-files-found: ignore
+
+      - name: Upload test screenshots
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-screenshots
+          path: tests/screenshots/
+          if-no-files-found: ignore

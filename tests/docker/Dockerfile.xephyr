@@ -1,0 +1,56 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install required packages
+RUN apt-get update && apt-get install -y \
+    xvfb \
+    i3 \
+    xterm \
+    scrot \
+    imagemagick \
+    openssh-client \
+    x11-xserver-utils \
+    dbus-x11 \
+    git \
+    build-essential \
+    libncurses-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build and install abduco from source
+RUN git clone https://github.com/martanne/abduco.git /tmp/abduco && \
+    cd /tmp/abduco && \
+    make && \
+    make PREFIX=/usr install && \
+    rm -rf /tmp/abduco
+
+# Create necessary directories
+RUN mkdir -p /opt/i3mux-test \
+    && mkdir -p /root/.ssh/sockets \
+    && mkdir -p /tmp/screenshots \
+    && chmod 700 /root/.ssh \
+    && chmod 700 /root/.ssh/sockets
+
+# Copy i3 test config
+COPY i3-test-config /opt/i3mux-test/i3-test-config
+
+# Copy startup script
+COPY start-xephyr.sh /opt/i3mux-test/start-xephyr.sh
+RUN chmod +x /opt/i3mux-test/start-xephyr.sh
+
+# Create SSH config for ControlMaster
+RUN echo "Host i3mux-remote-ssh" > /root/.ssh/config && \
+    echo "  HostName i3mux-remote-ssh" >> /root/.ssh/config && \
+    echo "  User testuser" >> /root/.ssh/config && \
+    echo "  Port 22" >> /root/.ssh/config && \
+    echo "  StrictHostKeyChecking no" >> /root/.ssh/config && \
+    echo "  UserKnownHostsFile /dev/null" >> /root/.ssh/config && \
+    echo "  ControlMaster auto" >> /root/.ssh/config && \
+    echo "  ControlPath /root/.ssh/sockets/%r@%h:%p" >> /root/.ssh/config && \
+    echo "  ControlPersist 600" >> /root/.ssh/config && \
+    chmod 600 /root/.ssh/config
+
+WORKDIR /opt/i3mux-test
+
+# Keep container running
+CMD ["/opt/i3mux-test/start-xephyr.sh"]

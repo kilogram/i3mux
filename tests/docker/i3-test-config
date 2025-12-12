@@ -1,0 +1,36 @@
+# i3 config file for testing
+# Minimal configuration for deterministic test environment
+
+# Font for window titles (keep simple for consistency)
+font pango:monospace 8
+
+# Use thin borders for windows
+default_border pixel 2
+default_floating_border pixel 2
+
+# Don't follow mouse (for test determinism)
+focus_follows_mouse no
+
+# i3mux-specific window configuration
+for_window [con_mark="i3mux-terminal"] border normal 2
+for_window [con_mark="i3mux-terminal"] title_format "%title"
+
+# Disable i3bar for cleaner screenshots (i3 v4 syntax)
+# No bar configuration = no bar
+
+# Define workspace names
+workspace 1
+workspace 2
+workspace 3
+workspace 4
+workspace 5
+workspace 6
+workspace 7
+workspace 8
+workspace 9
+workspace 10
+
+# Disable all animations and transitions
+# (i3 doesn't have animations, but this is for documentation)
+
+# (Workspace 1 is default, no exec needed)
