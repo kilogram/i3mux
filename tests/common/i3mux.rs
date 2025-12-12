@@ -40,7 +40,7 @@ impl<'a> I3muxRunner<'a> {
 
     /// Detach current session
     pub fn detach(&self, name: &str) -> Result<()> {
-        let cmd = format!("DISPLAY=:99 i3mux detach {}", name);
+        let cmd = format!("DISPLAY=:99 i3mux detach --session {}", name);
 
         let output = self.container_mgr.exec_in_xephyr(&cmd)?;
 
