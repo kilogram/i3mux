@@ -1,7 +1,20 @@
 [package]
 name = "i3mux"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
+i3ipc = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+gethostname = "0.4"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.8"

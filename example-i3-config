@@ -1,0 +1,57 @@
+# Example i3 config snippet for i3mux
+# Add this to your ~/.config/i3/config
+
+# ===== i3mux Integration =====
+
+# Smart terminal launcher (respects i3mux binding)
+bindsym $mod+Return exec i3mux terminal
+
+# Activate i3mux for current workspace
+# Using rofi for session input
+bindsym $mod+m exec i3mux activate $(rofi -dmenu -p 'Session (local or user@host):')
+
+# Alternative: using dmenu
+# bindsym $mod+m exec i3mux activate $(dmenu -p 'Session:')
+
+# Alternative: hardcoded sessions (faster)
+# bindsym $mod+Shift+l exec i3mux activate local
+# bindsym $mod+Shift+r exec i3mux activate user@remote.host
+
+# Deactivate i3mux for current workspace
+bindsym $mod+Shift+m exec i3mux deactivate
+
+# Optional: force normal terminal (escape hatch)
+bindsym $mod+Shift+Return exec i3-sensible-terminal
+
+# List all i3mux sessions
+bindsym $mod+Ctrl+m exec i3-sensible-terminal -e bash -c 'i3mux list; read'
+
+# ===== Visual Styling =====
+
+# Default: no borders/titlebars
+default_border none
+
+# i3mux terminals: thin titlebar (2px)
+for_window [title=".*:ws.*"] border normal 2
+for_window [title=".*:ws.*"] title_format "⚡ %title"
+
+# Optional: Color-code i3mux terminals (green borders)
+# client.focused #00aa00 #006600 #ffffff #00ff00 #00aa00
+
+# ===== Optional: Workspace-Specific Bindings =====
+
+# Auto-activate specific workspaces on switch
+# (Requires wrapper script - see below)
+
+# Example: Workspace 2 always for remote dev
+# exec_always --no-startup-id ~/.config/i3/scripts/workspace-monitor.sh
+
+# ===== SSH ControlMaster Setup =====
+# Add to ~/.ssh/config for fast connections:
+#
+# Host *
+#   ControlMaster auto
+#   ControlPath ~/.ssh/sockets/%r@%h:%p
+#   ControlPersist 10m
+#
+# Then: mkdir -p ~/.ssh/sockets
