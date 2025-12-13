@@ -173,6 +173,47 @@ impl TestEnvironment {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Launch an i3mux terminal and wait for it to appear
+    pub fn launch_i3mux_terminal(&self) -> Result<()> {
+        // Get window count before launch
+        let before = self.get_workspace_windows()?.len();
+
+        // Launch via i3-msg exec so i3 spawns the process (better for i3 integration)
+        // Run i3mux in foreground and capture any errors to /tmp/i3mux-debug.log
+        let output = self.container_mgr.exec_in_xephyr(
+            "DISPLAY=:99 i3-msg 'exec --no-startup-id i3mux terminal 2>>/tmp/i3mux-debug.log'"
+        )?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to launch i3mux terminal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        // Wait for window to appear (SSH connections can be slow)
+        for _ in 0..50 {  // Up to 5 seconds
+            std::thread::sleep(Duration::from_millis(100));
+            let after = self.get_workspace_windows()?.len();
+            if after > before {
+                // Window appeared - now wait for i3mux to finish marking
+                // This is critical: i3mux needs time to mark the window
+                std::thread::sleep(Duration::from_millis(2500));
+
+                // Verify marking succeeded
+                let windows = self.get_workspace_windows()?;
+                if let Some(new_window) = windows.get(windows.len() - 1) {
+                    let info = self.get_window_info(*new_window)?;
+                    println!("New window {} info after launch: {}", new_window, info);
+                }
+
+                return Ok(());
+            }
+        }
+
+        anyhow::bail!("i3mux terminal window did not appear within timeout")
+    }
+
     // ==================== Screenshot Operations ====================
 
     /// Capture a screenshot of the Xephyr display
@@ -317,6 +358,14 @@ impl TestEnvironment {
     /// Clear all network manipulation rules
     pub fn clear_network_rules(&self) -> Result<()> {
         self.network().clear_all_rules()
+    }
+
+    // ==================== Debug Helpers ====================
+
+    /// Read i3mux debug log from container
+    pub fn read_debug_log(&self) -> Result<String> {
+        let output = self.container_mgr.exec_in_xephyr("cat /tmp/i3mux-debug.log 2>/dev/null || echo 'No debug log'")?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     // ==================== Cleanup ====================

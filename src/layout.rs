@@ -39,7 +39,7 @@ pub enum Layout {
     },
 }
 
-const MARKER: &str = "\u{200B}";
+const MARKER: &str = "i3mux:";
 
 impl Layout {
     /// Capture layout from i3 workspace tree
@@ -50,9 +50,9 @@ impl Layout {
     fn capture_node(node: &Node) -> Result<Option<Self>> {
         // Check if this is an i3mux terminal
         if let Some(name) = &node.name {
-            if name.starts_with(MARKER) && name.ends_with(MARKER) {
-                // Extract socket ID from title
-                let clean_name = name.trim_start_matches(MARKER).trim_end_matches(MARKER);
+            if name.starts_with(MARKER) {
+                // Extract socket ID from title: "[i3mux] host:socket"
+                let clean_name = name.trim_start_matches(MARKER);
                 if let Some(socket_part) = clean_name.split(':').nth(1) {
                     return Ok(Some(Layout::Terminal {
                         socket: socket_part.to_string(),

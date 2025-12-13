@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# i3mux-rofi - Simple rofi interface for i3mux
+#
+# Usage: Bind to a key in your i3 config:
+#   bindsym $mod+m exec /path/to/i3mux-rofi
+#
+# Edit the menu items to specify host, then select
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/i3mux"
+LAST_REMOTE_FILE="$CONFIG_DIR/last_remote"
+mkdir -p "$CONFIG_DIR"
+
+get_last_remote() {
+    [ -f "$LAST_REMOTE_FILE" ] && cat "$LAST_REMOTE_FILE" || echo ""
+}
+
+save_last_remote() {
+    echo "$1" > "$LAST_REMOTE_FILE"
+}
+
+notify() {
+    command -v notify-send &>/dev/null && notify-send "i3mux" "$1"
+}
+
+get_all_sessions() {
+    {
+        i3mux sessions 2>/dev/null | grep -v "^Sessions on" | sed 's/^/[local] /' || true
+        local last_remote=$(get_last_remote)
+        if [ -n "$last_remote" ]; then
+            i3mux sessions --remote "$last_remote" 2>/dev/null | grep -v "^Sessions on" | sed "s/^/[$last_remote] /" || true
+        fi
+    } | grep -v "^No sessions"
+}
+
+# Build menu
+last_remote=$(get_last_remote)
+menu="Activate: local
+Detach
+Attach"
+
+# Add quick activate for last remote if exists
+if [ -n "$last_remote" ]; then
+    menu="Activate: local
+Activate: $last_remote
+Detach
+Attach"
+fi
+
+menu="$menu
+List Sessions
+Kill Session"
+
+# Show menu - user can edit entries or select as-is
+selection=$(echo "$menu" | rofi -dmenu -p "i3mux" -mesg "Edit 'Activate: ' lines to change host")
+
+[ -z "$selection" ] && exit 0
+
+# Parse selection
+case "$selection" in
+    Activate:*)
+        target=$(echo "$selection" | sed 's/^Activate: *//')
+        [ -z "$target" ] && exit 0
+
+        if [ "$target" = "local" ]; then
+            i3mux activate
+        else
+            save_last_remote "$target"
+            i3mux activate --remote "$target"
+        fi
+        ;;
+
+    Attach)
+        sessions=$(get_all_sessions)
+        [ -z "$sessions" ] && { notify "No sessions available"; exit 0; }
+
+        selected_session=$(echo "$sessions" | rofi -dmenu -p "Select Session")
+        [ -z "$selected_session" ] && exit 0
+
+        if [[ "$selected_session" =~ ^\[local\]\ (.+)\ -\ (.+)$ ]]; then
+            i3mux attach --session "${BASH_REMATCH[1]}" || rofi -e "Failed to attach (locked?)"
+        elif [[ "$selected_session" =~ ^\[(.+)\]\ (.+)\ -\ (.+)$ ]]; then
+            save_last_remote "${BASH_REMATCH[1]}"
+            i3mux attach --remote "${BASH_REMATCH[1]}" --session "${BASH_REMATCH[2]}" || rofi -e "Failed to attach (locked?)"
+        fi
+        ;;
+
+    Detach)
+        i3mux detach && notify "Session detached" || rofi -e "Failed to detach"
+        ;;
+
+    "List Sessions")
+        sessions=$(get_all_sessions)
+        [ -z "$sessions" ] && { rofi -e "No sessions found"; exit 0; }
+        echo "$sessions" | rofi -dmenu -p "All Sessions" -mesg "Read-only" || true
+        ;;
+
+    "Kill Session")
+        sessions=$(get_all_sessions)
+        [ -z "$sessions" ] && { rofi -e "No sessions to kill"; exit 0; }
+
+        selected_session=$(echo "$sessions" | rofi -dmenu -p "Select Session to Kill")
+        [ -z "$selected_session" ] && exit 0
+
+        confirm=$(echo -e "Yes\nNo" | rofi -dmenu -p "Really kill?")
+        [ "$confirm" != "Yes" ] && exit 0
+
+        if [[ "$selected_session" =~ ^\[local\]\ (.+)\ -\ (.+)$ ]]; then
+            i3mux kill --session "${BASH_REMATCH[1]}" && notify "Killed"
+        elif [[ "$selected_session" =~ ^\[(.+)\]\ (.+)\ -\ (.+)$ ]]; then
+            i3mux kill --remote "${BASH_REMATCH[1]}" --session "${BASH_REMATCH[2]}" && notify "Killed"
+        fi
+        ;;
+esac

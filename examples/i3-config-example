@@ -1,0 +1,144 @@
+# i3mux Integration Example
+# Add these to your ~/.config/i3/config
+
+# Set mod key (Mod1 = Alt, Mod4 = Super/Windows key)
+set $mod Mod4
+
+# ===== i3mux Session Management =====
+
+# Interactive session management with rofi
+bindsym $mod+m exec /path/to/i3mux-rofi
+
+# Quick actions
+bindsym $mod+Shift+m exec i3mux activate --remote your-server    # Activate remote on current workspace
+bindsym $mod+Shift+d exec i3mux detach                           # Quick detach
+bindsym $mod+Shift+a exec i3mux-rofi-quick-attach                # Quick attach (see script below)
+
+# ===== Terminal Spawning =====
+
+# Launch i3mux terminal (will be managed by i3mux if workspace is activated)
+bindsym $mod+Return exec i3mux terminal
+
+# Force a regular terminal (bypass i3mux)
+bindsym $mod+Shift+Return exec i3-sensible-terminal
+
+# ===== Window/Pane Management (tmux-like) =====
+
+# Split horizontally (like tmux prefix + ")
+bindsym $mod+apostrophe split h; exec i3mux terminal
+
+# Split vertically (like tmux prefix + %)
+bindsym $mod+minus split v; exec i3mux terminal
+
+# Just set split mode without spawning (like tmux prefix + h/v)
+bindsym $mod+h split h
+bindsym $mod+v split v
+
+# ===== Navigation (tmux-like hjkl) =====
+
+# Change focus (like tmux prefix + arrow or hjkl)
+bindsym $mod+j focus down
+bindsym $mod+k focus up
+bindsym $mod+l focus right
+bindsym $mod+semicolon focus left  # h is used for split
+
+# Alternative: arrow keys
+bindsym $mod+Left focus left
+bindsym $mod+Down focus down
+bindsym $mod+Up focus up
+bindsym $mod+Right focus right
+
+# Move windows (like tmux prefix + Shift + arrow)
+bindsym $mod+Shift+j move down
+bindsym $mod+Shift+k move up
+bindsym $mod+Shift+l move right
+bindsym $mod+Shift+semicolon move left
+
+# ===== Resizing (like tmux prefix + Alt + arrow) =====
+
+mode "resize" {
+    # Vim-like
+    bindsym j resize shrink height 5 px or 5 ppt
+    bindsym k resize grow height 5 px or 5 ppt
+    bindsym l resize grow width 5 px or 5 ppt
+    bindsym semicolon resize shrink width 5 px or 5 ppt
+
+    # Arrow keys
+    bindsym Left resize shrink width 5 px or 5 ppt
+    bindsym Down resize grow height 5 px or 5 ppt
+    bindsym Up resize shrink height 5 px or 5 ppt
+    bindsym Right resize grow width 5 px or 5 ppt
+
+    # Return to normal mode
+    bindsym Return mode "default"
+    bindsym Escape mode "default"
+}
+bindsym $mod+r mode "resize"
+
+# ===== Layout Management =====
+
+# Stacking (like tmux select-layout even-vertical)
+bindsym $mod+s layout stacking
+
+# Tabbed (like tmux select-layout even-horizontal)
+bindsym $mod+t layout tabbed
+
+# Toggle split (horizontal/vertical)
+bindsym $mod+e layout toggle split
+
+# Fullscreen (like tmux zoom-pane)
+bindsym $mod+f fullscreen toggle
+
+# ===== Workspace Management (like tmux windows) =====
+
+# Switch to workspace (like tmux select-window)
+bindsym $mod+1 workspace 1
+bindsym $mod+2 workspace 2
+bindsym $mod+3 workspace 3
+bindsym $mod+4 workspace 4
+bindsym $mod+5 workspace 5
+bindsym $mod+6 workspace 6
+bindsym $mod+7 workspace 7
+bindsym $mod+8 workspace 8
+bindsym $mod+9 workspace 9
+bindsym $mod+0 workspace 10
+
+# Move container to workspace
+bindsym $mod+Shift+1 move container to workspace 1
+bindsym $mod+Shift+2 move container to workspace 2
+bindsym $mod+Shift+3 move container to workspace 3
+bindsym $mod+Shift+4 move container to workspace 4
+bindsym $mod+Shift+5 move container to workspace 5
+bindsym $mod+Shift+6 move container to workspace 6
+bindsym $mod+Shift+7 move container to workspace 7
+bindsym $mod+Shift+8 move container to workspace 8
+bindsym $mod+Shift+9 move container to workspace 9
+bindsym $mod+Shift+0 move container to workspace 10
+
+# Cycle through workspaces (like tmux next-window/previous-window)
+bindsym $mod+n workspace next
+bindsym $mod+p workspace prev
+
+# ===== Window Operations =====
+
+# Kill focused window (like tmux kill-pane)
+bindsym $mod+Shift+q kill
+
+# ===== Status Bar =====
+
+bar {
+    status_command i3status
+    position top
+
+    # Optional: Add i3mux session indicator
+    # You could create a custom i3status config or use i3blocks
+    # to show active session information
+}
+
+# ===== Optional: Auto-activate i3mux on specific workspaces =====
+
+# Auto-activate workspace 1 as remote session on startup
+# exec --no-startup-id "i3-msg 'workspace 1; exec i3mux activate --remote your-server'"
+
+# Auto-activate specific workspaces as remote when you switch to them
+# (requires a helper script that monitors workspace changes)

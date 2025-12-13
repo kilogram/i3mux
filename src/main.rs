@@ -11,13 +11,26 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Global verbose flag
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+// Debug logging macro - only logs when verbose flag is set
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            eprintln!("[i3mux] {}", format!($($arg)*));
+        }
+    };
+}
 
 use connection::create_connection;
 use layout::Layout;
 use session::RemoteSession;
 use types::{RemoteHost, SessionName};
 
-const MARKER: &str = "\u{200B}"; // Zero-width space
+const MARKER: &str = "i3mux:"; // Visible marker prefix for i3mux-managed terminals
 const LOCAL_DISPLAY: &str = "\x1b[3mlocal\x1b[0m"; // Italicized "local"
 
 #[derive(Parser)]
@@ -32,6 +45,10 @@ struct Cli {
     /// Session name (optional, required if multiple sessions exist)
     #[arg(short, long)]
     session: Option<String>,
+
+    /// Enable verbose debug logging
+    #[arg(short, long, global = true)]
+    verbose: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -159,6 +176,9 @@ impl Drop for LocalState {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Set global verbose flag
+    VERBOSE.store(cli.verbose, Ordering::Relaxed);
+
     match cli.command {
         None => {
             // Default: activate current workspace
@@ -179,6 +199,41 @@ fn main() -> Result<()> {
     }
 }
 
+/// Check if abduco is available locally
+fn check_abduco_local() -> Result<()> {
+    match Command::new("which").arg("abduco").output() {
+        Ok(output) if output.status.success() => Ok(()),
+        _ => anyhow::bail!(
+            "abduco not found. Please install it:\n\
+            - Arch Linux: sudo pacman -S abduco\n\
+            - Debian/Ubuntu: sudo apt install abduco\n\
+            - macOS: brew install abduco\n\
+            - Or build from source: https://github.com/martanne/abduco"
+        ),
+    }
+}
+
+/// Check if abduco is available on remote host
+fn check_abduco_remote(remote_host: &str) -> Result<()> {
+    let output = Command::new("ssh")
+        .arg(remote_host)
+        .arg("which abduco")
+        .output()
+        .context("Failed to check for abduco on remote host")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "abduco not found on remote host '{}'. Please install it on the remote:\n\
+            - Arch Linux: sudo pacman -S abduco\n\
+            - Debian/Ubuntu: sudo apt install abduco\n\
+            - Or build from source: https://github.com/martanne/abduco",
+            remote_host
+        );
+    }
+
+    Ok(())
+}
+
 /// Activate i3mux for current workspace
 fn activate(remote: Option<String>, session_name: Option<String>) -> Result<()> {
     let mut conn = I3Connection::connect()?;
@@ -190,6 +245,12 @@ fn activate(remote: Option<String>, session_name: Option<String>) -> Result<()> 
     let remote_host = remote.map(|r| RemoteHost::new(r)).transpose()?;
 
     let validated_session_name = session_name.map(|name| SessionName::new(name)).transpose()?;
+
+    // Check abduco availability
+    match &remote_host {
+        None => check_abduco_local()?,
+        Some(host) => check_abduco_remote(host.as_str())?,
+    }
 
     let (session_type, host_str) = match &remote_host {
         None => ("local", None),
@@ -274,7 +335,12 @@ fn detach(session_name: Option<String>) -> Result<()> {
     println!("  Layout captured: {} terminals", remote_session.layout.get_sockets().len());
 
     // Close all i3mux terminals
-    conn.run_command(&format!("[workspace=\"{}\"] [con_mark=\"i3mux-terminal\"] kill", ws_num))?;
+    // We need to kill windows individually by matching their titles,
+    // because i3's criteria matching doesn't handle the zero-width space character reliably
+    let tree = conn.get_tree()?;
+    if let Some(ws_node) = find_workspace(&tree, ws_num) {
+        kill_i3mux_windows(&mut conn, ws_node)?;
+    }
 
     // Clean up lock holder process and release lock
     let lock_key = format!("{}:{}", ws_state.host, final_session_name.as_str());
@@ -304,6 +370,12 @@ fn attach(
 ) -> Result<()> {
     // Validate remote host at CLI boundary
     let remote_host = remote.map(|r| RemoteHost::new(r)).transpose()?;
+
+    // Check abduco availability (needed to restore sessions)
+    match &remote_host {
+        None => check_abduco_local()?,
+        Some(host) => check_abduco_remote(host.as_str())?,
+    }
 
     // Create connection (None = local, Some = remote)
     let host_conn = create_connection(remote_host.as_ref().map(|h| h.as_str()))?;
@@ -350,12 +422,15 @@ fn attach(
 
     println!("✓ Lock acquired for session '{}'", final_session_name);
 
-    // Check workspace is empty
+    // Check workspace doesn't have existing i3mux terminals (non-i3mux windows are fine)
     let mut conn = I3Connection::connect()?;
     let (ws_name, ws_num) = get_focused_workspace(&mut conn)?;
 
-    if !is_workspace_empty(&mut conn, ws_num)? {
-        anyhow::bail!("Workspace {} is not empty. Clear it first or switch to an empty workspace.", ws_num);
+    let tree = conn.get_tree()?;
+    if let Some(ws_node) = find_workspace(&tree, ws_num) {
+        if has_i3mux_windows(ws_node) {
+            anyhow::bail!("Workspace {} already has i3mux terminals. Detach or clear them first.", ws_num);
+        }
     }
 
     // Restore layout and launch terminals
@@ -515,6 +590,57 @@ fn is_workspace_empty(conn: &mut I3Connection, ws_num: i32) -> Result<bool> {
     }
 }
 
+fn has_i3mux_windows(node: &i3ipc::reply::Node) -> bool {
+    // Check if this node is a window with an i3mux title
+    if let Some(window_id) = node.window {
+        if window_id != 0 {
+            if let Some(name) = &node.name {
+                if name.starts_with(MARKER) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Recursively check child nodes
+    for child in &node.nodes {
+        if has_i3mux_windows(child) {
+            return true;
+        }
+    }
+    for child in &node.floating_nodes {
+        if has_i3mux_windows(child) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn kill_i3mux_windows(conn: &mut I3Connection, node: &i3ipc::reply::Node) -> Result<()> {
+    // Check if this node is a window with an i3mux title (starts with MARKER)
+    if let Some(window_id) = node.window {
+        if window_id != 0 {
+            if let Some(name) = &node.name {
+                if name.starts_with(MARKER) {
+                    // This is an i3mux window - kill it
+                    conn.run_command(&format!("[id=\"{}\"] kill", window_id))?;
+                }
+            }
+        }
+    }
+
+    // Recursively check child nodes
+    for child in &node.nodes {
+        kill_i3mux_windows(conn, child)?;
+    }
+    for child in &node.floating_nodes {
+        kill_i3mux_windows(conn, child)?;
+    }
+
+    Ok(())
+}
+
 fn find_focused_node(node: &i3ipc::reply::Node) -> Option<&i3ipc::reply::Node> {
     if node.focused {
         return Some(node);
@@ -568,6 +694,10 @@ fn get_terminal_command() -> String {
     std::env::var("TERMINAL").unwrap_or_else(|_| "i3-sensible-terminal".to_string())
 }
 
+fn get_user_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string())
+}
+
 fn launch_normal_terminal() -> Result<()> {
     Command::new(get_terminal_command())
         .spawn()
@@ -576,6 +706,8 @@ fn launch_normal_terminal() -> Result<()> {
 }
 
 fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
+    debug!("launch_i3mux_terminal called for workspace: {}", ws_name);
+
     let mut state = LocalState::load()?;
 
     let socket = {
@@ -585,6 +717,7 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
             .context("Workspace not i3mux-bound")?;
 
         let socket = format!("ws{}-{:03}", ws_name, ws_state.next_socket_id);
+        debug!("Generated socket ID: {}", socket);
         ws_state.next_socket_id += 1;
         ws_state.sockets.insert(socket.clone(), SocketInfo { socket_id: socket.clone() });
         socket
@@ -597,26 +730,29 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
             .context("Workspace not i3mux-bound")?;
 
         let title = if ws_state.session_type == "local" {
-            format!("{}local:{}{}", MARKER, socket, MARKER)
+            format!("{}local:{}", MARKER, socket)
         } else {
-            format!("{}{}:{}{}", MARKER, ws_state.host, socket, MARKER)
+            format!("{}{}:{}", MARKER, ws_state.host, socket)
         };
 
         // Escape the title for use in PROMPT_COMMAND (needs extra escaping for SSH)
         let title_for_prompt = title.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$");
 
+        let user_shell = get_user_shell();
+        debug!("Using user shell: {}", user_shell);
+
         let attach_cmd = if ws_state.session_type == "local" {
-            // Local: Use --norc to prevent bashrc from overriding title, and set PROMPT_COMMAND
+            // Local: Set PROMPT_COMMAND to maintain title
             let prompt_cmd_val = format!("echo -ne \\\"\\\\033]0;{}\\\\007\\\"", title_for_prompt);
             format!(
-                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} bash --norc""#,
-                prompt_cmd_val, socket
+                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} {}""#,
+                prompt_cmd_val, socket, user_shell
             )
         } else {
-            // Remote: Set PROMPT_COMMAND to maintain title through SSH, use --norc to prevent bashrc from overriding
+            // Remote: Set PROMPT_COMMAND to maintain title through SSH
             let remote_prompt_cmd = format!("\\\\033]0;{}\\\\007", title_for_prompt);
             format!(
-                r#"TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'export PROMPT_COMMAND='"'"'echo -ne \"{}\"'"'"'; exec abduco -A /tmp/{} bash --norc'"#,
+                r#"TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'export PROMPT_COMMAND='"'"'echo -ne \"{}\"'"'"'; exec abduco -A /tmp/{} $SHELL'"#,
                 ws_state.host, remote_prompt_cmd, socket
             )
         };
@@ -663,21 +799,64 @@ ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p {host} "
 
     let ws_state = state.workspaces.get(ws_name).unwrap();
 
-    // Create wrapper script
+    debug!("Session type: {}", ws_state.session_type);
+    debug!("Host: {}", ws_state.host);
+    debug!("Title: {}", title);
+    debug!("Attach command: {}", attach_cmd);
+
+    // Create wrapper script with debug logging
     // For remote sessions, set PROMPT_COMMAND to maintain title through SSH
     // For local sessions, just set title once at start
+    let log_file = format!("/tmp/i3mux-{}.log", socket);
     let wrapper = if ws_state.session_type == "remote" {
         let title_escape = format!("\\033]0;{}\\007", title);
         format!(
-            r#"export PROMPT_COMMAND='echo -ne "{}"'; echo -ne '\033]0;{}\007'; {}; {}echo 'Session ended.'"#,
-            title_escape, title, attach_cmd, cleanup_cmd
+            r#"exec &> >(tee -a {log}) 2>&1
+echo "[i3mux wrapper] Starting at $(date)"
+echo "[i3mux wrapper] Title: {title}"
+echo "[i3mux wrapper] Socket: {socket}"
+echo "[i3mux wrapper] Attach command: {attach}"
+export PROMPT_COMMAND='echo -ne "{title_esc}"'
+echo -ne '\033]0;{title}\007'
+echo "[i3mux wrapper] Running attach command..."
+{attach}
+RC=$?
+echo "[i3mux wrapper] Attach command exited with code: $RC"
+{cleanup}
+echo "[i3mux wrapper] Session ended at $(date)"
+read -p "Press Enter to close terminal..." || true"#,
+            log = log_file,
+            title = title,
+            socket = socket,
+            attach = attach_cmd,
+            title_esc = title_escape,
+            cleanup = cleanup_cmd
         )
     } else {
         format!(
-            r#"echo -ne '\033]0;{}\007'; {}; {}echo 'Session ended.'"#,
-            title, attach_cmd, cleanup_cmd
+            r#"exec &> >(tee -a {log}) 2>&1
+echo "[i3mux wrapper] Starting at $(date)"
+echo "[i3mux wrapper] Title: {title}"
+echo "[i3mux wrapper] Socket: {socket}"
+echo "[i3mux wrapper] Attach command: {attach}"
+echo -ne '\033]0;{title}\007'
+echo "[i3mux wrapper] Running attach command..."
+{attach}
+RC=$?
+echo "[i3mux wrapper] Attach command exited with code: $RC"
+{cleanup}
+echo "[i3mux wrapper] Session ended at $(date)"
+read -p "Press Enter to close terminal..." || true"#,
+            log = log_file,
+            title = title,
+            socket = socket,
+            attach = attach_cmd,
+            cleanup = cleanup_cmd
         )
     };
+
+    debug!("Wrapper script: {}", wrapper);
+    debug!("Terminal command: {}", get_terminal_command());
 
     Command::new(get_terminal_command())
         .arg("-T")
@@ -688,6 +867,8 @@ ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p {host} "
         .arg(&wrapper)
         .spawn()
         .context("Failed to launch i3mux terminal")?;
+
+    debug!("Terminal spawned successfully");
 
     // Wait for window to appear and mark it
     // For SSH connections, this can take longer, so retry with backoff
@@ -704,15 +885,18 @@ ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p {host} "
 
         // Check if the command succeeded (window was found)
         if result.outcomes.iter().any(|o| o.success) {
+            debug!("Successfully marked window '{}' after {} attempts", title, attempts + 1);
             break;
         }
 
         attempts += 1;
         if attempts >= max_attempts {
+            debug!("ERROR: Failed to find window with title '{}' after {} attempts", title, attempts);
             anyhow::bail!("Failed to find window with title '{}' after {} attempts", title, attempts);
         }
     }
 
+    debug!("launch_i3mux_terminal completed successfully");
     Ok(())
 }
 
@@ -733,10 +917,10 @@ fn restore_layout(
     // Launch terminals in order, executing layout commands between them
     for (i, socket_id) in sockets.iter().enumerate() {
         // Launch terminal for this socket
-        let title = format!("{}{}:{}{}", MARKER, remote_host, socket_id, MARKER);
+        let title = format!("{}{}:{}", MARKER, remote_host, socket_id);
 
         let attach_cmd = format!(
-            "TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'abduco -A /tmp/{} bash'",
+            "TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'abduco -A /tmp/{} $SHELL'",
             remote_host, socket_id
         );
 
@@ -761,7 +945,8 @@ fn restore_layout(
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
 
-            let result = conn.run_command(&format!("[title=\"{}\"] mark --add i3mux-terminal", title))?;
+            let mark_cmd = format!("[title=\"{}\"] mark --add i3mux-terminal", title);
+            let result = conn.run_command(&mark_cmd)?;
 
             if result.outcomes.iter().any(|o| o.success) {
                 break;
