@@ -49,4 +49,8 @@ if [ -n "$CLEANUP_CMD" ]; then
 fi
 
 echo "[i3mux wrapper] Session ended at $(date)"
-read -p "Press Enter to close terminal..." || true
+
+# Only pause on error exit codes
+if [ $RC -ne 0 ]; then
+    read -p "Press Enter to close terminal..." || true
+fi

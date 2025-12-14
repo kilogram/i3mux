@@ -117,6 +117,13 @@ enum Commands {
 
     /// Launch terminal (called by i3 keybind)
     Terminal,
+
+    /// Clean up workspace state if no sessions remain (internal command)
+    #[command(hide = true)]
+    CleanupWorkspace {
+        /// Workspace name (e.g., "4" for workspace 4)
+        workspace: String,
+    },
 }
 
 /// Local ephemeral state (current workspace activations)
@@ -204,6 +211,7 @@ fn main() -> Result<()> {
         Some(Commands::Sessions { remote }) => list_sessions(remote.or(cli.remote)),
         Some(Commands::Kill { remote, session }) => kill_session(remote.or(cli.remote), session),
         Some(Commands::Terminal) => terminal(),
+        Some(Commands::CleanupWorkspace { workspace }) => cleanup_workspace(&workspace),
     }
 }
 
@@ -863,27 +871,44 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
         };
 
         // Cleanup script to run after terminal exits
-        let cleanup_cmd = if let Some(session_name) = &ws_state.session_name {
+        // This cleans up remote session files AND local workspace state
+        let cleanup_cmd = {
             let ws_prefix = format!("ws{}", ws_name);
-            if ws_state.session_type == "local" {
-                // Local cleanup: Check socket files directly
-                format!(
-                    r#"if ! ls /tmp/{ws_prefix}-* &>/dev/null; then rm -f /tmp/i3mux/sessions/{session}.json /tmp/i3mux/locks/{session}.lock; fi"#,
-                    ws_prefix = ws_prefix,
-                    session = session_name
-                )
+            let session_cleanup = if let Some(session_name) = &ws_state.session_name {
+                if ws_state.session_type == "local" {
+                    // Local cleanup: Remove session files if no sockets remain
+                    format!(
+                        r#"if ! ls /tmp/{ws_prefix}-* &>/dev/null; then rm -f /tmp/i3mux/sessions/{session}.json /tmp/i3mux/locks/{session}.lock; fi"#,
+                        ws_prefix = ws_prefix,
+                        session = session_name
+                    )
+                } else {
+                    // Remote cleanup: Use helper script to check and clean up remote session files
+                    format!(
+                        r#"ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p {host} 'bash -lc "{helper} cleanup-check {ws_prefix} {session}"' 2>/dev/null || true"#,
+                        host = ws_state.host,
+                        helper = REMOTE_HELPER_PATH,
+                        ws_prefix = ws_prefix,
+                        session = session_name
+                    )
+                }
             } else {
-                // Remote cleanup: Use helper script to check and clean up
-                format!(
-                    r#"ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p {host} 'bash -lc "{helper} cleanup-check {ws_prefix} {session}"' 2>/dev/null || true"#,
-                    host = ws_state.host,
-                    helper = REMOTE_HELPER_PATH,
-                    ws_prefix = ws_prefix,
-                    session = session_name
-                )
-            }
-        } else {
-            String::new()
+                String::new()
+            };
+
+            // Always clean up workspace state if no sockets remain (for both local and remote)
+            // Get the binary path for i3mux
+            let i3mux_bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "i3mux".to_string());
+
+            format!(
+                r#"{session_cleanup}; {bin} cleanup-workspace {ws} 2>/dev/null || true"#,
+                session_cleanup = session_cleanup,
+                bin = i3mux_bin,
+                ws = ws_name
+            )
         };
 
         (title, attach_cmd, cleanup_cmd)
@@ -955,6 +980,46 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     }
 
     debug!("launch_i3mux_terminal completed successfully");
+    Ok(())
+}
+
+/// Clean up workspace state if no active sessions remain
+fn cleanup_workspace(ws_name: &str) -> Result<()> {
+    debug!("cleanup_workspace called for workspace: {}", ws_name);
+
+    let mut state = LocalState::load()?;
+
+    // Check if workspace exists in state
+    if !state.workspaces.contains_key(ws_name) {
+        debug!("Workspace {} not in state, nothing to clean up", ws_name);
+        return Ok(());
+    }
+
+    // Check if any socket files exist for this workspace
+    let ws_prefix = format!("ws{}", ws_name);
+    let socket_pattern = format!("/tmp/{}-*", ws_prefix);
+
+    debug!("Checking for socket files: {}", socket_pattern);
+
+    // Use glob to check for socket files
+    let has_sockets = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("ls {} 2>/dev/null", socket_pattern))
+        .output()?
+        .status
+        .success();
+
+    if has_sockets {
+        debug!("Socket files still exist, not cleaning up workspace state");
+        return Ok(());
+    }
+
+    // No sockets remain, remove workspace state
+    debug!("No socket files found, removing workspace state for {}", ws_name);
+    state.workspaces.remove(ws_name);
+    state.save()?;
+
+    debug!("Workspace {} state cleaned up successfully", ws_name);
     Ok(())
 }
 

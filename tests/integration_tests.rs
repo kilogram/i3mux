@@ -707,3 +707,56 @@ fn test_focus_navigation(#[case] session: Session) -> Result<()> {
 
     Ok(())
 }
+
+// ==================== Workspace Cleanup Tests ====================
+
+#[test]
+#[ignore] // Requires remote SSH setup
+fn test_workspace_cleanup_after_last_terminal_closes() -> Result<()> {
+    // Test that workspace state is cleaned up when last terminal closes,
+    // allowing the workspace to be reused for a different session type
+    let env = TestEnvironment::new()?;
+
+    env.cleanup_workspace("15")?;
+    env.i3_exec("workspace 15")?;
+
+    // Activate as remote workspace
+    println!("=== Activating workspace 15 as remote ===");
+    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "15")?;
+    std::thread::sleep(Duration::from_secs(2)); // Wait for initial terminal
+
+    // Verify we have at least one terminal
+    let windows = env.get_workspace_windows()?;
+    assert!(windows.len() >= 1, "Should have at least 1 terminal from activate");
+    println!("Terminal count after activate: {}", windows.len());
+
+    // Launch a second terminal to be sure we have multiple
+    env.launch_i3mux_terminal()?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    let windows = env.get_workspace_windows()?;
+    println!("Terminal count after manual launch: {}", windows.len());
+
+    // Close all terminals (simulating user closing all windows)
+    println!("=== Closing all terminals ===");
+    env.cleanup_workspace("15")?;
+    std::thread::sleep(Duration::from_secs(1)); // Wait for cleanup to run
+
+    // Verify workspace is empty
+    let windows = env.get_workspace_windows()?;
+    assert_eq!(windows.len(), 0, "Workspace should be empty after closing all terminals");
+
+    // Now try to activate the same workspace as LOCAL
+    // This should succeed if cleanup worked properly
+    println!("=== Activating workspace 15 as local (should succeed if cleanup worked) ===");
+    env.i3mux_activate(Session::Local, "15")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Verify we got a local terminal
+    let windows = env.get_workspace_windows()?;
+    assert!(windows.len() >= 1, "Should have at least 1 terminal from local activate");
+
+    println!("✓ Workspace cleanup test passed - workspace successfully transitioned from remote to local");
+
+    Ok(())
+}
