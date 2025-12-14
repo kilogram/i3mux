@@ -33,6 +33,10 @@ use types::{RemoteHost, SessionName};
 const MARKER: &str = "i3mux:"; // Visible marker prefix for i3mux-managed terminals
 const LOCAL_DISPLAY: &str = "\x1b[3mlocal\x1b[0m"; // Italicized "local"
 
+// Remote helper script - uploaded to remote hosts for reliable command execution
+const REMOTE_HELPER_SCRIPT: &str = include_str!("remote-helper.sh");
+const REMOTE_HELPER_PATH: &str = "/tmp/i3mux-helper.sh";
+
 #[derive(Parser)]
 #[command(name = "i3mux")]
 #[command(about = "Persistent terminal sessions with i3 workspace integration")]
@@ -213,24 +217,85 @@ fn check_abduco_local() -> Result<()> {
     }
 }
 
-/// Check if abduco is available on remote host
+/// Check if abduco is available on remote host using helper script
 fn check_abduco_remote(remote_host: &str) -> Result<()> {
+    // Ensure helper script is uploaded
+    ensure_remote_helper(remote_host)?;
+
+    // Use helper script to check dependencies
     let output = Command::new("ssh")
         .arg(remote_host)
-        .arg("which abduco")
+        .arg(format!("bash -lc '{} check-deps'", REMOTE_HELPER_PATH))
         .output()
         .context("Failed to check for abduco on remote host")?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "abduco not found on remote host '{}'. Please install it on the remote:\n\
-            - Arch Linux: sudo pacman -S abduco\n\
-            - Debian/Ubuntu: sudo apt install abduco\n\
-            - Or build from source: https://github.com/martanne/abduco",
-            remote_host
-        );
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{}", error_msg.trim());
     }
 
+    debug!("abduco found at: {}", String::from_utf8_lossy(&output.stdout).trim());
+    Ok(())
+}
+
+/// Ensure the remote helper script is uploaded and executable on the remote host
+fn ensure_remote_helper(remote_host: &str) -> Result<()> {
+    debug!("Ensuring remote helper script is present on {}", remote_host);
+
+    // Check if script exists and has correct version
+    let version_check = Command::new("ssh")
+        .arg(remote_host)
+        .arg(format!("{} version 2>/dev/null || echo ''", REMOTE_HELPER_PATH))
+        .output()
+        .context("Failed to check remote helper version")?;
+
+    let remote_version = String::from_utf8_lossy(&version_check.stdout).trim().to_string();
+
+    // Extract version from script (look for VERSION="x.x.x")
+    let local_version = REMOTE_HELPER_SCRIPT
+        .lines()
+        .find(|line| line.contains("VERSION="))
+        .and_then(|line| line.split('"').nth(1))
+        .unwrap_or("unknown");
+
+    if remote_version == local_version {
+        debug!("Remote helper already at version {}", local_version);
+        return Ok(());
+    }
+
+    debug!("Uploading remote helper script (version {})", local_version);
+
+    // Upload script via stdin
+    let mut upload = Command::new("ssh")
+        .arg(remote_host)
+        .arg(format!("cat > {}", REMOTE_HELPER_PATH))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to start SSH upload")?;
+
+    if let Some(mut stdin) = upload.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(REMOTE_HELPER_SCRIPT.as_bytes())
+            .context("Failed to write helper script")?;
+    }
+
+    let status = upload.wait().context("Failed to wait for upload")?;
+    if !status.success() {
+        anyhow::bail!("Failed to upload helper script to {}", remote_host);
+    }
+
+    // Make script executable
+    let chmod = Command::new("ssh")
+        .arg(remote_host)
+        .arg(format!("chmod +x {}", REMOTE_HELPER_PATH))
+        .status()
+        .context("Failed to make helper script executable")?;
+
+    if !chmod.success() {
+        anyhow::bail!("Failed to make helper script executable on {}", remote_host);
+    }
+
+    debug!("Remote helper script uploaded successfully");
     Ok(())
 }
 
@@ -250,6 +315,11 @@ fn activate(remote: Option<String>, session_name: Option<String>) -> Result<()> 
     match &remote_host {
         None => check_abduco_local()?,
         Some(host) => check_abduco_remote(host.as_str())?,
+    }
+
+    // Ensure SSH control socket directory exists
+    if remote_host.is_some() {
+        std::fs::create_dir_all("/tmp/i3mux/sockets")?;
     }
 
     let (session_type, host_str) = match &remote_host {
@@ -375,6 +445,11 @@ fn attach(
     match &remote_host {
         None => check_abduco_local()?,
         Some(host) => check_abduco_remote(host.as_str())?,
+    }
+
+    // Ensure SSH control socket directory exists
+    if remote_host.is_some() {
+        std::fs::create_dir_all("/tmp/i3mux/sockets")?;
     }
 
     // Create connection (None = local, Some = remote)
@@ -749,11 +824,10 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
                 prompt_cmd_val, socket, user_shell
             )
         } else {
-            // Remote: Set PROMPT_COMMAND to maintain title through SSH
-            let remote_prompt_cmd = format!("\\\\033]0;{}\\\\007", title_for_prompt);
+            // Remote: Use helper script to attach (ensures PATH is set correctly)
             format!(
-                r#"TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'export PROMPT_COMMAND='"'"'echo -ne \"{}\"'"'"'; exec abduco -A /tmp/{} $SHELL'"#,
-                ws_state.host, remote_prompt_cmd, socket
+                r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'exec bash -lc "{} attach {}"'"#,
+                ws_state.host, REMOTE_HELPER_PATH, socket
             )
         };
 
@@ -773,17 +847,11 @@ fi
                     session = session_name
                 )
             } else {
-                // Remote cleanup: SSH to check abduco sessions
+                // Remote cleanup: Use helper script to check and clean up
                 format!(
-                    r#"
-ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p {host} "
-    if ! abduco | grep -q '^{ws_prefix}-'; then
-        rm -f /tmp/i3mux/sessions/{session}.json
-        rm -f /tmp/i3mux/locks/{session}.lock
-    fi
-" 2>/dev/null || true
-                    "#,
+                    r#"ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p {host} 'bash -lc "{helper} cleanup-check {ws_prefix} {session}"' 2>/dev/null || true"#,
                     host = ws_state.host,
+                    helper = REMOTE_HELPER_PATH,
                     ws_prefix = ws_prefix,
                     session = session_name
                 )
@@ -920,8 +988,8 @@ fn restore_layout(
         let title = format!("{}{}:{}", MARKER, remote_host, socket_id);
 
         let attach_cmd = format!(
-            "TERM=xterm-256color ssh -o ControlPath=~/.ssh/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'abduco -A /tmp/{} $SHELL'",
-            remote_host, socket_id
+            r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'exec bash -lc "{} attach {}"'"#,
+            remote_host, REMOTE_HELPER_PATH, socket_id
         );
 
         let wrapper = format!(

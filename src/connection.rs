@@ -163,7 +163,7 @@ impl SshConnection {
     fn ssh_base_args(&self) -> Vec<String> {
         vec![
             "-o".to_string(),
-            "ControlPath=~/.ssh/sockets/%r@%h:%p".to_string(),
+            "ControlPath=/tmp/i3mux/sockets/%r@%h:%p".to_string(),
             "-o".to_string(),
             "ControlMaster=auto".to_string(),
             "-o".to_string(),
