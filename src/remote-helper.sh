@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.3"
 
 # Check if abduco is available (sources login profile for PATH)
 cmd_check_deps() {
@@ -24,9 +24,10 @@ cmd_check_deps() {
 # Attach to an abduco session (runs in user's shell)
 cmd_attach() {
     local socket="$1"
-    # This will be run inside the SSH -t terminal session
-    # abduco will attach or create the session, running $SHELL inside it
-    exec abduco -A "/tmp/$socket" "$SHELL"
+    # Wrap in a shell that disables alternate screen buffer before exec
+    # This allows terminal scrollback to work properly
+    # See: https://github.com/martanne/abduco/issues/35
+    exec abduco -A "/tmp/$socket" sh -c 'printf "\033[?1049l"; exec "$SHELL"'
 }
 
 # Check if any abduco sessions exist for a workspace prefix, clean up if none

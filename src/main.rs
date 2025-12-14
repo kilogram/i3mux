@@ -37,6 +37,10 @@ const LOCAL_DISPLAY: &str = "\x1b[3mlocal\x1b[0m"; // Italicized "local"
 const REMOTE_HELPER_SCRIPT: &str = include_str!("remote-helper.sh");
 const REMOTE_HELPER_PATH: &str = "/tmp/i3mux-helper.sh";
 
+// Wrapper script - runs locally to launch terminals with proper setup
+const WRAPPER_SCRIPT: &str = include_str!("wrapper.sh");
+const WRAPPER_PATH: &str = "/tmp/i3mux-wrapper.sh";
+
 #[derive(Parser)]
 #[command(name = "i3mux")]
 #[command(about = "Persistent terminal sessions with i3 workspace integration")]
@@ -238,9 +242,33 @@ fn check_abduco_remote(remote_host: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the remote helper script is uploaded and executable on the remote host
+/// Ensure the wrapper script exists locally
+fn ensure_wrapper_script() -> Result<()> {
+    use std::io::Write;
+
+    let path = std::path::Path::new(WRAPPER_PATH);
+
+    // Always write the script (it's cheap and ensures we have latest version)
+    let mut file = std::fs::File::create(path)
+        .context("Failed to create wrapper script")?;
+    file.write_all(WRAPPER_SCRIPT.as_bytes())
+        .context("Failed to write wrapper script")?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)?;
+    }
+
+    Ok(())
+}
+
+/// Ensure the helper script is uploaded and executable on a remote host
 fn ensure_remote_helper(remote_host: &str) -> Result<()> {
-    debug!("Ensuring remote helper script is present on {}", remote_host);
+    debug!("Ensuring helper script is present on {}", remote_host);
 
     // Check if script exists and has correct version
     let version_check = Command::new("ssh")
@@ -263,7 +291,7 @@ fn ensure_remote_helper(remote_host: &str) -> Result<()> {
         return Ok(());
     }
 
-    debug!("Uploading remote helper script (version {})", local_version);
+    debug!("Uploading helper script to remote (version {})", local_version);
 
     // Upload script via stdin
     let mut upload = Command::new("ssh")
@@ -295,7 +323,7 @@ fn ensure_remote_helper(remote_host: &str) -> Result<()> {
         anyhow::bail!("Failed to make helper script executable on {}", remote_host);
     }
 
-    debug!("Remote helper script uploaded successfully");
+    debug!("Helper script uploaded to remote successfully");
     Ok(())
 }
 
@@ -441,7 +469,7 @@ fn attach(
     // Validate remote host at CLI boundary
     let remote_host = remote.map(|r| RemoteHost::new(r)).transpose()?;
 
-    // Check abduco availability (needed to restore sessions)
+    // Check abduco availability
     match &remote_host {
         None => check_abduco_local()?,
         Some(host) => check_abduco_remote(host.as_str())?,
@@ -783,6 +811,9 @@ fn launch_normal_terminal() -> Result<()> {
 fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     debug!("launch_i3mux_terminal called for workspace: {}", ws_name);
 
+    // Ensure wrapper script exists
+    ensure_wrapper_script()?;
+
     let mut state = LocalState::load()?;
 
     let socket = {
@@ -817,10 +848,10 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
         debug!("Using user shell: {}", user_shell);
 
         let attach_cmd = if ws_state.session_type == "local" {
-            // Local: Set PROMPT_COMMAND to maintain title
+            // Local: Direct abduco attach with alternate buffer fix
             let prompt_cmd_val = format!("echo -ne \\\"\\\\033]0;{}\\\\007\\\"", title_for_prompt);
             format!(
-                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} {}""#,
+                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} sh -c 'printf \"\\033[?1049l\"; exec {}'""#,
                 prompt_cmd_val, socket, user_shell
             )
         } else {
@@ -835,14 +866,9 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
         let cleanup_cmd = if let Some(session_name) = &ws_state.session_name {
             let ws_prefix = format!("ws{}", ws_name);
             if ws_state.session_type == "local" {
-                // Local cleanup: check if any abduco sessions remain
+                // Local cleanup: Check socket files directly
                 format!(
-                    r#"
-if ! abduco | grep -q '^{ws_prefix}-'; then
-    rm -f /tmp/i3mux/sessions/{session}.json
-    rm -f /tmp/i3mux/locks/{session}.lock
-fi
-                    "#,
+                    r#"if ! ls /tmp/{ws_prefix}-* &>/dev/null; then rm -f /tmp/i3mux/sessions/{session}.json /tmp/i3mux/locks/{session}.lock; fi"#,
                     ws_prefix = ws_prefix,
                     session = session_name
                 )
@@ -872,67 +898,31 @@ fi
     debug!("Title: {}", title);
     debug!("Attach command: {}", attach_cmd);
 
-    // Create wrapper script with debug logging
-    // For remote sessions, set PROMPT_COMMAND to maintain title through SSH
-    // For local sessions, just set title once at start
-    let log_file = format!("/tmp/i3mux-{}.log", socket);
-    let wrapper = if ws_state.session_type == "remote" {
-        let title_escape = format!("\\033]0;{}\\007", title);
-        format!(
-            r#"exec &> >(tee -a {log}) 2>&1
-echo "[i3mux wrapper] Starting at $(date)"
-echo "[i3mux wrapper] Title: {title}"
-echo "[i3mux wrapper] Socket: {socket}"
-echo "[i3mux wrapper] Attach command: {attach}"
-export PROMPT_COMMAND='echo -ne "{title_esc}"'
-echo -ne '\033]0;{title}\007'
-echo "[i3mux wrapper] Running attach command..."
-{attach}
-RC=$?
-echo "[i3mux wrapper] Attach command exited with code: $RC"
-{cleanup}
-echo "[i3mux wrapper] Session ended at $(date)"
-read -p "Press Enter to close terminal..." || true"#,
-            log = log_file,
-            title = title,
-            socket = socket,
-            attach = attach_cmd,
-            title_esc = title_escape,
-            cleanup = cleanup_cmd
-        )
+    // Build wrapper script invocation
+    // Pass PROMPT_COMMAND for remote sessions to maintain title
+    let prompt_cmd = if ws_state.session_type == "remote" {
+        format!("echo -ne \"\\033]0;{}\\007\"", title.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$"))
     } else {
-        format!(
-            r#"exec &> >(tee -a {log}) 2>&1
-echo "[i3mux wrapper] Starting at $(date)"
-echo "[i3mux wrapper] Title: {title}"
-echo "[i3mux wrapper] Socket: {socket}"
-echo "[i3mux wrapper] Attach command: {attach}"
-echo -ne '\033]0;{title}\007'
-echo "[i3mux wrapper] Running attach command..."
-{attach}
-RC=$?
-echo "[i3mux wrapper] Attach command exited with code: $RC"
-{cleanup}
-echo "[i3mux wrapper] Session ended at $(date)"
-read -p "Press Enter to close terminal..." || true"#,
-            log = log_file,
-            title = title,
-            socket = socket,
-            attach = attach_cmd,
-            cleanup = cleanup_cmd
-        )
+        String::new()
     };
 
-    debug!("Wrapper script: {}", wrapper);
+    let wrapper_args = vec![
+        socket.as_str(),
+        &title,
+        &attach_cmd,
+        &cleanup_cmd,
+        &prompt_cmd,
+    ];
+
+    debug!("Wrapper script: {} with args: {:?}", WRAPPER_PATH, wrapper_args);
     debug!("Terminal command: {}", get_terminal_command());
 
     Command::new(get_terminal_command())
         .arg("-T")
         .arg(&title)
         .arg("-e")
-        .arg("bash")
-        .arg("-c")
-        .arg(&wrapper)
+        .arg(WRAPPER_PATH)
+        .args(&wrapper_args)
         .spawn()
         .context("Failed to launch i3mux terminal")?;
 
