@@ -856,16 +856,16 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
         debug!("Using user shell: {}", user_shell);
 
         let attach_cmd = if ws_state.session_type == "local" {
-            // Local: Direct abduco attach with alternate buffer fix
+            // Local: Direct abduco attach
             let prompt_cmd_val = format!("echo -ne \\\"\\\\033]0;{}\\\\007\\\"", title_for_prompt);
             format!(
-                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} sh -c 'printf \"\\033[?1049l\"; exec {}'""#,
+                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} {}""#,
                 prompt_cmd_val, socket, user_shell
             )
         } else {
             // Remote: Use helper script to attach (ensures PATH is set correctly)
             format!(
-                r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'exec bash -lc "{} attach {}"'"#,
+                r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -tt {} 'bash -l -c "exec {} attach {}"'"#,
                 ws_state.host, REMOTE_HELPER_PATH, socket
             )
         };

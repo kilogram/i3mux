@@ -29,15 +29,10 @@ fi
 # Set terminal title
 printf '\033]0;%s\007' "$TITLE"
 
-# Reset terminal modes for proper scrollback
-printf '\033[?1l'    # Disable application cursor keys
-printf '\033[?1000l' # Disable mouse tracking
-printf '\033[?1002l' # Disable cell motion mouse tracking
-printf '\033[?1006l' # Disable SGR mouse mode
-
 echo "[i3mux wrapper] Running attach command..."
 
 # Run the attach command
+# Note: SIGWINCH should propagate automatically to the foreground process
 eval "$ATTACH_CMD"
 RC=$?
 

@@ -24,10 +24,8 @@ cmd_check_deps() {
 # Attach to an abduco session (runs in user's shell)
 cmd_attach() {
     local socket="$1"
-    # Wrap in a shell that disables alternate screen buffer before exec
-    # This allows terminal scrollback to work properly
-    # See: https://github.com/martanne/abduco/issues/35
-    exec abduco -A "/tmp/$socket" sh -c 'printf "\033[?1049l"; exec "$SHELL"'
+    # Attach to abduco session
+    exec abduco -A "/tmp/$socket" "$SHELL"
 }
 
 # Check if any abduco sessions exist for a workspace prefix, clean up if none
