@@ -702,11 +702,11 @@ fn is_workspace_empty(conn: &mut I3Connection, ws_num: i32) -> Result<bool> {
 }
 
 fn has_i3mux_windows(node: &i3ipc::reply::Node) -> bool {
-    // Check if this node is a window with an i3mux title
+    // Check if this node is an i3mux window by checking instance name
     if let Some(window_id) = node.window {
         if window_id != 0 {
-            if let Some(name) = &node.name {
-                if name.starts_with(MARKER) {
+            if let Some(instance) = get_window_instance_by_id(window_id as u64) {
+                if instance.starts_with(MARKER) {
                     return true;
                 }
             }
@@ -729,11 +729,14 @@ fn has_i3mux_windows(node: &i3ipc::reply::Node) -> bool {
 }
 
 fn kill_i3mux_windows(conn: &mut I3Connection, node: &i3ipc::reply::Node) -> Result<()> {
-    // Check if this node is a window with an i3mux title (starts with MARKER)
+    // Check if this node is an i3mux window by checking instance name
+    // (title can be changed by shell's PS1/PROMPT_COMMAND)
     if let Some(window_id) = node.window {
         if window_id != 0 {
-            if let Some(name) = &node.name {
-                if name.starts_with(MARKER) {
+            // Get instance name for this window
+            let instance = get_window_instance_by_id(window_id as u64);
+            if let Some(inst) = instance {
+                if inst.starts_with(MARKER) {
                     // This is an i3mux window - kill it
                     conn.run_command(&format!("[id=\"{}\"] kill", window_id))?;
                 }
@@ -750,6 +753,54 @@ fn kill_i3mux_windows(conn: &mut I3Connection, node: &i3ipc::reply::Node) -> Res
     }
 
     Ok(())
+}
+
+/// Get window instance name by ID using i3-msg directly
+/// (workaround for i3ipc crate bug that returns None for window_properties)
+fn get_window_instance_by_id(window_id: u64) -> Option<String> {
+    let output = Command::new("i3-msg")
+        .args(["-t", "get_tree"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let tree: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    find_instance_in_tree(&tree, window_id)
+}
+
+fn find_instance_in_tree(node: &serde_json::Value, window_id: u64) -> Option<String> {
+    if let Some(window) = node.get("window").and_then(|w| w.as_u64()) {
+        if window == window_id {
+            if let Some(props) = node.get("window_properties") {
+                if let Some(instance) = props.get("instance").and_then(|i| i.as_str()) {
+                    return Some(instance.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
+        for child in nodes {
+            if let Some(instance) = find_instance_in_tree(child, window_id) {
+                return Some(instance);
+            }
+        }
+    }
+
+    if let Some(nodes) = node.get("floating_nodes").and_then(|n| n.as_array()) {
+        for child in nodes {
+            if let Some(instance) = find_instance_in_tree(child, window_id) {
+                return Some(instance);
+            }
+        }
+    }
+
+    None
 }
 
 fn find_focused_node(node: &i3ipc::reply::Node) -> Option<&i3ipc::reply::Node> {
@@ -942,7 +993,11 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     debug!("Wrapper script: {} with args: {:?}", WRAPPER_PATH, wrapper_args);
     debug!("Terminal command: {}", get_terminal_command());
 
+    // Use -name to set X11 instance name (won't be overwritten by shell like title can be)
+    // This allows reliable window matching even when shell PS1/PROMPT_COMMAND changes the title
     Command::new(get_terminal_command())
+        .arg("-name")
+        .arg(&title)
         .arg("-T")
         .arg(&title)
         .arg("-e")
@@ -954,6 +1009,7 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     debug!("Terminal spawned successfully");
 
     // Wait for window to appear and mark it
+    // Match on instance name which is stable (title can change due to shell PS1)
     // For SSH connections, this can take longer, so retry with backoff
     let mut conn = I3Connection::connect()?;
     let mut attempts = 0;
@@ -962,8 +1018,8 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // Try to mark the window
-        let mark_cmd = format!("[title=\"{}\"] mark --add i3mux-terminal", title);
+        // Try to mark the window by instance name (more reliable than title)
+        let mark_cmd = format!("[instance=\"{}\"] mark --add i3mux-terminal", title);
         let result = conn.run_command(&mark_cmd)?;
 
         // Check if the command succeeded (window was found)
@@ -1052,7 +1108,10 @@ fn restore_layout(
             title, attach_cmd
         );
 
+        // Use -name to set X11 instance name (won't be overwritten by shell like title can be)
         Command::new(get_terminal_command())
+            .arg("-name")
+            .arg(&title)
             .arg("-T")
             .arg(&title)
             .arg("-e")
@@ -1062,13 +1121,14 @@ fn restore_layout(
             .spawn()?;
 
         // Wait for window to appear with retry logic (SSH connections can be slow)
+        // Match on instance name which is stable (title can change due to shell PS1)
         let mut attempts = 0;
         let max_attempts = 20; // Up to 2 seconds
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
 
-            let mark_cmd = format!("[title=\"{}\"] mark --add i3mux-terminal", title);
+            let mark_cmd = format!("[instance=\"{}\"] mark --add i3mux-terminal", title);
             let result = conn.run_command(&mark_cmd)?;
 
             if result.outcomes.iter().any(|o| o.success) {
@@ -1077,7 +1137,7 @@ fn restore_layout(
 
             attempts += 1;
             if attempts >= max_attempts {
-                anyhow::bail!("Failed to find window with title '{}' during layout restore", title);
+                anyhow::bail!("Failed to find window with instance '{}' during layout restore", title);
             }
         }
 

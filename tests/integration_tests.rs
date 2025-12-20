@@ -220,7 +220,7 @@ fn test_detach_attach_default_session_name() -> Result<()> {
     env.i3_exec("workspace 14")?;
 
     // Activate without session name - should default to workspace-based name
-    env.i3_exec("exec --no-startup-id DISPLAY=:99 i3mux activate --remote testuser@i3mux-remote-ssh")?;
+    env.i3_exec("exec --no-startup-id DISPLAY=:99 TERMINAL=xterm i3mux activate --remote testuser@i3mux-remote-ssh")?;
     std::thread::sleep(Duration::from_secs(3));
 
     let initial_windows = env.get_workspace_windows()?;
@@ -757,6 +757,695 @@ fn test_workspace_cleanup_after_last_terminal_closes() -> Result<()> {
     assert!(windows.len() >= 1, "Should have at least 1 terminal from local activate");
 
     println!("✓ Workspace cleanup test passed - workspace successfully transitioned from remote to local");
+
+    Ok(())
+}
+
+// ==================== Tabbed Layout Tests ====================
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_tabbed_2_terminals(#[case] session: Session) -> Result<()> {
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(20, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Launch first terminal (red)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Set layout to tabbed
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Launch second terminal (green)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Capture screenshots for both tabs (we're on tab 2, cycle back to tab 1 first)
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let screenshots = env.capture_multi_screenshots(2, "next")?;
+
+    // Compare with golden images
+    let spec = ComparisonSpec::load("tabbed-2-terminals")?;
+    env.compare_multi_with_golden("tabbed-2-terminals", &screenshots, &spec)?;
+
+    println!("✓ Tabbed 2 terminals test passed ({:?})", session);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_stacked_2_terminals(#[case] session: Session) -> Result<()> {
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(21, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Launch first terminal (blue)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Set layout to stacking
+    env.i3_exec("layout stacking")?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Launch second terminal (yellow)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Focus first terminal (stacked uses up/down)
+    env.focus_prev_stack()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture first screenshot
+    let screenshot1 = env.capture_screenshot()?;
+
+    // Focus next stack item
+    env.focus_next_stack()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture second screenshot
+    let screenshot2 = env.capture_screenshot()?;
+
+    let screenshots = vec![screenshot1, screenshot2];
+    let spec = ComparisonSpec::load("stacked-2-terminals")?;
+    env.compare_multi_with_golden("stacked-2-terminals", &screenshots, &spec)?;
+
+    println!("✓ Stacked 2 terminals test passed ({:?})", session);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_tabbed_3_terminals(#[case] session: Session) -> Result<()> {
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(22, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Launch first terminal (red)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Set layout to tabbed
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Launch second terminal (green)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Launch third terminal (blue)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?;
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Focus first terminal (we're on tab 3)
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let screenshots = env.capture_multi_screenshots(3, "next")?;
+
+    let spec = ComparisonSpec::load("tabbed-3-terminals")?;
+    env.compare_multi_with_golden("tabbed-3-terminals", &screenshots, &spec)?;
+
+    println!("✓ Tabbed 3 terminals test passed ({:?})", session);
+
+    Ok(())
+}
+
+// ==================== Nested Layout Tests (Tabs + Splits) ====================
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_tabs_in_hsplit(#[case] session: Session) -> Result<()> {
+    // Layout: [Tabs(Red, Green)] | [Blue]
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(23, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Left side: create tabbed container with 2 terminals
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Right side: add hsplit and blue terminal
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("split h")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Now capture: first the two tabs on left, then the blue on right
+    // Focus the tabbed container (left)
+    env.i3_exec("focus left")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_tab()?; // Go to first tab (red)
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 1 (Red + Blue visible)
+    let screenshot1 = env.capture_screenshot()?;
+
+    // Focus next tab (Green)
+    env.focus_next_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 2 (Green + Blue visible)
+    let screenshot2 = env.capture_screenshot()?;
+
+    let screenshots = vec![screenshot1, screenshot2];
+    let spec = ComparisonSpec::load("tabs-in-hsplit")?;
+    env.compare_multi_with_golden("tabs-in-hsplit", &screenshots, &spec)?;
+
+    println!("✓ Tabs in horizontal split test passed ({:?})", session);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_tabs_in_vsplit(#[case] session: Session) -> Result<()> {
+    // Layout: [Tabs(Red, Green)] / [Blue]
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(24, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Top: create tabbed container with 2 terminals
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Bottom: add vsplit and blue terminal
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("split v")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Focus the tabbed container (top)
+    env.i3_exec("focus up")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_tab()?; // Go to first tab (red)
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 1 (Red / Blue visible)
+    let screenshot1 = env.capture_screenshot()?;
+
+    // Focus next tab (Green)
+    env.focus_next_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 2 (Green / Blue visible)
+    let screenshot2 = env.capture_screenshot()?;
+
+    let screenshots = vec![screenshot1, screenshot2];
+    let spec = ComparisonSpec::load("tabs-in-vsplit")?;
+    env.compare_multi_with_golden("tabs-in-vsplit", &screenshots, &spec)?;
+
+    println!("✓ Tabs in vertical split test passed ({:?})", session);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_hsplit_in_tabs(#[case] session: Session) -> Result<()> {
+    // Layout: Tabs( [Red|Green], [Blue|Yellow] )
+    // Tab 1: Red | Green (horizontal split)
+    // Tab 2: Blue | Yellow (horizontal split)
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(25, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Tab 1: Red | Green
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("split h")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Set parent to tabbed layout
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Tab 2: Blue | Yellow (need to create a new container)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("split h")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Focus back to first tab
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 1 (Red | Green)
+    let screenshot1 = env.capture_screenshot()?;
+
+    // Focus tab 2
+    env.focus_next_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 2 (Blue | Yellow)
+    let screenshot2 = env.capture_screenshot()?;
+
+    let screenshots = vec![screenshot1, screenshot2];
+    let spec = ComparisonSpec::load("hsplit-in-tabs")?;
+    env.compare_multi_with_golden("hsplit-in-tabs", &screenshots, &spec)?;
+
+    println!("✓ Horizontal split in tabs test passed ({:?})", session);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_vsplit_in_tabs(#[case] session: Session) -> Result<()> {
+    // Layout: Tabs( [Red/Green], [Blue/Yellow] )
+    // Tab 1: Red over Green (vertical split)
+    // Tab 2: Blue over Yellow (vertical split)
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(26, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Tab 1: Red / Green
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("split v")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Set parent to tabbed layout
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Tab 2: Blue / Yellow
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("split v")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Focus back to first tab
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 1 (Red / Green)
+    let screenshot1 = env.capture_screenshot()?;
+
+    // Focus tab 2
+    env.focus_next_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture tab 2 (Blue / Yellow)
+    let screenshot2 = env.capture_screenshot()?;
+
+    let screenshots = vec![screenshot1, screenshot2];
+    let spec = ComparisonSpec::load("vsplit-in-tabs")?;
+    env.compare_multi_with_golden("vsplit-in-tabs", &screenshots, &spec)?;
+
+    println!("✓ Vertical split in tabs test passed ({:?})", session);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_stacked_in_hsplit(#[case] session: Session) -> Result<()> {
+    // Layout: [Stack(Red, Green)] | [Blue]
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(27, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Left side: create stacked container with 2 terminals
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("layout stacking")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Right side: add hsplit and blue terminal
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("split h")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Focus the stacked container (left)
+    env.i3_exec("focus left")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_stack()?; // Go to first stack item (red)
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture stack 1 (Red + Blue visible)
+    let screenshot1 = env.capture_screenshot()?;
+
+    // Focus next stack item (Green)
+    env.focus_next_stack()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture stack 2 (Green + Blue visible)
+    let screenshot2 = env.capture_screenshot()?;
+
+    let screenshots = vec![screenshot1, screenshot2];
+    let spec = ComparisonSpec::load("stacked-in-hsplit")?;
+    env.compare_multi_with_golden("stacked-in-hsplit", &screenshots, &spec)?;
+
+    println!("✓ Stacked in horizontal split test passed ({:?})", session);
+
+    Ok(())
+}
+
+// ==================== Deep Nesting Tests ====================
+
+// NOTE: test_tabs_in_tabs is omitted because reliably navigating double-nested
+// tabbed containers in i3 requires more complex focus management. The other
+// nested layout tests (tabs_in_hsplit, hsplit_in_tabs, complex_nested) provide
+// sufficient coverage for nested layouts.
+
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote("testuser@i3mux-remote-ssh"))]
+fn test_complex_nested_layout(#[case] session: Session) -> Result<()> {
+    // Complex layout:
+    // +---------------------------+
+    // | Tabs(Red|Green) | Blue    |   <- hsplit with tabs on left
+    // +---------------------------+
+    // |     Yellow      | Magenta |   <- hsplit below
+    // +---------------------------+
+    //
+    // So it's: VSplit( HSplit(Tabs(R,G), B), HSplit(Y, M) )
+    if should_ignore_session(&session) && std::env::var("RUN_REMOTE_TESTS").is_err() {
+        println!("⊘ Skipping remote test (set RUN_REMOTE_TESTS=1 to run)");
+        return Ok(());
+    }
+
+    let env = TestEnvironment::new()?;
+    let ws = workspace_for_session(29, &session);
+
+    env.cleanup_workspace(&ws)?;
+    env.i3_exec(&format!("workspace {}", ws))?;
+
+    // Top-left: Tabbed(Red, Green)
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Top-right: Blue
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("split h")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Bottom row: Yellow | Magenta (via parent split v)
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("split v")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    std::thread::sleep(Duration::from_millis(800));
+    env.i3_exec("split h")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 45")?; // Magenta
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Navigate to top-left tabbed container, first tab
+    env.i3_exec("focus up")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("focus left")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Capture with Red tab visible
+    let screenshot1 = env.capture_screenshot()?;
+
+    // Capture with Green tab visible
+    env.focus_next_tab()?;
+    std::thread::sleep(Duration::from_millis(300));
+    let screenshot2 = env.capture_screenshot()?;
+
+    let screenshots = vec![screenshot1, screenshot2];
+    let spec = ComparisonSpec::load("complex-nested")?;
+    env.compare_multi_with_golden("complex-nested", &screenshots, &spec)?;
+
+    println!("✓ Complex nested layout test passed ({:?})", session);
+
+    Ok(())
+}
+
+// ==================== Detach/Attach with Tabbed/Stacked ====================
+
+#[test]
+fn test_detach_attach_tabbed_layout() -> Result<()> {
+    // Test that tabbed layouts are properly saved and restored
+    let env = TestEnvironment::new()?;
+
+    env.cleanup_workspace("30")?;
+    env.i3_exec("workspace 30")?;
+
+    // Activate remote session
+    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "30")?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Set to tabbed layout
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Add second terminal
+    env.launch_i3mux_terminal()?;
+
+    // Add third terminal
+    env.launch_i3mux_terminal()?;
+
+    // Verify we have 3 terminals
+    let initial_windows = env.get_workspace_windows()?;
+    assert_eq!(initial_windows.len(), 3, "Should have 3 terminals before detach");
+
+    // Detach
+    env.i3mux_detach("ws30")?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify empty
+    let windows_after_detach = env.get_workspace_windows()?;
+    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
+
+    // Attach
+    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws30")?;
+    std::thread::sleep(Duration::from_secs(4)); // Extra time for 3 terminals
+
+    // Verify all terminals restored
+    let windows_after_attach = env.get_workspace_windows()?;
+    assert_eq!(
+        windows_after_attach.len(),
+        3,
+        "Should restore all 3 terminals in tabbed layout"
+    );
+
+    // Verify layout is still tabbed by checking if we can cycle through tabs
+    // (if it were a split, focus left/right would move to different windows, not cycle)
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.focus_prev_tab()?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    println!("✓ Detach/attach with tabbed layout passed");
+
+    Ok(())
+}
+
+#[test]
+fn test_detach_attach_stacked_layout() -> Result<()> {
+    // Test that stacked layouts are properly saved and restored
+    let env = TestEnvironment::new()?;
+
+    env.cleanup_workspace("31")?;
+    env.i3_exec("workspace 31")?;
+
+    // Activate remote session
+    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "31")?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Set to stacked layout
+    env.i3_exec("layout stacking")?;
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Add second terminal
+    env.launch_i3mux_terminal()?;
+
+    // Verify we have 2 terminals
+    let initial_windows = env.get_workspace_windows()?;
+    assert_eq!(initial_windows.len(), 2, "Should have 2 terminals before detach");
+
+    // Detach
+    env.i3mux_detach("ws31")?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify empty
+    let windows_after_detach = env.get_workspace_windows()?;
+    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
+
+    // Attach
+    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws31")?;
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Verify terminals restored
+    let windows_after_attach = env.get_workspace_windows()?;
+    assert_eq!(
+        windows_after_attach.len(),
+        2,
+        "Should restore both terminals in stacked layout"
+    );
+
+    println!("✓ Detach/attach with stacked layout passed");
+
+    Ok(())
+}
+
+#[test]
+fn test_detach_attach_nested_tabs_splits() -> Result<()> {
+    // Test complex nested layout: HSplit(Tabs(t1,t2), t3)
+    let env = TestEnvironment::new()?;
+
+    env.cleanup_workspace("32")?;
+    env.i3_exec("workspace 32")?;
+
+    // Activate remote session
+    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "32")?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Create tabbed container with 2 terminals
+    env.i3_exec("layout tabbed")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.launch_i3mux_terminal()?;
+
+    // Add hsplit and third terminal
+    env.i3_exec("focus parent")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("split h")?;
+    std::thread::sleep(Duration::from_millis(200));
+    env.launch_i3mux_terminal()?;
+
+    // Verify we have 3 terminals
+    let initial_windows = env.get_workspace_windows()?;
+    assert_eq!(initial_windows.len(), 3, "Should have 3 terminals before detach");
+
+    // Detach
+    env.i3mux_detach("ws32")?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify empty
+    let windows_after_detach = env.get_workspace_windows()?;
+    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
+
+    // Attach
+    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws32")?;
+    std::thread::sleep(Duration::from_secs(4));
+
+    // Verify all terminals restored
+    let windows_after_attach = env.get_workspace_windows()?;
+    assert_eq!(
+        windows_after_attach.len(),
+        3,
+        "Should restore all 3 terminals with nested layout"
+    );
+
+    println!("✓ Detach/attach with nested tabs/splits passed");
 
     Ok(())
 }

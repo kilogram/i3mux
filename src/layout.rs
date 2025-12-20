@@ -1,6 +1,7 @@
 use anyhow::Result;
 use i3ipc::reply::Node;
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 
 /// Simplified i3 layout representation for serialization
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -48,10 +49,38 @@ impl Layout {
     }
 
     fn capture_node(node: &Node) -> Result<Option<Self>> {
-        // Check if this is an i3mux terminal
+        use i3ipc::reply::WindowProperty;
+
+        // Check if this is an i3mux terminal by looking at window instance name
+        // (more reliable than title which can be changed by shell PS1/PROMPT_COMMAND)
+
+        // First try i3ipc's window_properties
+        let instance = if let Some(props) = &node.window_properties {
+            props.get(&WindowProperty::Instance).cloned()
+        } else if let Some(window_id) = node.window {
+            // Fallback: i3ipc returns None for window_properties when i3 includes
+            // unknown property keys (like "machine"). Use i3-msg directly as workaround.
+            get_window_instance(window_id as u64)
+        } else {
+            None
+        };
+
+        if let Some(instance) = instance {
+            if instance.starts_with(MARKER) {
+                // Extract socket ID from instance: "i3mux:host:socket"
+                let clean_name = instance.trim_start_matches(MARKER);
+                if let Some(socket_part) = clean_name.split(':').nth(1) {
+                    return Ok(Some(Layout::Terminal {
+                        socket: socket_part.to_string(),
+                        percent: node.percent,
+                    }));
+                }
+            }
+        }
+
+        // Fallback: also check title for backwards compatibility
         if let Some(name) = &node.name {
             if name.starts_with(MARKER) {
-                // Extract socket ID from title: "[i3mux] host:socket"
                 let clean_name = name.trim_start_matches(MARKER);
                 if let Some(socket_part) = clean_name.split(':').nth(1) {
                     return Ok(Some(Layout::Terminal {
@@ -156,6 +185,61 @@ impl Layout {
 
         commands
     }
+}
+
+/// Get window instance name using i3-msg directly (workaround for i3ipc crate bug)
+/// The i3ipc crate returns None for window_properties if any unknown property key exists
+fn get_window_instance(window_id: u64) -> Option<String> {
+    // Run i3-msg -t get_tree and extract instance for this window
+    let output = Command::new("i3-msg")
+        .args(["-t", "get_tree"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+
+    // Parse JSON and find the window with matching ID
+    let tree: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    find_window_instance(&tree, window_id)
+}
+
+fn find_window_instance(node: &serde_json::Value, window_id: u64) -> Option<String> {
+    // Check if this node has the window we're looking for
+    if let Some(window) = node.get("window").and_then(|w| w.as_u64()) {
+        if window == window_id {
+            // Found the window, get its instance from window_properties
+            if let Some(props) = node.get("window_properties") {
+                if let Some(instance) = props.get("instance").and_then(|i| i.as_str()) {
+                    return Some(instance.to_string());
+                }
+            }
+        }
+    }
+
+    // Recursively search nodes
+    if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
+        for child in nodes {
+            if let Some(instance) = find_window_instance(child, window_id) {
+                return Some(instance);
+            }
+        }
+    }
+
+    // Also search floating_nodes
+    if let Some(nodes) = node.get("floating_nodes").and_then(|n| n.as_array()) {
+        for child in nodes {
+            if let Some(instance) = find_window_instance(child, window_id) {
+                return Some(instance);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

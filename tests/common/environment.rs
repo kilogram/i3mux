@@ -180,8 +180,9 @@ impl TestEnvironment {
 
         // Launch via i3-msg exec so i3 spawns the process (better for i3 integration)
         // Run i3mux in foreground and capture any errors to /tmp/i3mux-debug.log
+        // Set TERMINAL=xterm for consistent behavior
         let output = self.container_mgr.exec_in_xephyr(
-            "DISPLAY=:99 i3-msg 'exec --no-startup-id i3mux terminal 2>>/tmp/i3mux-debug.log'"
+            "DISPLAY=:99 i3-msg 'exec --no-startup-id TERMINAL=xterm i3mux terminal 2>>/tmp/i3mux-debug.log'"
         )?;
 
         if !output.status.success() {
@@ -317,6 +318,94 @@ impl TestEnvironment {
         Ok(())
     }
 
+    /// Focus child window in a direction (for cycling through tabs/stacks)
+    pub fn focus_child(&self) -> Result<()> {
+        self.i3_exec("focus child")
+    }
+
+    /// Focus the next tab/window in a tabbed container (horizontal cycling)
+    pub fn focus_next_tab(&self) -> Result<()> {
+        self.i3_exec("focus right")
+    }
+
+    /// Focus the previous tab/window in a tabbed container (horizontal cycling)
+    pub fn focus_prev_tab(&self) -> Result<()> {
+        self.i3_exec("focus left")
+    }
+
+    /// Focus the next window in a stacked container (vertical cycling)
+    pub fn focus_next_stack(&self) -> Result<()> {
+        self.i3_exec("focus down")
+    }
+
+    /// Focus the previous window in a stacked container (vertical cycling)
+    pub fn focus_prev_stack(&self) -> Result<()> {
+        self.i3_exec("focus up")
+    }
+
+    /// Get layout info for current workspace (returns JSON structure)
+    pub fn get_workspace_layout(&self) -> Result<String> {
+        let ws_output = self.container_mgr.exec_in_xephyr(
+            "DISPLAY=:99 i3-msg -t get_workspaces | jq -r '.[] | select(.focused==true) | .num'"
+        )?;
+
+        let ws_num = String::from_utf8_lossy(&ws_output.stdout)
+            .trim()
+            .parse::<i32>()
+            .context("Failed to get focused workspace number")?;
+
+        let output = self.container_mgr.exec_in_xephyr(&format!(
+            r#"DISPLAY=:99 i3-msg -t get_tree | jq '.. | select(.type? == "workspace" and .num? == {})'"#,
+            ws_num
+        ))?;
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Capture multiple screenshots by cycling through tabs/stacks
+    /// This navigates through all visible containers using focus commands
+    /// and captures a screenshot at each position.
+    ///
+    /// `count` - number of screenshots to take (should match number of tabs/stack items)
+    /// `direction` - "next" to cycle right/down, "prev" to cycle left/up
+    pub fn capture_multi_screenshots(&self, count: usize, direction: &str) -> Result<Vec<RgbaImage>> {
+        let mut screenshots = Vec::with_capacity(count);
+
+        for i in 0..count {
+            // Capture current screenshot
+            let screenshot = self.capture_screenshot()?;
+            screenshots.push(screenshot);
+
+            // Navigate to next tab/stack (except for last one)
+            if i < count - 1 {
+                std::thread::sleep(Duration::from_millis(100));
+                if direction == "next" {
+                    self.focus_next_tab()?;
+                } else {
+                    self.focus_prev_tab()?;
+                }
+                std::thread::sleep(Duration::from_millis(300)); // Wait for focus change to render
+            }
+        }
+
+        Ok(screenshots)
+    }
+
+    /// Compare multiple screenshots with corresponding golden images
+    /// Golden images are named with suffix like "base-name-1.png", "base-name-2.png", etc.
+    pub fn compare_multi_with_golden(
+        &self,
+        golden_base_name: &str,
+        screenshots: &[RgbaImage],
+        spec: &ComparisonSpec,
+    ) -> Result<()> {
+        for (i, screenshot) in screenshots.iter().enumerate() {
+            let golden_name = format!("{}-{}.png", golden_base_name, i + 1);
+            self.compare_with_golden(&golden_name, screenshot, spec)?;
+        }
+        Ok(())
+    }
+
     /// Wait for SSH connection to establish
     pub fn wait_for_ssh_connection(&self, _window_id: u64, timeout: Duration) -> Result<()> {
         std::thread::sleep(timeout);
@@ -361,6 +450,12 @@ impl TestEnvironment {
     }
 
     // ==================== Debug Helpers ====================
+
+    /// Run a command in the Xephyr container and return stdout
+    pub fn container_exec_in_xephyr(&self, cmd: &str) -> Result<String> {
+        let output = self.container_mgr.exec_in_xephyr(cmd)?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
 
     /// Read i3mux debug log from container
     pub fn read_debug_log(&self) -> Result<String> {

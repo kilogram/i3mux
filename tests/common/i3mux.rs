@@ -17,11 +17,11 @@ impl<'a> I3muxRunner<'a> {
     pub fn activate(&self, session: &Session, workspace: &str) -> Result<()> {
         let cmd = match session {
             Session::Local => format!(
-                "DISPLAY=:99 i3-msg workspace {} && DISPLAY=:99 i3mux activate",
+                "DISPLAY=:99 i3-msg workspace {} && DISPLAY=:99 TERMINAL=xterm i3mux activate",
                 workspace
             ),
             Session::Remote(host) => format!(
-                "DISPLAY=:99 i3-msg workspace {} && DISPLAY=:99 i3mux activate --remote {}",
+                "DISPLAY=:99 i3-msg workspace {} && DISPLAY=:99 TERMINAL=xterm i3mux activate --remote {}",
                 workspace, host
             ),
         };
@@ -59,9 +59,9 @@ impl<'a> I3muxRunner<'a> {
         let force_flag = if force { "--force" } else { "" };
 
         let cmd = match session {
-            Session::Local => format!("DISPLAY=:99 i3mux attach {} --session {}", force_flag, name),
+            Session::Local => format!("DISPLAY=:99 TERMINAL=xterm i3mux attach {} --session {}", force_flag, name),
             Session::Remote(host) => format!(
-                "DISPLAY=:99 i3mux attach --remote {} {} --session {}",
+                "DISPLAY=:99 TERMINAL=xterm i3mux attach --remote {} {} --session {}",
                 host, force_flag, name
             ),
         };

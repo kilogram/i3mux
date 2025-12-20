@@ -13,6 +13,9 @@ PROMPT_CMD="${5:-}"  # Optional
 
 LOG_FILE="/tmp/i3mux-${SOCKET}.log"
 
+# Set terminal title BEFORE redirecting output (must go to actual terminal)
+printf '\033]0;%s\007' "$TITLE"
+
 # Redirect all output to log file
 exec &> >(tee -a "$LOG_FILE") 2>&1
 
@@ -25,9 +28,6 @@ echo "[i3mux wrapper] Attach command: $ATTACH_CMD"
 if [ -n "$PROMPT_CMD" ]; then
     export PROMPT_COMMAND="$PROMPT_CMD"
 fi
-
-# Set terminal title
-printf '\033]0;%s\007' "$TITLE"
 
 echo "[i3mux wrapper] Running attach command..."
 
