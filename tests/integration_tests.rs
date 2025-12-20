@@ -638,7 +638,7 @@ fn test_many_windows(#[case] session: Session) -> Result<()> {
     ];
 
     // Create 7 more windows with alternating horizontal and vertical splits (activate gave us 1)
-    for (i, (code, name)) in color_codes.iter().enumerate() {
+    for (i, (code, _name)) in color_codes.iter().enumerate() {
         env.i3_exec(&format!("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh {}", code))?; // {name}
         std::thread::sleep(Duration::from_millis(800));
 

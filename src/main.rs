@@ -2,6 +2,7 @@ mod connection;
 mod layout;
 mod session;
 mod types;
+mod window;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -29,8 +30,9 @@ use connection::create_connection;
 use layout::Layout;
 use session::RemoteSession;
 use types::{RemoteHost, SessionName};
+use window::{I3muxWindow, wait_for_window_and_mark};
 
-const MARKER: &str = "i3mux:"; // Visible marker prefix for i3mux-managed terminals
+const MARKER: &str = "i3mux:"; // Marker prefix for window titles (for initial window matching)
 const LOCAL_DISPLAY: &str = "\x1b[3mlocal\x1b[0m"; // Italicized "local"
 
 // Remote helper script - uploaded to remote hosts for reliable command execution
@@ -404,12 +406,8 @@ fn detach(session_name: Option<String>) -> Result<()> {
         anyhow::bail!("Cannot detach local sessions (use remote sessions for detach/attach)");
     }
 
-    // Capture layout
-    let tree = conn.get_tree()?;
-    let workspace_node = find_workspace(&tree, ws_num)
-        .context("Could not find workspace in i3 tree")?;
-
-    let layout = Layout::capture_from_workspace(workspace_node)?
+    // Capture layout using marks (most reliable identification method)
+    let layout = Layout::capture_from_workspace_num(ws_num)?
         .context("No i3mux terminals found in workspace")?;
 
     // Determine session name and validate at boundary
@@ -440,13 +438,8 @@ fn detach(session_name: Option<String>) -> Result<()> {
     println!("✓ Session '{}' saved to {}", final_session_name, ws_state.host);
     println!("  Layout captured: {} terminals", remote_session.layout.get_sockets().len());
 
-    // Close all i3mux terminals
-    // We need to kill windows individually by matching their titles,
-    // because i3's criteria matching doesn't handle the zero-width space character reliably
-    let tree = conn.get_tree()?;
-    if let Some(ws_node) = find_workspace(&tree, ws_num) {
-        kill_i3mux_windows(&mut conn, ws_node)?;
-    }
+    // Close all i3mux terminals (identified by marks)
+    window::kill_i3mux_windows_in_workspace(&mut conn, ws_num)?;
 
     // Clean up lock holder process and release lock
     let lock_key = format!("{}:{}", ws_state.host, final_session_name.as_str());
@@ -537,11 +530,8 @@ fn attach(
     let mut conn = I3Connection::connect()?;
     let (ws_name, ws_num) = get_focused_workspace(&mut conn)?;
 
-    let tree = conn.get_tree()?;
-    if let Some(ws_node) = find_workspace(&tree, ws_num) {
-        if has_i3mux_windows(ws_node) {
-            anyhow::bail!("Workspace {} already has i3mux terminals. Detach or clear them first.", ws_num);
-        }
+    if window::workspace_has_i3mux_windows(ws_num)? {
+        anyhow::bail!("Workspace {} already has i3mux terminals. Detach or clear them first.", ws_num);
     }
 
     // Restore layout and launch terminals
@@ -667,189 +657,27 @@ fn get_focused_workspace(conn: &mut I3Connection) -> Result<(String, i32)> {
     anyhow::bail!("No focused workspace found")
 }
 
-fn find_workspace<'a>(node: &'a i3ipc::reply::Node, ws_num: i32) -> Option<&'a i3ipc::reply::Node> {
-    use i3ipc::reply::NodeType;
-    if node.nodetype == NodeType::Workspace {
-        // Check workspace number via name parsing
-        if let Some(name) = &node.name {
-            if let Ok(num) = name.split(':').next().unwrap_or("").parse::<i32>() {
-                if num == ws_num {
-                    return Some(node);
-                }
-            }
-        }
+/// Build terminal-specific arguments to set WM_CLASS instance
+///
+/// Different terminals have different CLI options for setting the X11 WM_CLASS instance.
+/// This function returns the appropriate arguments for the detected terminal.
+fn build_terminal_instance_args(terminal: &str, instance: &str) -> Vec<String> {
+    // Extract just the binary name from the path
+    let terminal_name = std::path::Path::new(terminal)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(terminal);
+
+    match terminal_name {
+        "xterm" => vec!["-name".to_string(), instance.to_string()],
+        "alacritty" => vec!["--class".to_string(), format!("Alacritty,{}", instance)],
+        "kitty" => vec!["--name".to_string(), instance.to_string()],
+        "urxvt" | "rxvt-unicode" => vec!["-name".to_string(), instance.to_string()],
+        "st" => vec!["-n".to_string(), instance.to_string()],
+        "foot" => vec!["--app-id".to_string(), instance.to_string()],
+        // For i3-sensible-terminal or unknown terminals, try -name as it's most common
+        _ => vec!["-name".to_string(), instance.to_string()],
     }
-    for child in &node.nodes {
-        if let Some(found) = find_workspace(child, ws_num) {
-            return Some(found);
-        }
-    }
-    for child in &node.floating_nodes {
-        if let Some(found) = find_workspace(child, ws_num) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn is_workspace_empty(conn: &mut I3Connection, ws_num: i32) -> Result<bool> {
-    let tree = conn.get_tree()?;
-    if let Some(ws_node) = find_workspace(&tree, ws_num) {
-        Ok(ws_node.nodes.is_empty() && ws_node.floating_nodes.is_empty())
-    } else {
-        Ok(true)
-    }
-}
-
-fn has_i3mux_windows(node: &i3ipc::reply::Node) -> bool {
-    // Check if this node is an i3mux window by checking instance name
-    if let Some(window_id) = node.window {
-        if window_id != 0 {
-            if let Some(instance) = get_window_instance_by_id(window_id as u64) {
-                if instance.starts_with(MARKER) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Recursively check child nodes
-    for child in &node.nodes {
-        if has_i3mux_windows(child) {
-            return true;
-        }
-    }
-    for child in &node.floating_nodes {
-        if has_i3mux_windows(child) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn kill_i3mux_windows(conn: &mut I3Connection, node: &i3ipc::reply::Node) -> Result<()> {
-    // Check if this node is an i3mux window by checking instance name
-    // (title can be changed by shell's PS1/PROMPT_COMMAND)
-    if let Some(window_id) = node.window {
-        if window_id != 0 {
-            // Get instance name for this window
-            let instance = get_window_instance_by_id(window_id as u64);
-            if let Some(inst) = instance {
-                if inst.starts_with(MARKER) {
-                    // This is an i3mux window - kill it
-                    conn.run_command(&format!("[id=\"{}\"] kill", window_id))?;
-                }
-            }
-        }
-    }
-
-    // Recursively check child nodes
-    for child in &node.nodes {
-        kill_i3mux_windows(conn, child)?;
-    }
-    for child in &node.floating_nodes {
-        kill_i3mux_windows(conn, child)?;
-    }
-
-    Ok(())
-}
-
-/// Get window instance name by ID using i3-msg directly
-/// (workaround for i3ipc crate bug that returns None for window_properties)
-fn get_window_instance_by_id(window_id: u64) -> Option<String> {
-    let output = Command::new("i3-msg")
-        .args(["-t", "get_tree"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let tree: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-
-    find_instance_in_tree(&tree, window_id)
-}
-
-fn find_instance_in_tree(node: &serde_json::Value, window_id: u64) -> Option<String> {
-    if let Some(window) = node.get("window").and_then(|w| w.as_u64()) {
-        if window == window_id {
-            if let Some(props) = node.get("window_properties") {
-                if let Some(instance) = props.get("instance").and_then(|i| i.as_str()) {
-                    return Some(instance.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
-        for child in nodes {
-            if let Some(instance) = find_instance_in_tree(child, window_id) {
-                return Some(instance);
-            }
-        }
-    }
-
-    if let Some(nodes) = node.get("floating_nodes").and_then(|n| n.as_array()) {
-        for child in nodes {
-            if let Some(instance) = find_instance_in_tree(child, window_id) {
-                return Some(instance);
-            }
-        }
-    }
-
-    None
-}
-
-fn find_focused_node(node: &i3ipc::reply::Node) -> Option<&i3ipc::reply::Node> {
-    if node.focused {
-        return Some(node);
-    }
-    for child in &node.nodes {
-        if let Some(found) = find_focused_node(child) {
-            return Some(found);
-        }
-    }
-    for child in &node.floating_nodes {
-        if let Some(found) = find_focused_node(child) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn is_i3mux_terminal(conn: &mut I3Connection) -> Result<bool> {
-    let tree = conn.get_tree()?;
-
-    if let Some(focused) = find_focused_node(&tree) {
-        if let Some(name) = &focused.name {
-            return Ok(name.starts_with(MARKER) && name.ends_with(MARKER));
-        }
-    }
-
-    Ok(false)
-}
-
-fn is_terminal_window(conn: &mut I3Connection) -> Result<bool> {
-    let tree = conn.get_tree()?;
-
-    if let Some(focused) = find_focused_node(&tree) {
-        if let Some(props) = &focused.window_properties {
-            use i3ipc::reply::WindowProperty;
-            let terminal_classes = [
-                "URxvt", "Alacritty", "kitty", "st", "xterm",
-                "konsole", "gnome-terminal", "foot",
-            ];
-
-            if let Some(class) = props.get(&WindowProperty::Class) {
-                return Ok(terminal_classes.iter().any(|tc| class.contains(tc)));
-            }
-        }
-    }
-
-    Ok(false)
 }
 
 fn get_terminal_command() -> String {
@@ -993,47 +821,33 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     debug!("Wrapper script: {} with args: {:?}", WRAPPER_PATH, wrapper_args);
     debug!("Terminal command: {}", get_terminal_command());
 
-    // Use -name to set X11 instance name (won't be overwritten by shell like title can be)
-    // This allows reliable window matching even when shell PS1/PROMPT_COMMAND changes the title
-    Command::new(get_terminal_command())
-        .arg("-name")
-        .arg(&title)
+    // Get the host for creating the I3muxWindow identity
+    let host = ws_state.host.clone();
+
+    // Generate instance name (same format as marks)
+    let instance = I3muxWindow::mark_from_parts(&host, &socket);
+
+    // Build terminal command with instance-specific args
+    let terminal = get_terminal_command();
+    let instance_args = build_terminal_instance_args(&terminal, &instance);
+
+    debug!("Instance name: {}", instance);
+    debug!("Terminal args: {:?}", instance_args);
+
+    // Spawn the terminal with instance set via terminal-specific CLI args
+    let mut cmd = Command::new(&terminal);
+    cmd.args(&instance_args)
         .arg("-T")
         .arg(&title)
         .arg("-e")
         .arg(WRAPPER_PATH)
-        .args(&wrapper_args)
-        .spawn()
-        .context("Failed to launch i3mux terminal")?;
+        .args(&wrapper_args);
 
-    debug!("Terminal spawned successfully");
+    cmd.spawn().context("Failed to launch i3mux terminal")?;
 
-    // Wait for window to appear and mark it
-    // Match on instance name which is stable (title can change due to shell PS1)
-    // For SSH connections, this can take longer, so retry with backoff
+    // Wait for window to appear and apply i3mux mark
     let mut conn = I3Connection::connect()?;
-    let mut attempts = 0;
-    let max_attempts = 20; // Up to 2 seconds (20 * 100ms)
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Try to mark the window by instance name (more reliable than title)
-        let mark_cmd = format!("[instance=\"{}\"] mark --add i3mux-terminal", title);
-        let result = conn.run_command(&mark_cmd)?;
-
-        // Check if the command succeeded (window was found)
-        if result.outcomes.iter().any(|o| o.success) {
-            debug!("Successfully marked window '{}' after {} attempts", title, attempts + 1);
-            break;
-        }
-
-        attempts += 1;
-        if attempts >= max_attempts {
-            debug!("ERROR: Failed to find window with title '{}' after {} attempts", title, attempts);
-            anyhow::bail!("Failed to find window with title '{}' after {} attempts", title, attempts);
-        }
-    }
+    wait_for_window_and_mark(&mut conn, &instance, &host, &socket)?;
 
     debug!("launch_i3mux_terminal completed successfully");
     Ok(())
@@ -1098,6 +912,9 @@ fn restore_layout(
         // Launch terminal for this socket
         let title = format!("{}{}:{}", MARKER, remote_host, socket_id);
 
+        // Generate instance name (same format as marks)
+        let instance = I3muxWindow::mark_from_parts(remote_host, socket_id);
+
         let attach_cmd = format!(
             r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'exec bash -lc "{} attach {}"'"#,
             remote_host, REMOTE_HELPER_PATH, socket_id
@@ -1108,38 +925,24 @@ fn restore_layout(
             title, attach_cmd
         );
 
-        // Use -name to set X11 instance name (won't be overwritten by shell like title can be)
-        Command::new(get_terminal_command())
-            .arg("-name")
-            .arg(&title)
+        // Build terminal command with instance-specific args
+        let terminal = get_terminal_command();
+        let instance_args = build_terminal_instance_args(&terminal, &instance);
+
+        // Spawn terminal with instance set via terminal-specific CLI args
+        let mut cmd = Command::new(&terminal);
+        cmd.args(&instance_args)
             .arg("-T")
             .arg(&title)
             .arg("-e")
             .arg("bash")
             .arg("-c")
-            .arg(&wrapper)
-            .spawn()?;
+            .arg(&wrapper);
 
-        // Wait for window to appear with retry logic (SSH connections can be slow)
-        // Match on instance name which is stable (title can change due to shell PS1)
-        let mut attempts = 0;
-        let max_attempts = 20; // Up to 2 seconds
+        cmd.spawn().context("Failed to spawn terminal for layout restore")?;
 
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            let mark_cmd = format!("[instance=\"{}\"] mark --add i3mux-terminal", title);
-            let result = conn.run_command(&mark_cmd)?;
-
-            if result.outcomes.iter().any(|o| o.success) {
-                break;
-            }
-
-            attempts += 1;
-            if attempts >= max_attempts {
-                anyhow::bail!("Failed to find window with instance '{}' during layout restore", title);
-            }
-        }
+        // Wait for window to appear and apply i3mux mark
+        wait_for_window_and_mark(conn, &instance, remote_host, socket_id)?;
 
         // Execute layout command if available
         if i < commands.len() {

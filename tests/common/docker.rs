@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use testcontainers::{core::WaitFor, runners::SyncRunner, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::SyncRunner, GenericImage};
 
 pub struct ContainerManager {
     xvfb_container: testcontainers::Container<GenericImage>,

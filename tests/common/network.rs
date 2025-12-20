@@ -1,6 +1,6 @@
 // Network manipulation for SSH failure simulation
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use super::docker::ContainerManager;
 
 pub struct NetworkManipulator<'a> {

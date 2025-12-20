@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::docker::ContainerManager;
 use super::i3mux::I3muxRunner;
 use super::network::NetworkManipulator;
-use super::screenshot::{compare_screenshots, load_golden_image, save_comparison_failure, ComparisonResult};
+use super::screenshot::{compare_screenshots, load_golden_image, save_comparison_failure};
 use super::comparison_spec::ComparisonSpec;
 
 /// Session type for i3mux

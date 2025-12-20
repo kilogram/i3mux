@@ -1,6 +1,5 @@
 // Visual diff generation for failed screenshot comparisons
 
-use anyhow::Result;
 use image::{Rgba, RgbaImage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +14,7 @@ pub enum DiffType {
 /// - Gray pixels: matching pixels (dimmed for clarity)
 pub fn generate_diff_image(
     golden: &RgbaImage,
-    actual: &RgbaImage,
+    _actual: &RgbaImage,
     diff_pixels: &[(u32, u32, DiffType)],
 ) -> RgbaImage {
     let (width, height) = golden.dimensions();

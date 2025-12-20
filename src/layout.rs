@@ -1,7 +1,13 @@
+//! Layout capture and restoration for i3mux
+//!
+//! This module handles capturing the current i3 layout structure and
+//! serializing/deserializing it for session persistence.
+
 use anyhow::Result;
-use i3ipc::reply::Node;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+
+use crate::window::I3muxWindow;
 
 /// Simplified i3 layout representation for serialization
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -40,92 +46,30 @@ pub enum Layout {
     },
 }
 
-const MARKER: &str = "i3mux:";
-
 impl Layout {
-    /// Capture layout from i3 workspace tree
-    pub fn capture_from_workspace(workspace_node: &Node) -> Result<Option<Self>> {
-        Self::capture_node(workspace_node)
-    }
+    /// Capture layout from i3 workspace by number
+    ///
+    /// This uses i3-msg directly to get the tree and identify i3mux windows
+    /// by their marks (the most reliable identification method).
+    pub fn capture_from_workspace_num(workspace_num: i32) -> Result<Option<Self>> {
+        let output = Command::new("i3-msg")
+            .args(["-t", "get_tree"])
+            .output()?;
 
-    fn capture_node(node: &Node) -> Result<Option<Self>> {
-        use i3ipc::reply::WindowProperty;
-
-        // Check if this is an i3mux terminal by looking at window instance name
-        // (more reliable than title which can be changed by shell PS1/PROMPT_COMMAND)
-
-        // First try i3ipc's window_properties
-        let instance = if let Some(props) = &node.window_properties {
-            props.get(&WindowProperty::Instance).cloned()
-        } else if let Some(window_id) = node.window {
-            // Fallback: i3ipc returns None for window_properties when i3 includes
-            // unknown property keys (like "machine"). Use i3-msg directly as workaround.
-            get_window_instance(window_id as u64)
-        } else {
-            None
-        };
-
-        if let Some(instance) = instance {
-            if instance.starts_with(MARKER) {
-                // Extract socket ID from instance: "i3mux:host:socket"
-                let clean_name = instance.trim_start_matches(MARKER);
-                if let Some(socket_part) = clean_name.split(':').nth(1) {
-                    return Ok(Some(Layout::Terminal {
-                        socket: socket_part.to_string(),
-                        percent: node.percent,
-                    }));
-                }
-            }
+        if !output.status.success() {
+            anyhow::bail!("i3-msg get_tree failed");
         }
 
-        // Fallback: also check title for backwards compatibility
-        if let Some(name) = &node.name {
-            if name.starts_with(MARKER) {
-                let clean_name = name.trim_start_matches(MARKER);
-                if let Some(socket_part) = clean_name.split(':').nth(1) {
-                    return Ok(Some(Layout::Terminal {
-                        socket: socket_part.to_string(),
-                        percent: node.percent,
-                    }));
-                }
-            }
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let tree: serde_json::Value = serde_json::from_str(&json_str)?;
+
+        // Find the workspace node
+        let ws_node = find_workspace_node(&tree, workspace_num);
+
+        match ws_node {
+            Some(node) => capture_node_from_json(node),
+            None => Ok(None),
         }
-
-        // Not a terminal, check if it's a container with i3mux children
-        let children: Vec<Layout> = node
-            .nodes
-            .iter()
-            .chain(node.floating_nodes.iter())
-            .filter_map(|child| Self::capture_node(child).ok().flatten())
-            .collect();
-
-        if children.is_empty() {
-            return Ok(None);
-        }
-
-        // Determine container type from layout
-        use i3ipc::reply::NodeLayout;
-        let layout = match node.layout {
-            NodeLayout::SplitH => Layout::HSplit {
-                children,
-                percent: node.percent,
-            },
-            NodeLayout::SplitV => Layout::VSplit {
-                children,
-                percent: node.percent,
-            },
-            NodeLayout::Tabbed => Layout::Tabbed { children },
-            NodeLayout::Stacked => Layout::Stacked { children },
-            _ => {
-                // Default to vsplit if unknown
-                Layout::VSplit {
-                    children,
-                    percent: node.percent,
-                }
-            }
-        };
-
-        Ok(Some(layout))
     }
 
     /// Get list of all socket IDs in this layout
@@ -187,54 +131,82 @@ impl Layout {
     }
 }
 
-/// Get window instance name using i3-msg directly (workaround for i3ipc crate bug)
-/// The i3ipc crate returns None for window_properties if any unknown property key exists
-fn get_window_instance(window_id: u64) -> Option<String> {
-    // Run i3-msg -t get_tree and extract instance for this window
-    let output = Command::new("i3-msg")
-        .args(["-t", "get_tree"])
-        .output()
-        .ok()?;
+// ============ Internal JSON-based capture (uses marks) ============
 
-    if !output.status.success() {
-        return None;
-    }
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-
-    // Parse JSON and find the window with matching ID
-    let tree: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-
-    find_window_instance(&tree, window_id)
-}
-
-fn find_window_instance(node: &serde_json::Value, window_id: u64) -> Option<String> {
-    // Check if this node has the window we're looking for
-    if let Some(window) = node.get("window").and_then(|w| w.as_u64()) {
-        if window == window_id {
-            // Found the window, get its instance from window_properties
-            if let Some(props) = node.get("window_properties") {
-                if let Some(instance) = props.get("instance").and_then(|i| i.as_str()) {
-                    return Some(instance.to_string());
+fn capture_node_from_json(node: &serde_json::Value) -> Result<Option<Layout>> {
+    // Check if this node is an i3mux terminal by looking at marks
+    if let Some(marks) = node.get("marks").and_then(|m| m.as_array()) {
+        for mark in marks {
+            if let Some(mark_str) = mark.as_str() {
+                if let Some(identity) = I3muxWindow::from_mark(mark_str) {
+                    // This is an i3mux terminal
+                    let percent = node.get("percent").and_then(|p| p.as_f64());
+                    return Ok(Some(Layout::Terminal {
+                        socket: identity.socket,
+                        percent,
+                    }));
                 }
             }
         }
     }
 
-    // Recursively search nodes
+    // Not a terminal, check if it's a container with i3mux children
+    let mut children = Vec::new();
+
+    // Check regular nodes
     if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
         for child in nodes {
-            if let Some(instance) = find_window_instance(child, window_id) {
-                return Some(instance);
+            if let Some(layout) = capture_node_from_json(child)? {
+                children.push(layout);
             }
         }
     }
 
-    // Also search floating_nodes
+    // Check floating nodes
     if let Some(nodes) = node.get("floating_nodes").and_then(|n| n.as_array()) {
         for child in nodes {
-            if let Some(instance) = find_window_instance(child, window_id) {
-                return Some(instance);
+            if let Some(layout) = capture_node_from_json(child)? {
+                children.push(layout);
+            }
+        }
+    }
+
+    if children.is_empty() {
+        return Ok(None);
+    }
+
+    // Determine container type from layout
+    let layout_type = node.get("layout").and_then(|l| l.as_str()).unwrap_or("splith");
+    let percent = node.get("percent").and_then(|p| p.as_f64());
+
+    let layout = match layout_type {
+        "splith" => Layout::HSplit { children, percent },
+        "splitv" => Layout::VSplit { children, percent },
+        "tabbed" => Layout::Tabbed { children },
+        "stacked" => Layout::Stacked { children },
+        _ => Layout::VSplit { children, percent }, // Default
+    };
+
+    Ok(Some(layout))
+}
+
+fn find_workspace_node(node: &serde_json::Value, workspace_num: i32) -> Option<&serde_json::Value> {
+    // Check if this is the workspace we're looking for
+    if let Some(node_type) = node.get("type").and_then(|t| t.as_str()) {
+        if node_type == "workspace" {
+            if let Some(num) = node.get("num").and_then(|n| n.as_i64()) {
+                if num == workspace_num as i64 {
+                    return Some(node);
+                }
+            }
+        }
+    }
+
+    // Recurse into children
+    if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
+        for child in nodes {
+            if let Some(found) = find_workspace_node(child, workspace_num) {
+                return Some(found);
             }
         }
     }
