@@ -3,9 +3,41 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
-use testcontainers::{core::WaitFor, runners::SyncRunner, GenericImage};
+use testcontainers::{core::WaitFor, runners::SyncRunner, GenericImage, ImageExt};
+
+/// Container runtime configuration - detected once, used everywhere
+struct ContainerRuntime {
+    /// CLI command: "docker" or "podman"
+    cli: &'static str,
+    /// Compose command: "docker-compose" or "podman-compose"
+    compose: &'static str,
+}
+
+static RUNTIME: OnceLock<ContainerRuntime> = OnceLock::new();
+
+fn runtime() -> &'static ContainerRuntime {
+    RUNTIME.get_or_init(|| {
+        // Check DOCKER_HOST to see if podman socket is configured
+        let use_podman = std::env::var("DOCKER_HOST")
+            .map(|h| h.contains("podman"))
+            .unwrap_or(false);
+
+        if use_podman {
+            ContainerRuntime {
+                cli: "podman",
+                compose: "podman-compose",
+            }
+        } else {
+            ContainerRuntime {
+                cli: "docker",
+                compose: "docker-compose",
+            }
+        }
+    })
+}
 
 pub struct ContainerManager {
     xvfb_container: testcontainers::Container<GenericImage>,
@@ -17,21 +49,19 @@ impl ContainerManager {
         // Build images ONCE (they'll be cached by docker/podman)
         Self::ensure_images_built()?;
 
-        println!("Starting containers with testcontainers...");
+        let image_name = Self::get_image_name();
 
         // Create Xvfb container - testcontainers handles lifecycle
-        let xvfb_image = GenericImage::new("localhost/docker_i3mux-test-xephyr", "latest")
-            .with_wait_for(WaitFor::Nothing);
+        let xvfb_container = GenericImage::new(image_name.clone(), "latest".to_string())
+            .with_wait_for(WaitFor::message_on_stdout("Test environment is ready!"))
+            .with_cmd(["/opt/i3mux-test/start-xephyr.sh"])
+            .start()?;
 
-        let xvfb_container = xvfb_image.start()?;
-
-        // Create SSH remote container
-        let remote_image = GenericImage::new("localhost/docker_i3mux-remote-ssh", "latest")
-            .with_wait_for(WaitFor::Nothing);
-
-        let remote_container = remote_image.start()?;
-
-        println!("✓ Containers started (testcontainers will auto-cleanup)");
+        // Create SSH remote container (same image, different command)
+        let remote_container = GenericImage::new(image_name, "latest".to_string())
+            .with_wait_for(WaitFor::message_on_stderr("Server listening"))
+            .with_cmd(["/usr/sbin/sshd", "-D", "-e"])
+            .start()?;
 
         let mgr = Self {
             xvfb_container,
@@ -48,17 +78,17 @@ impl ContainerManager {
     }
 
     fn setup_container_files(&self) -> Result<()> {
-        let docker_cmd = Self::get_docker_cmd();
+        let cli = runtime().cli;
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
 
         // Copy i3mux binary to xvfb container (use statically-linked musl binary)
         let i3mux_binary = PathBuf::from(manifest_dir).join("target/x86_64-unknown-linux-musl/debug/i3mux");
         if !i3mux_binary.exists() {
-            anyhow::bail!("i3mux binary not found. Please run 'cargo build --target x86_64-unknown-linux-musl' first.");
+            anyhow::bail!("i3mux musl binary not found.\nRun: cargo build --target x86_64-unknown-linux-musl");
         }
 
         let xvfb_id = self.xvfb_container.id();
-        Command::new(&docker_cmd)
+        Command::new(cli)
             .args(&[
                 "cp",
                 i3mux_binary.to_str().unwrap(),
@@ -74,7 +104,7 @@ impl ContainerManager {
         self.exec_in_xephyr("mkdir -p /opt/i3mux-test/color-scripts")?;
 
         let color_fill_script = PathBuf::from(manifest_dir).join("tests/color-scripts/color-fill.sh");
-        Command::new(&docker_cmd)
+        Command::new(cli)
             .args(&[
                 "cp",
                 color_fill_script.to_str().unwrap(),
@@ -91,7 +121,7 @@ impl ContainerManager {
         let ssh_key = PathBuf::from(manifest_dir).join("tests/docker/ssh-keys/id_rsa");
         let ssh_pub = PathBuf::from(manifest_dir).join("tests/docker/ssh-keys/id_rsa.pub");
 
-        Command::new(&docker_cmd)
+        Command::new(cli)
             .args(&[
                 "cp",
                 ssh_key.to_str().unwrap(),
@@ -100,7 +130,7 @@ impl ContainerManager {
             .status()
             .context("Failed to copy SSH private key to xvfb container")?;
 
-        Command::new(&docker_cmd)
+        Command::new(cli)
             .args(&[
                 "cp",
                 ssh_pub.to_str().unwrap(),
@@ -138,13 +168,13 @@ Host i3mux-remote-ssh
         let remote_id = self.remote_container.id();
 
         // Create .ssh directory for testuser
-        Command::new(&docker_cmd)
+        Command::new(cli)
             .args(&["exec", remote_id, "bash", "-c", "mkdir -p /home/testuser/.ssh && chown testuser:testuser /home/testuser/.ssh && chmod 700 /home/testuser/.ssh"])
             .status()
             .context("Failed to create .ssh directory in remote container")?;
 
         // Copy public key to remote container
-        Command::new(&docker_cmd)
+        Command::new(cli)
             .args(&[
                 "cp",
                 ssh_pub.to_str().unwrap(),
@@ -154,7 +184,7 @@ Host i3mux-remote-ssh
             .context("Failed to copy public key to remote container")?;
 
         // Set proper permissions on authorized_keys
-        Command::new(&docker_cmd)
+        Command::new(cli)
             .args(&["exec", remote_id, "bash", "-c", "chown testuser:testuser /home/testuser/.ssh/authorized_keys && chmod 600 /home/testuser/.ssh/authorized_keys"])
             .status()
             .context("Failed to set permissions on authorized_keys in remote container")?;
@@ -163,47 +193,41 @@ Host i3mux-remote-ssh
     }
 
     fn ensure_images_built() -> Result<()> {
-        // Check if images exist
-        let docker_cmd = Self::get_docker_cmd();
-        let check = Command::new(&docker_cmd)
-            .args(&["images", "-q", "localhost/docker_i3mux-test-xephyr:latest"])
+        let rt = runtime();
+        let image_name = format!("{}:latest", Self::get_image_name());
+        let check = Command::new(rt.cli)
+            .args(&["images", "-q", &image_name])
             .output()?;
 
         if check.stdout.is_empty() {
-            // Images don't exist, build them
-            println!("Building container images (one-time setup)...");
+            // Image doesn't exist, build it
+            println!("Building container image (one-time setup)...");
             let docker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/docker");
 
-            let compose_cmd = if Command::new("podman-compose").arg("--version").output().is_ok() {
-                "podman-compose"
-            } else {
-                "docker-compose"
-            };
-
-            let status = Command::new(compose_cmd)
+            let status = Command::new(rt.compose)
                 .current_dir(&docker_dir)
                 .args(&["build"])
                 .status()
-                .context("Failed to build images")?;
+                .context("Failed to build image")?;
 
             if !status.success() {
                 anyhow::bail!("Image build failed");
             }
-            println!("✓ Images built and cached");
+            println!("✓ Image built and cached");
         } else {
-            println!("✓ Using cached container images");
+            println!("✓ Using cached container image");
         }
 
         Ok(())
     }
 
     fn setup_networking(&self) -> Result<()> {
-        let docker_cmd = Self::get_docker_cmd();
+        let cli = runtime().cli;
         let remote_id = self.remote_container.id();
 
         // Get the IP address of the remote container
-        let inspect_output = Command::new(&docker_cmd)
+        let inspect_output = Command::new(cli)
             .args(&[
                 "inspect",
                 "-f",
@@ -232,19 +256,15 @@ Host i3mux-remote-ssh
         Ok(())
     }
 
-    fn get_docker_cmd() -> String {
-        if Command::new("podman").arg("--version").output().is_ok() {
-            "podman".to_string()
-        } else {
-            "docker".to_string()
-        }
+    fn get_image_name() -> String {
+        // Use short name - both docker and podman can find local images this way
+        // Note: podman stores as localhost/i3mux-test but finds it via short name
+        "i3mux-test".to_string()
     }
 
     pub fn exec_in_xephyr(&self, cmd: &str) -> Result<std::process::Output> {
         let container_id = self.xvfb_container.id();
-        let docker_cmd = Self::get_docker_cmd();
-
-        Command::new(docker_cmd)
+        Command::new(runtime().cli)
             .args(&["exec", container_id, "bash", "-c", cmd])
             .output()
             .context("Failed to exec in Xvfb container")
@@ -252,9 +272,7 @@ Host i3mux-remote-ssh
 
     pub fn exec_in_remote(&self, cmd: &str) -> Result<std::process::Output> {
         let container_id = self.remote_container.id();
-        let docker_cmd = Self::get_docker_cmd();
-
-        Command::new(docker_cmd)
+        Command::new(runtime().cli)
             .args(&["exec", container_id, "bash", "-c", cmd])
             .output()
             .context("Failed to exec in remote container")
@@ -304,9 +322,7 @@ Host i3mux-remote-ssh
 
     pub fn copy_from_xephyr(&self, container_path: &str, host_path: &str) -> Result<()> {
         let container_id = self.xvfb_container.id();
-        let docker_cmd = Self::get_docker_cmd();
-
-        let status = Command::new(docker_cmd)
+        let status = Command::new(runtime().cli)
             .args(&[
                 "cp",
                 &format!("{}:{}", container_id, container_path),

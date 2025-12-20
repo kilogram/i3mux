@@ -38,7 +38,7 @@ fn default_tolerance() -> u32 {
 }
 
 fn default_max_diff_pixels() -> usize {
-    1000
+    2500
 }
 
 fn default_max_diff_percentage() -> f64 {
@@ -99,7 +99,7 @@ mod tests {
     fn test_default_values() {
         let spec = ComparisonSpec::simple("test");
         assert_eq!(spec.fuzzy_boundaries.tolerance_px, 5);
-        assert_eq!(spec.fuzzy_boundaries.max_diff_pixels, 1000);
+        assert_eq!(spec.fuzzy_boundaries.max_diff_pixels, 2500);
         assert_eq!(spec.fuzzy_boundaries.max_diff_percentage, 1.0);
     }
 

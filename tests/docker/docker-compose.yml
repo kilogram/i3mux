@@ -2,9 +2,10 @@ version: '3.8'
 
 services:
   i3mux-test-xephyr:
+    image: i3mux-test:latest
     build:
       context: .
-      dockerfile: Dockerfile.xephyr
+      dockerfile: Dockerfile
     container_name: i3mux-test-xephyr
     hostname: i3mux-test-xephyr
     networks:
@@ -24,9 +25,9 @@ services:
     tty: true
 
   i3mux-remote-ssh:
-    build:
-      context: .
-      dockerfile: Dockerfile.remote
+    image: i3mux-test:latest
+    depends_on:
+      - i3mux-test-xephyr
     container_name: i3mux-remote-ssh
     hostname: i3mux-remote-ssh
     networks:
@@ -40,6 +41,7 @@ services:
       - /tmp:exec
     ports:
       - "2222:22"
+    command: /usr/sbin/sshd -D -e
     stdin_open: true
     tty: true
 

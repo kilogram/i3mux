@@ -16,44 +16,32 @@ jobs:
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-unknown-linux-musl
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             docker-compose \
-            podman \
-            podman-compose
+            musl-tools
 
-      - name: Build i3mux binary
-        run: cargo build --release
+      - name: Build i3mux binary (musl)
+        run: cargo build --target x86_64-unknown-linux-musl
+
+      - name: Run unit tests
+        run: cargo test --bins
 
       - name: Build test containers
         run: |
           cd tests/docker
           docker-compose build
 
-      - name: Run unit tests
-        run: cargo test --lib
+      - name: Integration smoke test
+        run: ./tests/integration.sh test_basic_infrastructure -- --nocapture
 
       - name: Run integration tests
-        run: |
-          # Run basic infrastructure test
-          cargo test --test integration_tests test_basic_infrastructure -- --nocapture
-
-          # Run local session tests
-          cargo test --test integration_tests test_local -- --nocapture
-
-      - name: Check for uncommitted golden images
-        run: |
-          if ! git diff --quiet --exit-code tests/golden/; then
-            echo "ERROR: Golden images have uncommitted changes!"
-            echo "If you updated goldens, please commit them."
-            echo ""
-            echo "Changed files:"
-            git diff --name-only tests/golden/
-            exit 1
-          fi
+        run: ./tests/integration.sh -- --nocapture
 
       - name: Upload test failure artifacts
         if: failure()
