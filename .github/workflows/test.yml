@@ -50,11 +50,3 @@ jobs:
           name: test-failures
           path: tests/test-output/failures/
           if-no-files-found: ignore
-
-      - name: Upload test screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-screenshots
-          path: tests/screenshots/
-          if-no-files-found: ignore
