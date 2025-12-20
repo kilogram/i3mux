@@ -1059,20 +1059,28 @@ fn test_hsplit_in_tabs(#[case] session: Session) -> Result<()> {
     env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
     std::thread::sleep(Duration::from_millis(800));
 
-    // Focus back to first tab
-    env.i3_exec("focus parent")?;
+    // Navigate to Tab 1 from Yellow:
+    // Yellow -> Blue (focus left within Tab 2's hsplit)
+    // Blue -> Tab 1 (focus left crosses into Tab 1, landing on Green)
+    // Green -> Red (focus left within Tab 1's hsplit)
+    env.i3_exec("focus left")?;  // Yellow -> Blue
     std::thread::sleep(Duration::from_millis(200));
-    env.focus_prev_tab()?;
+    env.i3_exec("focus left")?;  // Blue -> Green (switches tabs)
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("focus left")?;  // Green -> Red
     std::thread::sleep(Duration::from_millis(300));
 
-    // Capture tab 1 (Red | Green)
+    // Capture tab 1 (Red | Green) - now focused on Red
     let screenshot1 = env.capture_screenshot()?;
 
-    // Focus tab 2
-    env.focus_next_tab()?;
+    // Navigate to Tab 2:
+    // Red -> Green -> Blue -> Yellow (or we can go right 3 times)
+    env.i3_exec("focus right")?;  // Red -> Green
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("focus right")?;  // Green -> Blue (switches tabs)
     std::thread::sleep(Duration::from_millis(300));
 
-    // Capture tab 2 (Blue | Yellow)
+    // Capture tab 2 (Blue | Yellow) - now focused on Blue
     let screenshot2 = env.capture_screenshot()?;
 
     let screenshots = vec![screenshot1, screenshot2];
@@ -1124,17 +1132,20 @@ fn test_vsplit_in_tabs(#[case] session: Session) -> Result<()> {
     env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
     std::thread::sleep(Duration::from_millis(800));
 
-    // Focus back to first tab
-    env.i3_exec("focus parent")?;
+    // Navigate to Tab 1 from Yellow:
+    // parent -> up -> left to switch tabs
+    env.i3_exec("focus parent")?;  // Yellow -> Tab 2's vsplit container
     std::thread::sleep(Duration::from_millis(200));
-    env.focus_prev_tab()?;
+    env.i3_exec("focus up")?;      // Up to tabbed container level
+    std::thread::sleep(Duration::from_millis(200));
+    env.i3_exec("focus left")?;    // Switch to Tab 1
     std::thread::sleep(Duration::from_millis(300));
 
     // Capture tab 1 (Red / Green)
     let screenshot1 = env.capture_screenshot()?;
 
-    // Focus tab 2
-    env.focus_next_tab()?;
+    // Navigate to Tab 2:
+    env.i3_exec("focus right")?;  // Tab 1 -> Tab 2 (switches tabs)
     std::thread::sleep(Duration::from_millis(300));
 
     // Capture tab 2 (Blue / Yellow)
