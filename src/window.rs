@@ -88,11 +88,6 @@ impl I3muxWindow {
         })
     }
 
-    /// Check if a mark string identifies an i3mux window
-    pub fn is_i3mux_mark(mark: &str) -> bool {
-        mark.starts_with(MARK_PREFIX)
-    }
-
     /// Apply the i3mux mark to a window
     ///
     /// This should be called after the window appears to mark it as i3mux-managed.
@@ -336,10 +331,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_i3mux_mark() {
-        assert!(I3muxWindow::is_i3mux_mark("_i3mux:local:ws1-001"));
-        assert!(I3muxWindow::is_i3mux_mark("_i3mux:user@host:ws2-003"));
-        assert!(!I3muxWindow::is_i3mux_mark("random-mark"));
-        assert!(!I3muxWindow::is_i3mux_mark("i3mux-terminal"));
+    fn test_mark_starts_with_prefix() {
+        // Valid marks should parse successfully
+        assert!(I3muxWindow::from_mark("_i3mux:local:ws1-001").is_some());
+        assert!(I3muxWindow::from_mark("_i3mux:user@host:ws2-003").is_some());
+        // Invalid marks should not parse
+        assert!(I3muxWindow::from_mark("random-mark").is_none());
+        assert!(I3muxWindow::from_mark("i3mux-terminal").is_none());
     }
 }

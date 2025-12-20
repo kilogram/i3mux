@@ -16,16 +16,6 @@ pub struct ComparisonResult {
     pub passed: bool,
 }
 
-impl ComparisonResult {
-    pub fn success() -> Self {
-        Self {
-            total_diff_pixels: 0,
-            diff_percentage: 0.0,
-            diff_map: Vec::new(),
-            passed: true,
-        }
-    }
-}
 
 /// Compare two screenshots using a comparison specification
 ///
@@ -226,7 +216,7 @@ pub fn save_comparison_failure(
 /// Load a golden image
 pub fn load_golden_image<P: AsRef<Path>>(name: P) -> Result<RgbaImage> {
     let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/golden")
+        .join("tests/integration/golden")
         .join(name.as_ref());
 
     image::open(&golden_path)

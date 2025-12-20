@@ -68,29 +68,10 @@ impl ComparisonSpec {
         Ok(spec)
     }
 
-    /// Save a comparison spec to a TOML file
-    pub fn save<P: AsRef<Path>>(&self, name: P) -> Result<()> {
-        let spec_path = Self::spec_path(name.as_ref())?;
-
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = spec_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create spec directory: {}", parent.display()))?;
-        }
-
-        let contents = toml::to_string_pretty(self)
-            .context("Failed to serialize spec to TOML")?;
-
-        fs::write(&spec_path, contents)
-            .with_context(|| format!("Failed to write spec file: {}", spec_path.display()))?;
-
-        Ok(())
-    }
-
     /// Get the path to a spec file
     fn spec_path(name: &Path) -> Result<PathBuf> {
         let spec_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/golden/specs");
+            .join("tests/integration/golden/specs");
 
         let mut path = spec_dir.join(name);
         if path.extension().is_none() {

@@ -119,7 +119,8 @@ impl<'a> I3muxRunner<'a> {
         anyhow::bail!("Terminal window did not appear within timeout")
     }
 
-    /// List sessions
+    /// List sessions (kept for potential future session management tests)
+    #[allow(dead_code)]
     pub fn list_sessions(&self, session: &Session) -> Result<Vec<String>> {
         let cmd = match session {
             Session::Local => "DISPLAY=:99 i3mux list".to_string(),
@@ -142,7 +143,8 @@ impl<'a> I3muxRunner<'a> {
         Ok(sessions)
     }
 
-    /// Kill a session
+    /// Kill a session (kept for potential future session management tests)
+    #[allow(dead_code)]
     pub fn kill_session(&self, session: &Session, name: &str) -> Result<()> {
         let cmd = match session {
             Session::Local => format!("DISPLAY=:99 i3mux kill {}", name),

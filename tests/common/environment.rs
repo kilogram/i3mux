@@ -18,8 +18,9 @@ pub enum Session {
     Remote(&'static str),
 }
 
-/// Color for terminal backgrounds
+/// Color for terminal backgrounds (used by network failure tests)
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum ColorScript {
     Red,
     Green,
@@ -89,24 +90,9 @@ impl TestEnvironment {
         self.i3mux().attach(&session, name, false)
     }
 
-    /// Attach to a session with --force
-    pub fn i3mux_attach_force(&self, session: Session, name: &str) -> Result<()> {
-        self.i3mux().attach(&session, name, true)
-    }
-
-    /// Launch a terminal with colored background
+    /// Launch a terminal with colored background (used by network tests)
     pub fn launch_terminal(&self, color: ColorScript) -> Result<u64> {
         self.i3mux().launch_terminal(&color)
-    }
-
-    /// List available sessions
-    pub fn list_sessions(&self, session: Session) -> Result<Vec<String>> {
-        self.i3mux().list_sessions(&session)
-    }
-
-    /// Kill a session
-    pub fn kill_session(&self, session: Session, name: &str) -> Result<()> {
-        self.i3mux().kill_session(&session, name)
     }
 
     // ==================== i3 Window Manager Operations ====================
@@ -272,7 +258,7 @@ impl TestEnvironment {
         if self.update_goldens {
             // Save as golden image
             let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/golden")
+                .join("tests/integration/golden")
                 .join(golden_name);
 
             if let Some(parent) = golden_path.parent() {
@@ -306,23 +292,6 @@ impl TestEnvironment {
         Ok(())
     }
 
-    /// Wait for window to finish rendering
-    pub fn wait_for_window_render(&self, _window_id: u64, duration: Duration) -> Result<()> {
-        std::thread::sleep(duration);
-        Ok(())
-    }
-
-    /// Wait for layout restoration to complete
-    pub fn wait_for_layout_restore(&self, duration: Duration) -> Result<()> {
-        std::thread::sleep(duration);
-        Ok(())
-    }
-
-    /// Focus child window in a direction (for cycling through tabs/stacks)
-    pub fn focus_child(&self) -> Result<()> {
-        self.i3_exec("focus child")
-    }
-
     /// Focus the next tab/window in a tabbed container (horizontal cycling)
     pub fn focus_next_tab(&self) -> Result<()> {
         self.i3_exec("focus right")
@@ -341,25 +310,6 @@ impl TestEnvironment {
     /// Focus the previous window in a stacked container (vertical cycling)
     pub fn focus_prev_stack(&self) -> Result<()> {
         self.i3_exec("focus up")
-    }
-
-    /// Get layout info for current workspace (returns JSON structure)
-    pub fn get_workspace_layout(&self) -> Result<String> {
-        let ws_output = self.container_mgr.exec_in_xephyr(
-            "DISPLAY=:99 i3-msg -t get_workspaces | jq -r '.[] | select(.focused==true) | .num'"
-        )?;
-
-        let ws_num = String::from_utf8_lossy(&ws_output.stdout)
-            .trim()
-            .parse::<i32>()
-            .context("Failed to get focused workspace number")?;
-
-        let output = self.container_mgr.exec_in_xephyr(&format!(
-            r#"DISPLAY=:99 i3-msg -t get_tree | jq '.. | select(.type? == "workspace" and .num? == {})'"#,
-            ws_num
-        ))?;
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Capture multiple screenshots by cycling through tabs/stacks
@@ -424,38 +374,12 @@ impl TestEnvironment {
         self.network().inject_packet_loss(percentage)
     }
 
-    /// Inject bandwidth throttling
-    pub fn inject_bandwidth_limit(&self, kbps: u32) -> Result<()> {
-        self.network().inject_bandwidth_limit(kbps)
-    }
-
-    /// Drop SSH connections
-    pub fn drop_ssh_connections(&self) -> Result<()> {
-        self.network().drop_ssh_connections()
-    }
-
-    /// Restart SSH daemon
-    pub fn restart_sshd(&self) -> Result<()> {
-        self.network().restart_sshd()
-    }
-
-    /// Block DNS resolution
-    pub fn block_dns(&self) -> Result<()> {
-        self.network().block_dns()
-    }
-
     /// Clear all network manipulation rules
     pub fn clear_network_rules(&self) -> Result<()> {
         self.network().clear_all_rules()
     }
 
     // ==================== Debug Helpers ====================
-
-    /// Run a command in the Xephyr container and return stdout
-    pub fn container_exec_in_xephyr(&self, cmd: &str) -> Result<String> {
-        let output = self.container_mgr.exec_in_xephyr(cmd)?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
 
     /// Read i3mux debug log from container
     pub fn read_debug_log(&self) -> Result<String> {

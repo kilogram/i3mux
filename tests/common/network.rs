@@ -1,12 +1,15 @@
 // Network manipulation for SSH failure simulation
+// Some methods are kept for potential future network failure tests
 
 use anyhow::Result;
 use super::docker::ContainerManager;
 
+#[allow(dead_code)]
 pub struct NetworkManipulator<'a> {
     container_mgr: &'a ContainerManager,
 }
 
+#[allow(dead_code)]
 impl<'a> NetworkManipulator<'a> {
     pub fn new(container_mgr: &'a ContainerManager) -> Self {
         Self { container_mgr }
