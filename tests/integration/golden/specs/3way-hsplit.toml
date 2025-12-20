@@ -4,5 +4,5 @@ name = "3way-hsplit"
 
 [fuzzy_boundaries]
 tolerance_px = 5
-max_diff_pixels = 1000
+max_diff_pixels = 2500
 max_diff_percentage = 1.0

@@ -183,9 +183,11 @@ pub fn save_comparison_failure(
     actual: &RgbaImage,
     result: &ComparisonResult,
 ) -> Result<PathBuf> {
+    // Sanitize test name for filesystem (replace :: with __ for Windows/NTFS compatibility)
+    let safe_name = test_name.replace("::", "__");
     let output_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/test-output/failures")
-        .join(test_name)
+        .join(&safe_name)
         .join(chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string());
 
     fs::create_dir_all(&output_dir)
