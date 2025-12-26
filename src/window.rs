@@ -20,9 +20,9 @@
 //! ```
 
 use anyhow::{Context, Result};
-use i3ipc::I3Connection;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+
+use crate::wm::WmBackend;
 
 /// Prefix for hidden i3 marks (underscore = hidden from title bar)
 pub const MARK_PREFIX: &str = "_i3mux:";
@@ -91,47 +91,41 @@ impl I3muxWindow {
     /// Apply the i3mux mark to a window
     ///
     /// This should be called after the window appears to mark it as i3mux-managed.
-    pub fn apply_mark(&self, conn: &mut I3Connection) -> Result<()> {
+    /// Uses con_id selector which works for both i3 and Sway.
+    pub fn apply_mark(&self, backend: &WmBackend) -> Result<()> {
         let mark = self.mark();
-        let cmd = format!("[id=\"{}\"] mark --add {}", self.window_id, mark);
-        let result = conn.run_command(&cmd)?;
-
-        if !result.outcomes.iter().any(|o| o.success) {
-            anyhow::bail!("Failed to apply mark '{}' to window {}", mark, self.window_id);
-        }
-
+        let cmd = format!("[con_id=\"{}\"] mark --add {}", self.window_id, mark);
+        backend.run_command(&cmd)?;
         Ok(())
     }
 }
 
-/// Find a window by its WM_CLASS instance name
+/// Find a window by its instance name (WM_CLASS instance on X11, app_id on Wayland)
 ///
-/// Searches the i3 tree for a window with the specified instance.
-/// Returns the window ID if found.
-pub fn find_window_by_instance(instance: &str) -> Option<u64> {
-    let output = Command::new("i3-msg")
-        .args(["-t", "get_tree"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let tree: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-
+/// Searches the window manager tree for a window with the specified instance.
+/// Returns the container ID if found.
+pub fn find_window_by_instance(backend: &WmBackend, instance: &str) -> Option<u64> {
+    let tree = backend.get_tree().ok()?;
     find_window_by_instance_in_tree(&tree, instance)
 }
 
 fn find_window_by_instance_in_tree(node: &serde_json::Value, target_instance: &str) -> Option<u64> {
-    // Check if this node has the target instance
-    if let Some(window_id) = node.get("window").and_then(|w| w.as_u64()) {
-        if let Some(props) = node.get("window_properties") {
-            if let Some(instance) = props.get("instance").and_then(|i| i.as_str()) {
-                if instance == target_instance {
-                    return Some(window_id);
-                }
+    // Get container ID - works for both i3 and Sway
+    // Sway uses "id" for container ID, i3 uses "id" as well (but also has "window" for X11 window ID)
+    let container_id = node.get("id").and_then(|w| w.as_u64());
+
+    // Check app_id first (Wayland/Sway)
+    if let Some(app_id) = node.get("app_id").and_then(|a| a.as_str()) {
+        if app_id == target_instance {
+            return container_id;
+        }
+    }
+
+    // Fall back to window_properties.instance (X11/i3)
+    if let Some(props) = node.get("window_properties") {
+        if let Some(instance) = props.get("instance").and_then(|i| i.as_str()) {
+            if instance == target_instance {
+                return container_id;
             }
         }
     }
@@ -159,9 +153,9 @@ fn find_window_by_instance_in_tree(node: &serde_json::Value, target_instance: &s
 /// Wait for a window to appear by instance name, then apply i3mux mark
 ///
 /// Polls until the window appears or max_attempts is reached.
-/// Returns the window ID on success.
+/// Returns the container ID on success.
 pub fn wait_for_window_and_mark(
-    conn: &mut I3Connection,
+    backend: &WmBackend,
     instance: &str,
     host: &str,
     socket: &str,
@@ -169,10 +163,10 @@ pub fn wait_for_window_and_mark(
     for attempt in 0..WINDOW_WAIT_MAX_ATTEMPTS {
         std::thread::sleep(std::time::Duration::from_millis(WINDOW_WAIT_INTERVAL_MS));
 
-        if let Some(window_id) = find_window_by_instance(instance) {
-            let i3mux_window = I3muxWindow::new(window_id, host, socket);
-            i3mux_window.apply_mark(conn)?;
-            return Ok(window_id);
+        if let Some(container_id) = find_window_by_instance(backend, instance) {
+            let i3mux_window = I3muxWindow::new(container_id, host, socket);
+            i3mux_window.apply_mark(backend)?;
+            return Ok(container_id);
         }
 
         // Log progress at intervals
@@ -192,19 +186,9 @@ pub fn wait_for_window_and_mark(
 }
 
 /// Find all i3mux windows in a specific workspace
-pub fn find_i3mux_windows_in_workspace(workspace_num: i32) -> Result<Vec<I3muxWindow>> {
-    let output = Command::new("i3-msg")
-        .args(["-t", "get_tree"])
-        .output()
-        .context("Failed to run i3-msg")?;
-
-    if !output.status.success() {
-        anyhow::bail!("i3-msg get_tree failed");
-    }
-
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    let tree: serde_json::Value = serde_json::from_str(&json_str)
-        .context("Failed to parse i3 tree JSON")?;
+pub fn find_i3mux_windows_in_workspace(workspace_num: i32, backend: &WmBackend) -> Result<Vec<I3muxWindow>> {
+    let tree = backend.get_tree()
+        .context("Failed to get window manager tree")?;
 
     // Find the workspace node first
     let ws_node = find_workspace_node(&tree, workspace_num);
@@ -220,20 +204,21 @@ pub fn find_i3mux_windows_in_workspace(workspace_num: i32) -> Result<Vec<I3muxWi
 }
 
 /// Kill all i3mux windows in a workspace
-pub fn kill_i3mux_windows_in_workspace(conn: &mut I3Connection, workspace_num: i32) -> Result<()> {
-    let windows = find_i3mux_windows_in_workspace(workspace_num)?;
+pub fn kill_i3mux_windows_in_workspace(backend: &WmBackend, workspace_num: i32) -> Result<()> {
+    let windows = find_i3mux_windows_in_workspace(workspace_num, backend)?;
 
     for window in windows {
-        let cmd = format!("[id=\"{}\"] kill", window.window_id);
-        let _ = conn.run_command(&cmd); // Ignore errors for individual windows
+        // Use con_id selector which works for both i3 and Sway
+        let cmd = format!("[con_id=\"{}\"] kill", window.window_id);
+        let _ = backend.run_command(&cmd); // Ignore errors for individual windows
     }
 
     Ok(())
 }
 
 /// Check if a workspace has any i3mux windows
-pub fn workspace_has_i3mux_windows(workspace_num: i32) -> Result<bool> {
-    let windows = find_i3mux_windows_in_workspace(workspace_num)?;
+pub fn workspace_has_i3mux_windows(workspace_num: i32, backend: &WmBackend) -> Result<bool> {
+    let windows = find_i3mux_windows_in_workspace(workspace_num, backend)?;
     Ok(!windows.is_empty())
 }
 
@@ -241,12 +226,13 @@ pub fn workspace_has_i3mux_windows(workspace_num: i32) -> Result<bool> {
 
 fn collect_i3mux_windows(node: &serde_json::Value, windows: &mut Vec<I3muxWindow>) {
     // Check if this node has marks
+    // Use "id" for container ID which works for both i3 and Sway
     if let Some(marks) = node.get("marks").and_then(|m| m.as_array()) {
-        if let Some(window_id) = node.get("window").and_then(|w| w.as_u64()) {
+        if let Some(container_id) = node.get("id").and_then(|w| w.as_u64()) {
             for mark in marks {
                 if let Some(mark_str) = mark.as_str() {
                     if let Some(mut identity) = I3muxWindow::from_mark(mark_str) {
-                        identity.window_id = window_id;
+                        identity.window_id = container_id;
                         windows.push(identity);
                         break; // Only count once per window
                     }

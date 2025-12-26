@@ -3,10 +3,10 @@ mod layout;
 mod session;
 mod types;
 mod window;
+mod wm;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use i3ipc::I3Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -31,6 +31,7 @@ use layout::Layout;
 use session::RemoteSession;
 use types::{RemoteHost, SessionName};
 use window::{I3muxWindow, wait_for_window_and_mark};
+use wm::{WmBackend, WmType};
 
 const MARKER: &str = "i3mux:"; // Marker prefix for window titles (for initial window matching)
 const LOCAL_DISPLAY: &str = "\x1b[3mlocal\x1b[0m"; // Italicized "local"
@@ -339,8 +340,8 @@ fn ensure_remote_helper(remote_host: &str) -> Result<()> {
 
 /// Activate i3mux for current workspace
 fn activate(remote: Option<String>, session_name: Option<String>) -> Result<()> {
-    let mut conn = I3Connection::connect()?;
-    let (ws_name, ws_num) = get_focused_workspace(&mut conn)?;
+    let backend = WmBackend::connect()?;
+    let (ws_name, ws_num) = get_focused_workspace(&backend)?;
 
     let mut state = LocalState::load()?;
 
@@ -391,8 +392,8 @@ fn activate(remote: Option<String>, session_name: Option<String>) -> Result<()> 
 
 /// Detach current workspace and save session
 fn detach(session_name: Option<String>) -> Result<()> {
-    let mut conn = I3Connection::connect()?;
-    let (ws_name, ws_num) = get_focused_workspace(&mut conn)?;
+    let backend = WmBackend::connect()?;
+    let (ws_name, ws_num) = get_focused_workspace(&backend)?;
 
     let mut state = LocalState::load()?;
 
@@ -407,7 +408,7 @@ fn detach(session_name: Option<String>) -> Result<()> {
     }
 
     // Capture layout using marks (most reliable identification method)
-    let layout = Layout::capture_from_workspace_num(ws_num)?
+    let layout = Layout::capture_from_workspace_num(ws_num, &backend)?
         .context("No i3mux terminals found in workspace")?;
 
     // Determine session name and validate at boundary
@@ -439,7 +440,7 @@ fn detach(session_name: Option<String>) -> Result<()> {
     println!("  Layout captured: {} terminals", remote_session.layout.get_sockets().len());
 
     // Close all i3mux terminals (identified by marks)
-    window::kill_i3mux_windows_in_workspace(&mut conn, ws_num)?;
+    window::kill_i3mux_windows_in_workspace(&backend, ws_num)?;
 
     // Clean up lock holder process and release lock
     let lock_key = format!("{}:{}", ws_state.host, final_session_name.as_str());
@@ -527,15 +528,15 @@ fn attach(
     println!("✓ Lock acquired for session '{}'", final_session_name);
 
     // Check workspace doesn't have existing i3mux terminals (non-i3mux windows are fine)
-    let mut conn = I3Connection::connect()?;
-    let (ws_name, ws_num) = get_focused_workspace(&mut conn)?;
+    let backend = WmBackend::connect()?;
+    let (ws_name, ws_num) = get_focused_workspace(&backend)?;
 
-    if window::workspace_has_i3mux_windows(ws_num)? {
+    if window::workspace_has_i3mux_windows(ws_num, &backend)? {
         anyhow::bail!("Workspace {} already has i3mux terminals. Detach or clear them first.", ws_num);
     }
 
     // Restore layout and launch terminals
-    restore_layout(&mut conn, &session, &ws_name, &host_display)?;
+    restore_layout(&backend, &session, &ws_name, &host_display)?;
 
     // Update local state
     let mut state = LocalState::load()?;
@@ -627,29 +628,29 @@ fn kill_session(remote: Option<String>, session: String) -> Result<()> {
 
 /// Launch terminal (smart detection)
 fn terminal() -> Result<()> {
-    let mut conn = I3Connection::connect()?;
-    let (ws_name, _) = get_focused_workspace(&mut conn)?;
+    let backend = WmBackend::connect()?;
+    let (ws_name, _) = get_focused_workspace(&backend)?;
 
     let state = LocalState::load()?;
 
     // Check if workspace is i3mux-bound
     if state.workspaces.get(&ws_name).is_none() {
-        return launch_normal_terminal();
+        return launch_normal_terminal(backend.wm_type());
     }
 
     // Workspace is i3mux-bound - always launch i3mux terminal
     // (The old logic checked focused window type, but that doesn't make sense:
     //  if the workspace is bound to i3mux, ALL terminals should be i3mux terminals)
-    launch_i3mux_terminal(&ws_name)?;
+    launch_i3mux_terminal(&ws_name, backend.wm_type())?;
 
     Ok(())
 }
 
 // Helper functions
 
-fn get_focused_workspace(conn: &mut I3Connection) -> Result<(String, i32)> {
-    let workspaces = conn.get_workspaces()?;
-    for ws in workspaces.workspaces {
+fn get_focused_workspace(backend: &WmBackend) -> Result<(String, i32)> {
+    let workspaces = backend.get_workspaces()?;
+    for ws in workspaces {
         if ws.focused {
             return Ok((ws.num.to_string(), ws.num));
         }
@@ -657,11 +658,11 @@ fn get_focused_workspace(conn: &mut I3Connection) -> Result<(String, i32)> {
     anyhow::bail!("No focused workspace found")
 }
 
-/// Build terminal-specific arguments to set WM_CLASS instance
+/// Build terminal-specific arguments to set window instance/app_id
 ///
-/// Different terminals have different CLI options for setting the X11 WM_CLASS instance.
-/// This function returns the appropriate arguments for the detected terminal.
-fn build_terminal_instance_args(terminal: &str, instance: &str) -> Vec<String> {
+/// Different terminals have different CLI options for setting the window identifier.
+/// On X11 (i3), this sets the WM_CLASS instance. On Wayland (Sway), this sets the app_id.
+fn build_terminal_instance_args(terminal: &str, instance: &str, wm_type: WmType) -> Vec<String> {
     // Extract just the binary name from the path
     let terminal_name = std::path::Path::new(terminal)
         .file_name()
@@ -669,33 +670,48 @@ fn build_terminal_instance_args(terminal: &str, instance: &str) -> Vec<String> {
         .unwrap_or(terminal);
 
     match terminal_name {
+        // Wayland-native terminals
+        "foot" => vec!["--app-id".to_string(), instance.to_string()],
+
+        // Terminals that work on both X11 and Wayland
+        "alacritty" => match wm_type {
+            WmType::Sway => vec!["--class".to_string(), instance.to_string()],
+            WmType::I3 => vec!["--class".to_string(), format!("Alacritty,{}", instance)],
+        },
+        "kitty" => vec!["--class".to_string(), instance.to_string()],
+
+        // X11-only terminals
         "xterm" => vec!["-name".to_string(), instance.to_string()],
-        "alacritty" => vec!["--class".to_string(), format!("Alacritty,{}", instance)],
-        "kitty" => vec!["--name".to_string(), instance.to_string()],
         "urxvt" | "rxvt-unicode" => vec!["-name".to_string(), instance.to_string()],
         "st" => vec!["-n".to_string(), instance.to_string()],
-        "foot" => vec!["--app-id".to_string(), instance.to_string()],
-        // For i3-sensible-terminal or unknown terminals, try -name as it's most common
-        _ => vec!["-name".to_string(), instance.to_string()],
+
+        // Default based on WM type
+        _ => match wm_type {
+            WmType::Sway => vec!["--app-id".to_string(), instance.to_string()],
+            WmType::I3 => vec!["-name".to_string(), instance.to_string()],
+        },
     }
 }
 
-fn get_terminal_command() -> String {
-    std::env::var("TERMINAL").unwrap_or_else(|_| "i3-sensible-terminal".to_string())
+fn get_terminal_command(wm_type: WmType) -> String {
+    std::env::var("TERMINAL").unwrap_or_else(|_| match wm_type {
+        WmType::Sway => "foot".to_string(),
+        WmType::I3 => "i3-sensible-terminal".to_string(),
+    })
 }
 
 fn get_user_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string())
 }
 
-fn launch_normal_terminal() -> Result<()> {
-    Command::new(get_terminal_command())
+fn launch_normal_terminal(wm_type: WmType) -> Result<()> {
+    Command::new(get_terminal_command(wm_type))
         .spawn()
         .context("Failed to launch terminal")?;
     Ok(())
 }
 
-fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
+fn launch_i3mux_terminal(ws_name: &str, wm_type: WmType) -> Result<()> {
     debug!("launch_i3mux_terminal called for workspace: {}", ws_name);
 
     // Ensure wrapper script exists
@@ -819,7 +835,7 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     ];
 
     debug!("Wrapper script: {} with args: {:?}", WRAPPER_PATH, wrapper_args);
-    debug!("Terminal command: {}", get_terminal_command());
+    debug!("Terminal command: {}", get_terminal_command(wm_type));
 
     // Get the host for creating the I3muxWindow identity
     let host = ws_state.host.clone();
@@ -828,8 +844,8 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     let instance = I3muxWindow::mark_from_parts(&host, &socket);
 
     // Build terminal command with instance-specific args
-    let terminal = get_terminal_command();
-    let instance_args = build_terminal_instance_args(&terminal, &instance);
+    let terminal = get_terminal_command(wm_type);
+    let instance_args = build_terminal_instance_args(&terminal, &instance, wm_type);
 
     debug!("Instance name: {}", instance);
     debug!("Terminal args: {:?}", instance_args);
@@ -846,8 +862,8 @@ fn launch_i3mux_terminal(ws_name: &str) -> Result<()> {
     cmd.spawn().context("Failed to launch i3mux terminal")?;
 
     // Wait for window to appear and apply i3mux mark
-    let mut conn = I3Connection::connect()?;
-    wait_for_window_and_mark(&mut conn, &instance, &host, &socket)?;
+    let backend = WmBackend::connect()?;
+    wait_for_window_and_mark(&backend, &instance, &host, &socket)?;
 
     debug!("launch_i3mux_terminal completed successfully");
     Ok(())
@@ -894,7 +910,7 @@ fn cleanup_workspace(ws_name: &str) -> Result<()> {
 }
 
 fn restore_layout(
-    conn: &mut I3Connection,
+    backend: &WmBackend,
     session: &RemoteSession,
     _ws_name: &str,
     remote_host: &str,
@@ -926,8 +942,8 @@ fn restore_layout(
         );
 
         // Build terminal command with instance-specific args
-        let terminal = get_terminal_command();
-        let instance_args = build_terminal_instance_args(&terminal, &instance);
+        let terminal = get_terminal_command(backend.wm_type());
+        let instance_args = build_terminal_instance_args(&terminal, &instance, backend.wm_type());
 
         // Spawn terminal with instance set via terminal-specific CLI args
         let mut cmd = Command::new(&terminal);
@@ -942,11 +958,11 @@ fn restore_layout(
         cmd.spawn().context("Failed to spawn terminal for layout restore")?;
 
         // Wait for window to appear and apply i3mux mark
-        wait_for_window_and_mark(conn, &instance, remote_host, socket_id)?;
+        wait_for_window_and_mark(backend, &instance, remote_host, socket_id)?;
 
         // Execute layout command if available
         if i < commands.len() {
-            conn.run_command(&commands[i])?;
+            backend.run_command(&commands[i])?;
         }
     }
 

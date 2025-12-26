@@ -21,7 +21,7 @@ fn test_tabbed_2_terminals(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Launch first terminal (red)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Set layout to tabbed
@@ -29,7 +29,7 @@ fn test_tabbed_2_terminals(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
 
     // Launch second terminal (green)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Capture screenshots for both tabs (we're on tab 2, cycle back to tab 1 first)
@@ -63,7 +63,7 @@ fn test_stacked_2_terminals(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Launch first terminal (blue)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Set layout to stacking
@@ -71,7 +71,7 @@ fn test_stacked_2_terminals(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
 
     // Launch second terminal (yellow)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Focus first terminal (stacked uses up/down)
@@ -113,7 +113,7 @@ fn test_tabbed_3_terminals(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Launch first terminal (red)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Set layout to tabbed
@@ -121,11 +121,11 @@ fn test_tabbed_3_terminals(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
 
     // Launch second terminal (green)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Launch third terminal (blue)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Focus first terminal (we're on tab 3)

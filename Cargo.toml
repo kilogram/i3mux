@@ -5,7 +5,6 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
-i3ipc = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.5", features = ["derive"] }

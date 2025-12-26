@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # ============ i3 (X11) Test Services ============
   i3mux-test-xephyr:
     image: i3mux-test:latest
     build:
@@ -41,6 +42,52 @@ services:
       - /tmp:exec
     ports:
       - "2222:22"
+    command: /usr/sbin/sshd -D -e
+    stdin_open: true
+    tty: true
+
+  # ============ Sway (Wayland) Test Services ============
+  i3mux-test-sway:
+    image: i3mux-test-sway:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.sway
+    container_name: i3mux-test-sway
+    hostname: i3mux-test-sway
+    networks:
+      - i3mux-test-net
+    environment:
+      - XDG_RUNTIME_DIR=/tmp/runtime-root
+      - WLR_BACKENDS=headless
+      - WLR_LIBINPUT_NO_DEVICES=1
+    volumes:
+      - ../../target/debug/i3mux:/usr/local/bin/i3mux:ro,z
+      - ../color-scripts:/opt/i3mux-test/color-scripts:ro,z
+      - ../screenshots:/tmp/screenshots:z
+      - ./ssh-keys:/root/.ssh:ro,z
+    tmpfs:
+      - /tmp:exec
+    command: /opt/i3mux-test/start-sway.sh
+    stdin_open: true
+    tty: true
+
+  i3mux-remote-ssh-sway:
+    image: i3mux-test-sway:latest
+    depends_on:
+      - i3mux-test-sway
+    container_name: i3mux-remote-ssh-sway
+    hostname: i3mux-remote-ssh-sway
+    networks:
+      - i3mux-test-net
+    cap_add:
+      - NET_ADMIN  # For tc/iptables network manipulation
+    volumes:
+      - ../color-scripts:/opt/i3mux-test/color-scripts:ro,z
+      - ./ssh-keys/id_rsa.pub:/home/testuser/.ssh/authorized_keys:ro,z
+    tmpfs:
+      - /tmp:exec
+    ports:
+      - "2223:22"
     command: /usr/sbin/sshd -D -e
     stdin_open: true
     tty: true

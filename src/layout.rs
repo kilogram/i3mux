@@ -1,13 +1,13 @@
 //! Layout capture and restoration for i3mux
 //!
-//! This module handles capturing the current i3 layout structure and
+//! This module handles capturing the current window manager layout structure and
 //! serializing/deserializing it for session persistence.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 
 use crate::window::I3muxWindow;
+use crate::wm::WmBackend;
 
 /// Simplified i3 layout representation for serialization
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -47,21 +47,13 @@ pub enum Layout {
 }
 
 impl Layout {
-    /// Capture layout from i3 workspace by number
+    /// Capture layout from workspace by number
     ///
-    /// This uses i3-msg directly to get the tree and identify i3mux windows
+    /// This gets the window manager tree and identifies i3mux windows
     /// by their marks (the most reliable identification method).
-    pub fn capture_from_workspace_num(workspace_num: i32) -> Result<Option<Self>> {
-        let output = Command::new("i3-msg")
-            .args(["-t", "get_tree"])
-            .output()?;
-
-        if !output.status.success() {
-            anyhow::bail!("i3-msg get_tree failed");
-        }
-
-        let json_str = String::from_utf8_lossy(&output.stdout);
-        let tree: serde_json::Value = serde_json::from_str(&json_str)?;
+    pub fn capture_from_workspace_num(workspace_num: i32, backend: &WmBackend) -> Result<Option<Self>> {
+        let tree = backend.get_tree()
+            .context("Failed to get window manager tree")?;
 
         // Find the workspace node
         let ws_node = find_workspace_node(&tree, workspace_num);

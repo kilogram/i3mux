@@ -79,7 +79,7 @@ fn test_many_windows(#[case] session: Session) -> Result<()> {
 
     // Create 7 more windows with alternating horizontal and vertical splits (activate gave us 1)
     for (i, (code, _name)) in color_codes.iter().enumerate() {
-        env.i3_exec(&format!("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh {}", code))?;
+        env.launch_terminal_with_command(&format!("/opt/i3mux-test/color-scripts/color-fill.sh {}", code))?;
         std::thread::sleep(Duration::from_millis(800));
 
         if i < color_codes.len() - 1 {
@@ -125,7 +125,7 @@ fn test_focus_navigation(#[case] session: Session) -> Result<()> {
     // Create horizontal split
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Navigate focus

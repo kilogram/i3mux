@@ -1,0 +1,40 @@
+# Sway config file for testing
+# Minimal configuration for deterministic test environment
+# (Compatible with i3-test-config for consistent behavior)
+
+# Disable Xwayland (not needed for testing, avoids errors)
+xwayland disable
+
+# Font for window titles (keep simple for consistency)
+font pango:monospace 8
+
+# Use thin borders for windows
+default_border pixel 2
+default_floating_border pixel 2
+
+# Don't follow mouse (for test determinism)
+focus_follows_mouse no
+
+# i3mux-specific window configuration
+for_window [con_mark="i3mux-terminal"] border normal 2
+for_window [con_mark="i3mux-terminal"] title_format "%title"
+
+# Disable swaybar for cleaner screenshots
+bar {
+    mode invisible
+}
+
+# Headless output configuration
+output HEADLESS-1 resolution 1920x1080
+
+# Define workspaces (same as i3-test-config)
+workspace 1
+workspace 2
+workspace 3
+workspace 4
+workspace 5
+workspace 6
+workspace 7
+workspace 8
+workspace 9
+workspace 10

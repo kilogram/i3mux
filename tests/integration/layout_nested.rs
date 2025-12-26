@@ -22,11 +22,11 @@ fn test_tabs_in_hsplit(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Left side: create tabbed container with 2 terminals
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("layout tabbed")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Right side: add hsplit and blue terminal
@@ -34,7 +34,7 @@ fn test_tabs_in_hsplit(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
 
     // Now capture: first the two tabs on left, then the blue on right
@@ -80,11 +80,11 @@ fn test_tabs_in_vsplit(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Top: create tabbed container with 2 terminals
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("layout tabbed")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Bottom: add vsplit and blue terminal
@@ -92,7 +92,7 @@ fn test_tabs_in_vsplit(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
 
     // Focus the tabbed container (top)
@@ -139,11 +139,11 @@ fn test_hsplit_in_tabs(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Tab 1: Red | Green
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Set parent to tabbed layout
@@ -153,11 +153,11 @@ fn test_hsplit_in_tabs(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
 
     // Tab 2: Blue | Yellow (need to create a new container)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
     std::thread::sleep(Duration::from_millis(800));
 
     // Navigate to Tab 1 from Yellow:
@@ -212,11 +212,11 @@ fn test_vsplit_in_tabs(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Tab 1: Red / Green
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Set parent to tabbed layout
@@ -226,11 +226,11 @@ fn test_vsplit_in_tabs(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
 
     // Tab 2: Blue / Yellow
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
     std::thread::sleep(Duration::from_millis(800));
 
     // Navigate to Tab 1 from Yellow:
@@ -278,11 +278,11 @@ fn test_stacked_in_hsplit(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Left side: create stacked container with 2 terminals
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("layout stacking")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Right side: add hsplit and blue terminal
@@ -290,7 +290,7 @@ fn test_stacked_in_hsplit(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
 
     // Focus the stacked container (left)
@@ -347,11 +347,11 @@ fn test_complex_nested_layout(#[case] session: Session) -> Result<()> {
     env.i3_exec(&format!("workspace {}", ws))?;
 
     // Top-left: Tabbed(Red, Green)
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 41")?; // Red
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("layout tabbed")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Top-right: Blue
@@ -359,7 +359,7 @@ fn test_complex_nested_layout(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
 
     // Bottom row: Yellow | Magenta (via parent split v)
@@ -367,11 +367,11 @@ fn test_complex_nested_layout(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
     std::thread::sleep(Duration::from_millis(800));
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 45")?; // Magenta
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 45")?; // Magenta
     std::thread::sleep(Duration::from_millis(800));
 
     // Navigate to top-left tabbed container, first tab

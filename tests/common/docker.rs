@@ -8,6 +8,23 @@ use std::thread;
 use std::time::Duration;
 use testcontainers::{core::WaitFor, runners::SyncRunner, GenericImage, ImageExt};
 
+/// Window manager type for testing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestWmType {
+    I3,
+    Sway,
+}
+
+impl TestWmType {
+    /// Detect WM type from I3MUX_TEST_WM environment variable
+    pub fn from_env() -> Self {
+        match std::env::var("I3MUX_TEST_WM").as_deref() {
+            Ok("sway") => TestWmType::Sway,
+            _ => TestWmType::I3,
+        }
+    }
+}
+
 /// Container runtime configuration - detected once, used everywhere
 struct ContainerRuntime {
     /// CLI command: "docker" or "podman"
@@ -40,21 +57,26 @@ fn runtime() -> &'static ContainerRuntime {
 }
 
 pub struct ContainerManager {
-    xvfb_container: testcontainers::Container<GenericImage>,
+    wm_container: testcontainers::Container<GenericImage>,
     remote_container: testcontainers::Container<GenericImage>,
+    wm_type: TestWmType,
 }
 
 impl ContainerManager {
     pub fn new() -> Result<Self> {
+        let wm_type = TestWmType::from_env();
+        println!("Testing with WM type: {:?}", wm_type);
+
         // Build images ONCE (they'll be cached by docker/podman)
-        Self::ensure_images_built()?;
+        Self::ensure_images_built(wm_type)?;
 
-        let image_name = Self::get_image_name();
+        let image_name = Self::get_image_name(wm_type);
+        let start_script = Self::get_start_script(wm_type);
 
-        // Create Xvfb container - testcontainers handles lifecycle
-        let xvfb_container = GenericImage::new(image_name.clone(), "latest".to_string())
+        // Create WM container (Xvfb/i3 or headless Sway)
+        let wm_container = GenericImage::new(image_name.clone(), "latest".to_string())
             .with_wait_for(WaitFor::message_on_stdout("Test environment is ready!"))
-            .with_cmd(["/opt/i3mux-test/start-xephyr.sh"])
+            .with_cmd([start_script])
             .start()?;
 
         // Create SSH remote container (same image, different command)
@@ -64,59 +86,65 @@ impl ContainerManager {
             .start()?;
 
         let mgr = Self {
-            xvfb_container,
+            wm_container,
             remote_container,
+            wm_type,
         };
 
         // Copy i3mux binary and test scripts into containers
         mgr.setup_container_files()?;
 
-        // Setup networking - add remote container to xephyr's hosts file
+        // Setup networking - add remote container to WM container's hosts file
         mgr.setup_networking()?;
 
         Ok(mgr)
+    }
+
+    /// Get the WM type being tested
+    pub fn wm_type(&self) -> TestWmType {
+        self.wm_type
     }
 
     fn setup_container_files(&self) -> Result<()> {
         let cli = runtime().cli;
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
 
-        // Copy i3mux binary to xvfb container (use statically-linked musl binary)
+        // Copy i3mux binary to WM container (use statically-linked musl binary)
         let i3mux_binary = PathBuf::from(manifest_dir).join("target/x86_64-unknown-linux-musl/debug/i3mux");
         if !i3mux_binary.exists() {
             anyhow::bail!("i3mux musl binary not found.\nRun: cargo build --target x86_64-unknown-linux-musl");
         }
 
-        let xvfb_id = self.xvfb_container.id();
+        let wm_id = self.wm_container.id();
         Command::new(cli)
             .args(&[
                 "cp",
                 i3mux_binary.to_str().unwrap(),
-                &format!("{}:/usr/local/bin/i3mux", xvfb_id),
+                &format!("{}:/usr/local/bin/i3mux", wm_id),
             ])
             .status()
-            .context("Failed to copy i3mux binary to xvfb container")?;
+            .context("Failed to copy i3mux binary to WM container")?;
 
         // Make it executable
-        self.exec_in_xephyr("chmod +x /usr/local/bin/i3mux")?;
+        self.exec_in_wm("chmod +x /usr/local/bin/i3mux")?;
 
-        // Copy color-fill.sh script to xvfb container
-        self.exec_in_xephyr("mkdir -p /opt/i3mux-test/color-scripts")?;
+        // Copy color-fill.sh script to WM container
+        self.exec_in_wm("mkdir -p /opt/i3mux-test/color-scripts")?;
 
         let color_fill_script = PathBuf::from(manifest_dir).join("tests/color-scripts/color-fill.sh");
         Command::new(cli)
             .args(&[
                 "cp",
                 color_fill_script.to_str().unwrap(),
-                &format!("{}:/opt/i3mux-test/color-scripts/color-fill.sh", xvfb_id),
+                &format!("{}:/opt/i3mux-test/color-scripts/color-fill.sh", wm_id),
             ])
             .status()
-            .context("Failed to copy color-fill.sh to xvfb container")?;
+            .context("Failed to copy color-fill.sh to WM container")?;
 
-        self.exec_in_xephyr("chmod +x /opt/i3mux-test/color-scripts/color-fill.sh")?;
+        self.exec_in_wm("chmod +x /opt/i3mux-test/color-scripts/color-fill.sh")?;
 
         // Copy SSH keys for remote connections
-        self.exec_in_xephyr("mkdir -p /root/.ssh/sockets")?;
+        self.exec_in_wm("mkdir -p /root/.ssh/sockets")?;
 
         let ssh_key = PathBuf::from(manifest_dir).join("tests/docker/ssh-keys/id_rsa");
         let ssh_pub = PathBuf::from(manifest_dir).join("tests/docker/ssh-keys/id_rsa.pub");
@@ -125,29 +153,33 @@ impl ContainerManager {
             .args(&[
                 "cp",
                 ssh_key.to_str().unwrap(),
-                &format!("{}:/root/.ssh/id_rsa", xvfb_id),
+                &format!("{}:/root/.ssh/id_rsa", wm_id),
             ])
             .status()
-            .context("Failed to copy SSH private key to xvfb container")?;
+            .context("Failed to copy SSH private key to WM container")?;
 
         Command::new(cli)
             .args(&[
                 "cp",
                 ssh_pub.to_str().unwrap(),
-                &format!("{}:/root/.ssh/id_rsa.pub", xvfb_id),
+                &format!("{}:/root/.ssh/id_rsa.pub", wm_id),
             ])
             .status()
-            .context("Failed to copy SSH public key to xvfb container")?;
+            .context("Failed to copy SSH public key to WM container")?;
 
         // Set proper permissions for SSH keys
-        self.exec_in_xephyr("chmod 600 /root/.ssh/id_rsa")?;
-        self.exec_in_xephyr("chmod 644 /root/.ssh/id_rsa.pub")?;
-        self.exec_in_xephyr("chmod 700 /root/.ssh")?;
+        self.exec_in_wm("chmod 600 /root/.ssh/id_rsa")?;
+        self.exec_in_wm("chmod 644 /root/.ssh/id_rsa.pub")?;
+        self.exec_in_wm("chmod 700 /root/.ssh")?;
 
-        // Create SSH config (overwrite the one from Dockerfile to ensure proper settings)
-        let ssh_config = r#"
+        // Create SSH config - hostname depends on WM type
+        let ssh_hostname = match self.wm_type {
+            TestWmType::I3 => "i3mux-remote-ssh",
+            TestWmType::Sway => "i3mux-remote-ssh",  // Same for now, networking handles it
+        };
+        let ssh_config = format!(r#"
 Host i3mux-remote-ssh
-  HostName i3mux-remote-ssh
+  HostName {}
   User testuser
   Port 22
   IdentityFile /root/.ssh/id_rsa
@@ -156,13 +188,13 @@ Host i3mux-remote-ssh
   ControlMaster auto
   ControlPath /root/.ssh/sockets/%r@%h:%p
   ControlPersist 600
-"#;
+"#, ssh_hostname);
 
         let config_cmd = format!(
             "cat > /root/.ssh/config << 'EOF'\n{}EOF\nchmod 600 /root/.ssh/config",
             ssh_config
         );
-        self.exec_in_xephyr(&config_cmd)?;
+        self.exec_in_wm(&config_cmd)?;
 
         // Copy public key to remote container for SSH authentication
         let remote_id = self.remote_container.id();
@@ -192,31 +224,39 @@ Host i3mux-remote-ssh
         Ok(())
     }
 
-    fn ensure_images_built() -> Result<()> {
+    fn ensure_images_built(wm_type: TestWmType) -> Result<()> {
         let rt = runtime();
-        let image_name = format!("{}:latest", Self::get_image_name());
+        let image_name = format!("{}:latest", Self::get_image_name(wm_type));
         let check = Command::new(rt.cli)
             .args(&["images", "-q", &image_name])
             .output()?;
 
         if check.stdout.is_empty() {
             // Image doesn't exist, build it
-            println!("Building container image (one-time setup)...");
+            println!("Building container image for {:?} (one-time setup)...", wm_type);
             let docker_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/docker");
 
-            let status = Command::new(rt.compose)
-                .current_dir(&docker_dir)
-                .args(&["build"])
-                .status()
-                .context("Failed to build image")?;
+            // Build the specific service based on WM type
+            let services = match wm_type {
+                TestWmType::I3 => vec!["i3mux-test-xephyr", "i3mux-remote-ssh"],
+                TestWmType::Sway => vec!["i3mux-test-sway", "i3mux-remote-ssh-sway"],
+            };
 
-            if !status.success() {
-                anyhow::bail!("Image build failed");
+            for service in services {
+                let status = Command::new(rt.compose)
+                    .current_dir(&docker_dir)
+                    .args(&["build", service])
+                    .status()
+                    .context(format!("Failed to build {} image", service))?;
+
+                if !status.success() {
+                    anyhow::bail!("Image build failed for {}", service);
+                }
             }
-            println!("✓ Image built and cached");
+            println!("✓ Images built and cached");
         } else {
-            println!("✓ Using cached container image");
+            println!("✓ Using cached container image for {:?}", wm_type);
         }
 
         Ok(())
@@ -245,29 +285,38 @@ Host i3mux-remote-ssh
             anyhow::bail!("Could not get IP address of remote container");
         }
 
-        // Add the remote container's IP to xephyr's /etc/hosts
+        // Add the remote container's IP to WM container's /etc/hosts
         let hosts_entry = format!("{} i3mux-remote-ssh", remote_ip);
         let add_hosts_cmd = format!("echo '{}' >> /etc/hosts", hosts_entry);
 
-        self.exec_in_xephyr(&add_hosts_cmd)?;
+        self.exec_in_wm(&add_hosts_cmd)?;
 
         println!("✓ Configured network: {} -> {}", "i3mux-remote-ssh", remote_ip);
 
         Ok(())
     }
 
-    fn get_image_name() -> String {
+    fn get_image_name(wm_type: TestWmType) -> String {
         // Use short name - both docker and podman can find local images this way
-        // Note: podman stores as localhost/i3mux-test but finds it via short name
-        "i3mux-test".to_string()
+        match wm_type {
+            TestWmType::I3 => "i3mux-test".to_string(),
+            TestWmType::Sway => "i3mux-test-sway".to_string(),
+        }
     }
 
-    pub fn exec_in_xephyr(&self, cmd: &str) -> Result<std::process::Output> {
-        let container_id = self.xvfb_container.id();
+    fn get_start_script(wm_type: TestWmType) -> String {
+        match wm_type {
+            TestWmType::I3 => "/opt/i3mux-test/start-xephyr.sh".to_string(),
+            TestWmType::Sway => "/opt/i3mux-test/start-sway.sh".to_string(),
+        }
+    }
+
+    pub fn exec_in_wm(&self, cmd: &str) -> Result<std::process::Output> {
+        let container_id = self.wm_container.id();
         Command::new(runtime().cli)
             .args(&["exec", container_id, "bash", "-c", cmd])
             .output()
-            .context("Failed to exec in Xvfb container")
+            .context("Failed to exec in WM container")
     }
 
     pub fn exec_in_remote(&self, cmd: &str) -> Result<std::process::Output> {
@@ -278,14 +327,19 @@ Host i3mux-remote-ssh
             .context("Failed to exec in remote container")
     }
 
-    pub fn wait_for_xephyr_ready(&self, timeout_secs: u64) -> Result<()> {
-        println!("Waiting for Xvfb and i3 to be ready...");
+    pub fn wait_for_wm_ready(&self, timeout_secs: u64) -> Result<()> {
+        let (wm_name, check_cmd) = match self.wm_type {
+            TestWmType::I3 => ("i3", "DISPLAY=:99 i3-msg -t get_workspaces 2>/dev/null"),
+            TestWmType::Sway => ("Sway", "source /tmp/sway-env.sh && swaymsg -t get_workspaces 2>/dev/null"),
+        };
+
+        println!("Waiting for {} to be ready...", wm_name);
 
         for attempt in 0..timeout_secs {
-            let output = self.exec_in_xephyr("DISPLAY=:99 i3-msg -t get_workspaces 2>/dev/null")?;
+            let output = self.exec_in_wm(check_cmd)?;
 
             if output.status.success() {
-                println!("✓ Xvfb and i3 are ready!");
+                println!("✓ {} is ready!", wm_name);
                 return Ok(());
             }
 
@@ -296,7 +350,7 @@ Host i3mux-remote-ssh
             thread::sleep(Duration::from_secs(1));
         }
 
-        anyhow::bail!("Xvfb/i3 failed to start within {} seconds", timeout_secs)
+        anyhow::bail!("{} failed to start within {} seconds", wm_name, timeout_secs)
     }
 
     pub fn wait_for_ssh_ready(&self, timeout_secs: u64) -> Result<()> {
@@ -320,8 +374,8 @@ Host i3mux-remote-ssh
         anyhow::bail!("SSH server failed to start within {} seconds", timeout_secs)
     }
 
-    pub fn copy_from_xephyr(&self, container_path: &str, host_path: &str) -> Result<()> {
-        let container_id = self.xvfb_container.id();
+    pub fn copy_from_wm(&self, container_path: &str, host_path: &str) -> Result<()> {
+        let container_id = self.wm_container.id();
         let status = Command::new(runtime().cli)
             .args(&[
                 "cp",

@@ -25,13 +25,13 @@ fn test_3way_hsplit(#[case] session: Session) -> Result<()> {
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
 
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
 
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
 
     let screenshot = env.capture_screenshot()?;
@@ -63,13 +63,13 @@ fn test_3way_vsplit(#[case] session: Session) -> Result<()> {
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
 
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 45")?; // Magenta
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 45")?; // Magenta
     std::thread::sleep(Duration::from_millis(800));
 
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
 
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 46")?; // Cyan
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 46")?; // Cyan
     std::thread::sleep(Duration::from_millis(800));
 
     let screenshot = env.capture_screenshot()?;
@@ -101,7 +101,7 @@ fn test_4way_grid(#[case] session: Session) -> Result<()> {
     // Top-right (Green)
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Bottom-left (Blue) - focus left, split vertical
@@ -109,7 +109,7 @@ fn test_4way_grid(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
 
     // Bottom-right (Yellow) - focus right parent, split vertical
@@ -119,7 +119,7 @@ fn test_4way_grid(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
     std::thread::sleep(Duration::from_millis(800));
 
     let screenshot = env.capture_screenshot()?;
@@ -150,7 +150,7 @@ fn test_nested_splits(#[case] session: Session) -> Result<()> {
 
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Right side - single Blue (split horizontally from the parent)
@@ -158,7 +158,7 @@ fn test_nested_splits(#[case] session: Session) -> Result<()> {
     std::thread::sleep(Duration::from_millis(200));
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 44")?; // Blue
     std::thread::sleep(Duration::from_millis(800));
 
     let screenshot = env.capture_screenshot()?;

@@ -148,9 +148,9 @@ fn test_detach_attach_mixed_windows() -> Result<()> {
     env.i3_exec("split h")?;
     env.launch_i3mux_terminal()?;  // Waits for terminal to appear
 
-    // Add a regular (non-i3mux) xterm window
+    // Add a regular (non-i3mux) terminal window
     env.i3_exec("split v")?;
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?;
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?;
     std::thread::sleep(Duration::from_millis(800));
 
     // Should have 3 windows total (2 i3mux + 1 regular)
@@ -195,14 +195,15 @@ fn test_detach_attach_default_session_name() -> Result<()> {
     env.i3_exec("workspace 14")?;
 
     // Activate without session name - should default to workspace-based name
-    env.i3_exec("exec --no-startup-id DISPLAY=:99 TERMINAL=xterm i3mux activate --remote testuser@i3mux-remote-ssh")?;
+    // Use the i3mux_activate helper which is WM-agnostic
+    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "14")?;
     std::thread::sleep(Duration::from_secs(3));
 
     let initial_windows = env.get_workspace_windows()?;
     assert!(initial_windows.len() >= 1, "Should have at least 1 terminal");
 
     // Detach without session name - should use default "ws14"
-    env.i3_exec("exec --no-startup-id DISPLAY=:99 i3mux detach")?;
+    env.i3mux_detach("ws14")?;
     std::thread::sleep(Duration::from_millis(1000));
 
     let windows_after_detach = env.get_workspace_windows()?;

@@ -5,7 +5,7 @@ use image::RgbaImage;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::docker::ContainerManager;
+use super::docker::{ContainerManager, TestWmType};
 use super::i3mux::I3muxRunner;
 use super::network::NetworkManipulator;
 use super::screenshot::{compare_screenshots, load_golden_image, save_comparison_failure};
@@ -47,7 +47,7 @@ impl TestEnvironment {
             .context("Failed to create container manager")?;
 
         println!("=== Waiting for services to be ready ===");
-        container_mgr.wait_for_xephyr_ready(30)?;
+        container_mgr.wait_for_wm_ready(30)?;
         container_mgr.wait_for_ssh_ready(30)?;
         println!("=== Test environment ready ===\n");
 
@@ -95,16 +95,29 @@ impl TestEnvironment {
         self.i3mux().launch_terminal(&color)
     }
 
-    // ==================== i3 Window Manager Operations ====================
+    /// Launch a terminal running a command (WM-agnostic)
+    /// Used for tests that need to spawn non-i3mux terminals
+    pub fn launch_terminal_with_command(&self, command: &str) -> Result<()> {
+        let (terminal_cmd, env_prefix) = match self.container_mgr.wm_type() {
+            TestWmType::I3 => ("xterm -e", "DISPLAY=:99"),
+            TestWmType::Sway => ("foot", "source /tmp/sway-env.sh &&"),
+        };
 
-    /// Execute an i3 command
-    pub fn i3_exec(&self, cmd: &str) -> Result<()> {
-        let full_cmd = format!("DISPLAY=:99 i3-msg '{}'", cmd);
-        let output = self.container_mgr.exec_in_xephyr(&full_cmd)?;
+        let cmd = format!(
+            "{} {} 'exec --no-startup-id {} {}'",
+            env_prefix,
+            match self.container_mgr.wm_type() {
+                TestWmType::I3 => "i3-msg",
+                TestWmType::Sway => "swaymsg",
+            },
+            terminal_cmd,
+            command
+        );
+        let output = self.container_mgr.exec_in_wm(&cmd)?;
 
         if !output.status.success() {
             anyhow::bail!(
-                "i3 command failed: {}",
+                "Failed to launch terminal: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -112,35 +125,74 @@ impl TestEnvironment {
         Ok(())
     }
 
+    // ==================== Window Manager Operations ====================
+
+    /// Get the WM-specific message command prefix
+    fn wm_cmd_prefix(&self) -> &'static str {
+        match self.container_mgr.wm_type() {
+            TestWmType::I3 => "DISPLAY=:99 i3-msg",
+            TestWmType::Sway => "source /tmp/sway-env.sh && swaymsg",
+        }
+    }
+
+    /// Execute a WM command (i3-msg or swaymsg)
+    pub fn wm_exec(&self, cmd: &str) -> Result<()> {
+        let full_cmd = format!("{} '{}'", self.wm_cmd_prefix(), cmd);
+        let output = self.container_mgr.exec_in_wm(&full_cmd)?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "WM command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Execute an i3 command (alias for wm_exec for backward compatibility)
+    pub fn i3_exec(&self, cmd: &str) -> Result<()> {
+        self.wm_exec(cmd)
+    }
+
     /// Check if workspace is empty
     pub fn is_workspace_empty(&self, workspace: &str) -> Result<bool> {
         let cmd = format!(
-            "DISPLAY=:99 i3-msg -t get_tree | grep -q 'workspace \"{}\"' && echo found || echo empty",
+            "{} -t get_tree | grep -q 'workspace \"{}\"' && echo found || echo empty",
+            self.wm_cmd_prefix(),
             workspace
         );
 
-        let output = self.container_mgr.exec_in_xephyr(&cmd)?;
+        let output = self.container_mgr.exec_in_wm(&cmd)?;
         let result = String::from_utf8_lossy(&output.stdout);
 
         Ok(result.contains("empty"))
     }
 
-    /// Get list of window IDs in current workspace
+    /// Get list of container IDs in current workspace
+    /// Note: For Sway we use container IDs; for i3 we traditionally used X11 window IDs
+    /// but con_id works for both, so we use container IDs universally now
     pub fn get_workspace_windows(&self) -> Result<Vec<u64>> {
         // Get focused workspace number first
-        let ws_output = self.container_mgr.exec_in_xephyr(
-            "DISPLAY=:99 i3-msg -t get_workspaces | jq -r '.[] | select(.focused==true) | .num'"
-        )?;
+        let ws_cmd = format!(
+            "{} -t get_workspaces | jq -r '.[] | select(.focused==true) | .num'",
+            self.wm_cmd_prefix()
+        );
+        let ws_output = self.container_mgr.exec_in_wm(&ws_cmd)?;
 
         let ws_num = String::from_utf8_lossy(&ws_output.stdout)
             .trim()
             .parse::<i32>()
             .context("Failed to get focused workspace number")?;
 
-        // Get windows in that workspace
-        let output = self.container_mgr.exec_in_xephyr(
-            &format!(r#"DISPLAY=:99 i3-msg -t get_tree | jq -r '.. | select(.type? == "workspace" and .num? == {}) | .. | select(.window? != null and .window? != 0) | .window'"#, ws_num)
-        )?;
+        // Get container IDs in that workspace
+        // Use 'id' field which is the container ID (works for both i3 and Sway)
+        let tree_cmd = format!(
+            r#"{} -t get_tree | jq -r '.. | select(.type? == "workspace" and .num? == {}) | .. | select(.id? != null and (.app_id? != null or .window_properties? != null)) | .id'"#,
+            self.wm_cmd_prefix(),
+            ws_num
+        );
+        let output = self.container_mgr.exec_in_wm(&tree_cmd)?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let windows: Vec<u64> = stdout
@@ -151,11 +203,13 @@ impl TestEnvironment {
         Ok(windows)
     }
 
-    pub fn get_window_info(&self, window_id: u64) -> Result<String> {
-        let output = self.container_mgr.exec_in_xephyr(&format!(
-            r#"DISPLAY=:99 i3-msg -t get_tree | jq -r '.. | select(.window? == {}) | {{name: .name, marks: .marks}}'"#,
-            window_id
-        ))?;
+    pub fn get_window_info(&self, container_id: u64) -> Result<String> {
+        let cmd = format!(
+            r#"{} -t get_tree | jq -r '.. | select(.id? == {}) | {{name: .name, marks: .marks, app_id: .app_id}}'"#,
+            self.wm_cmd_prefix(),
+            container_id
+        );
+        let output = self.container_mgr.exec_in_wm(&cmd)?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
@@ -164,12 +218,20 @@ impl TestEnvironment {
         // Get window count before launch
         let before = self.get_workspace_windows()?.len();
 
-        // Launch via i3-msg exec so i3 spawns the process (better for i3 integration)
-        // Run i3mux in foreground and capture any errors to /tmp/i3mux-debug.log
-        // Set TERMINAL=xterm for consistent behavior
-        let output = self.container_mgr.exec_in_xephyr(
-            "DISPLAY=:99 i3-msg 'exec --no-startup-id TERMINAL=xterm i3mux terminal 2>>/tmp/i3mux-debug.log'"
-        )?;
+        // Set up appropriate terminal and env vars based on WM type
+        let (terminal, env_prefix, msg_cmd) = match self.container_mgr.wm_type() {
+            TestWmType::I3 => ("xterm", "DISPLAY=:99", "i3-msg"),
+            TestWmType::Sway => ("foot", "source /tmp/sway-env.sh &&", "swaymsg"),
+        };
+
+        // Launch via WM exec so WM spawns the process
+        let launch_cmd = format!(
+            "{} {} 'exec --no-startup-id TERMINAL={} i3mux terminal 2>>/tmp/i3mux-debug.log'",
+            env_prefix,
+            msg_cmd,
+            terminal
+        );
+        let output = self.container_mgr.exec_in_wm(&launch_cmd)?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -203,7 +265,7 @@ impl TestEnvironment {
 
     // ==================== Screenshot Operations ====================
 
-    /// Capture a screenshot of the Xephyr display
+    /// Capture a screenshot of the display (Xephyr for i3, headless for Sway)
     pub fn capture_screenshot(&self) -> Result<RgbaImage> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -212,11 +274,17 @@ impl TestEnvironment {
         let screenshot_path = format!("/tmp/screenshots/test-{}.png", timestamp);
 
         // Ensure screenshots directory exists
-        self.container_mgr.exec_in_xephyr("mkdir -p /tmp/screenshots")?;
+        self.container_mgr.exec_in_wm("mkdir -p /tmp/screenshots")?;
 
-        // Capture screenshot
-        let cmd = format!("DISPLAY=:99 scrot -o {}", screenshot_path);
-        let output = self.container_mgr.exec_in_xephyr(&cmd)?;
+        // Capture screenshot using appropriate tool
+        let cmd = match self.container_mgr.wm_type() {
+            TestWmType::I3 => format!("DISPLAY=:99 scrot -o {}", screenshot_path),
+            TestWmType::Sway => format!(
+                "source /tmp/sway-env.sh && grim {}",
+                screenshot_path
+            ),
+        };
+        let output = self.container_mgr.exec_in_wm(&cmd)?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -235,7 +303,7 @@ impl TestEnvironment {
         // Ensure host screenshots directory exists
         std::fs::create_dir_all(format!("{}/tests/screenshots", env!("CARGO_MANIFEST_DIR")))?;
 
-        self.container_mgr.copy_from_xephyr(&screenshot_path, &host_path)?;
+        self.container_mgr.copy_from_wm(&screenshot_path, &host_path)?;
 
         // Load and return image
         let img = image::open(&host_path)
@@ -248,6 +316,14 @@ impl TestEnvironment {
         Ok(img)
     }
 
+    /// Get the WM-specific golden image subdirectory
+    fn golden_subdir(&self) -> &'static str {
+        match self.container_mgr.wm_type() {
+            TestWmType::I3 => "i3",
+            TestWmType::Sway => "sway",
+        }
+    }
+
     /// Compare screenshot with golden image
     pub fn compare_with_golden(
         &self,
@@ -255,23 +331,26 @@ impl TestEnvironment {
         actual: &RgbaImage,
         spec: &ComparisonSpec,
     ) -> Result<()> {
+        // Use WM-specific golden image path
+        let golden_subpath = format!("{}/{}", self.golden_subdir(), golden_name);
+
         if self.update_goldens {
-            // Save as golden image
+            // Save as golden image in WM-specific subdirectory
             let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/integration/golden")
-                .join(golden_name);
+                .join(&golden_subpath);
 
             if let Some(parent) = golden_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
 
             actual.save(&golden_path)?;
-            println!("  ✓ Updated golden image: {}", golden_name);
+            println!("  ✓ Updated golden image: {}", golden_subpath);
             return Ok(());
         }
 
-        // Normal comparison mode
-        let golden = load_golden_image(golden_name)?;
+        // Normal comparison mode - load from WM-specific subdirectory
+        let golden = load_golden_image(&golden_subpath)?;
 
         let result = compare_screenshots(&golden, actual, spec)?;
 
@@ -383,7 +462,7 @@ impl TestEnvironment {
 
     /// Read i3mux debug log from container
     pub fn read_debug_log(&self) -> Result<String> {
-        let output = self.container_mgr.exec_in_xephyr("cat /tmp/i3mux-debug.log 2>/dev/null || echo 'No debug log'")?;
+        let output = self.container_mgr.exec_in_wm("cat /tmp/i3mux-debug.log 2>/dev/null || echo 'No debug log'")?;
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 

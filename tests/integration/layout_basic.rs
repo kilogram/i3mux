@@ -27,7 +27,7 @@ fn test_hsplit_2_terminals(#[case] session: Session) -> Result<()> {
     env.i3_exec("split h")?;
     std::thread::sleep(Duration::from_millis(200));
 
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 42")?; // Green
     std::thread::sleep(Duration::from_millis(800));
 
     // Capture screenshot
@@ -62,7 +62,7 @@ fn test_vsplit_2_terminals(#[case] session: Session) -> Result<()> {
     env.i3_exec("split v")?;
     std::thread::sleep(Duration::from_millis(200));
 
-    env.i3_exec("exec --no-startup-id xterm -e /opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
+    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?; // Yellow
     std::thread::sleep(Duration::from_millis(800));
 
     let screenshot = env.capture_screenshot()?;

@@ -7,7 +7,9 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  # ============ i3 (X11) Tests ============
+  test-i3:
+    name: Tests (i3/X11)
     runs-on: ubuntu-latest
 
     steps:
@@ -35,7 +37,7 @@ jobs:
       - name: Build test containers
         run: |
           cd tests/docker
-          docker-compose build
+          docker-compose build i3mux-test-xephyr i3mux-remote-ssh
 
       - name: Integration smoke test
         run: ./tests/integration.sh test_basic_infrastructure -- --nocapture
@@ -47,6 +49,49 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-failures
+          name: test-failures-i3
+          path: tests/test-output/failures/
+          if-no-files-found: ignore
+
+  # ============ Sway (Wayland) Tests ============
+  test-sway:
+    name: Tests (Sway/Wayland)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-unknown-linux-musl
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            docker-compose \
+            musl-tools
+
+      - name: Build i3mux binary (musl)
+        run: cargo build --target x86_64-unknown-linux-musl
+
+      - name: Build Sway test containers
+        run: |
+          cd tests/docker
+          docker-compose build i3mux-test-sway i3mux-remote-ssh-sway
+
+      - name: Integration smoke test (Sway)
+        run: I3MUX_TEST_WM=sway ./tests/integration.sh test_basic_infrastructure -- --nocapture
+
+      - name: Run integration tests (Sway)
+        run: I3MUX_TEST_WM=sway ./tests/integration.sh -- --nocapture
+
+      - name: Upload test failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failures-sway
           path: tests/test-output/failures/
           if-no-files-found: ignore
