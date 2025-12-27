@@ -1,0 +1,11 @@
+name = "restore-vsplit-2"
+description = "Vertical split with 2 terminals"
+terminal_count = 2
+
+actions = [
+    "msg 'split v'",
+    "launch_terminal",
+]
+
+[fuzzy_boundaries]
+max_diff_percentage = 3.0

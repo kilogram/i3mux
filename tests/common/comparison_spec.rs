@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 pub struct ComparisonSpec {
     pub name: String,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub terminal_count: usize,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(default)]
+    pub pre_screenshot: Vec<String>,
+    #[serde(default)]
     pub exact_regions: Vec<ExactRegion>,
     #[serde(default)]
     pub fuzzy_boundaries: FuzzyBoundaries,
@@ -85,6 +93,10 @@ impl ComparisonSpec {
     pub fn simple(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            description: String::new(),
+            terminal_count: 0,
+            actions: Vec::new(),
+            pre_screenshot: Vec::new(),
             exact_regions: Vec::new(),
             fuzzy_boundaries: FuzzyBoundaries::default(),
         }
@@ -107,6 +119,10 @@ mod tests {
     fn test_toml_roundtrip() {
         let spec = ComparisonSpec {
             name: "test-layout".to_string(),
+            description: String::new(),
+            terminal_count: 2,
+            actions: vec!["msg 'split h'".to_string()],
+            pre_screenshot: Vec::new(),
             exact_regions: vec![
                 ExactRegion {
                     x: 0,

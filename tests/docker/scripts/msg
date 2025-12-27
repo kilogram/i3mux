@@ -1,0 +1,7 @@
+#!/bin/sh
+# WM-agnostic message command - delegates to i3-msg or swaymsg
+if [ -n "$SWAYSOCK" ]; then
+    exec swaymsg "$@"
+else
+    exec i3-msg "$@"
+fi

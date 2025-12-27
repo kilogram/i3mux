@@ -1,0 +1,13 @@
+name = "restore-hsplit-2"
+description = "Horizontal split with 2 terminals"
+terminal_count = 2
+
+# Actions executed after i3mux activate (which creates first terminal)
+# These are shell commands run in the container
+actions = [
+    "msg 'split h'",
+    "launch_terminal",
+]
+
+[fuzzy_boundaries]
+max_diff_percentage = 3.0

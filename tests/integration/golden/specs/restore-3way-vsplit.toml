@@ -1,0 +1,12 @@
+name = "restore-3way-vsplit"
+description = "Vertical split with 3 terminals"
+terminal_count = 3
+
+actions = [
+    "msg 'split v'",
+    "launch_terminal",
+    "launch_terminal",
+]
+
+[fuzzy_boundaries]
+max_diff_percentage = 3.0

@@ -1,0 +1,19 @@
+name = "restore-hsplit-in-tabs"
+description = "Horizontal split inside tabbed container"
+terminal_count = 3
+
+# Layout: tabs([t1|t2], [t3])
+actions = [
+    "msg 'split h'",
+    "launch_terminal",
+    "msg 'focus parent'",
+    "msg 'layout tabbed'",
+    "launch_terminal",
+]
+
+pre_screenshot = [
+    "msg 'focus left'",
+]
+
+[fuzzy_boundaries]
+max_diff_percentage = 3.0

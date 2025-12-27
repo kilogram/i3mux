@@ -458,6 +458,45 @@ impl TestEnvironment {
         self.network().clear_all_rules()
     }
 
+    // ==================== Spec Action Execution ====================
+
+    /// Execute an action from a spec (e.g., "msg 'split h'", "launch_terminal")
+    /// Actions use WM-agnostic scripts: msg, launch_terminal
+    pub fn exec_action(&self, action: &str) -> Result<()> {
+        let env_prefix = match self.container_mgr.wm_type() {
+            TestWmType::I3 => "DISPLAY=:99",
+            TestWmType::Sway => "source /tmp/sway-env.sh &&",
+        };
+
+        let cmd = format!("{} {}", env_prefix, action);
+        let output = self.container_mgr.exec_in_wm(&cmd)?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Action '{}' failed: {}",
+                action,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        // Wait for action to take effect
+        if action.contains("launch_terminal") {
+            std::thread::sleep(Duration::from_secs(3));
+        } else {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        Ok(())
+    }
+
+    /// Execute a list of actions from a spec
+    pub fn exec_actions(&self, actions: &[String]) -> Result<()> {
+        for action in actions {
+            self.exec_action(action)?;
+        }
+        Ok(())
+    }
+
     // ==================== Debug Helpers ====================
 
     /// Read i3mux debug log from container

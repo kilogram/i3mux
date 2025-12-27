@@ -66,6 +66,12 @@ COPY i3-test-config /opt/i3mux-test/i3-test-config
 COPY start-xephyr.sh /opt/i3mux-test/start-xephyr.sh
 RUN chmod +x /opt/i3mux-test/start-xephyr.sh
 
+# Copy WM-agnostic helper scripts
+COPY scripts/msg /opt/i3mux-test/bin/msg
+COPY scripts/launch_terminal /opt/i3mux-test/bin/launch_terminal
+RUN chmod +x /opt/i3mux-test/bin/*
+ENV PATH="/opt/i3mux-test/bin:$PATH"
+
 # Create SSH config for ControlMaster
 RUN echo "Host i3mux-remote-ssh" > /root/.ssh/config && \
     echo "  HostName i3mux-remote-ssh" >> /root/.ssh/config && \

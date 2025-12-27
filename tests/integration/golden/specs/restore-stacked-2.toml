@@ -1,0 +1,15 @@
+name = "restore-stacked-2"
+description = "Stacked layout with 2 terminals"
+terminal_count = 2
+
+actions = [
+    "msg 'layout stacking'",
+    "launch_terminal",
+]
+
+pre_screenshot = [
+    "msg 'focus up'",
+]
+
+[fuzzy_boundaries]
+max_diff_percentage = 3.0

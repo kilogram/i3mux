@@ -1,0 +1,16 @@
+name = "restore-tabbed-2"
+description = "Tabbed layout with 2 terminals"
+terminal_count = 2
+
+actions = [
+    "msg 'layout tabbed'",
+    "launch_terminal",
+]
+
+# Focus first tab before screenshot for consistency
+pre_screenshot = [
+    "msg 'focus left'",
+]
+
+[fuzzy_boundaries]
+max_diff_percentage = 3.0

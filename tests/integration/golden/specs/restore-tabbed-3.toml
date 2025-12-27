@@ -1,0 +1,17 @@
+name = "restore-tabbed-3"
+description = "Tabbed layout with 3 terminals"
+terminal_count = 3
+
+actions = [
+    "msg 'layout tabbed'",
+    "launch_terminal",
+    "launch_terminal",
+]
+
+pre_screenshot = [
+    "msg 'focus left'",
+    "msg 'focus left'",
+]
+
+[fuzzy_boundaries]
+max_diff_percentage = 3.0

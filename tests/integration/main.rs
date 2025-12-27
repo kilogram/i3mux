@@ -6,6 +6,7 @@
 mod common;
 
 mod detach_attach;
+mod detach_attach_spec;
 mod edge_cases;
 mod infrastructure;
 mod layout_basic;

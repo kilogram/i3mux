@@ -1,0 +1,7 @@
+#!/bin/sh
+# WM-agnostic i3mux terminal launcher
+if [ -n "$SWAYSOCK" ]; then
+    TERMINAL=foot i3mux terminal 2>>/tmp/i3mux-debug.log
+else
+    TERMINAL=xterm i3mux terminal 2>>/tmp/i3mux-debug.log
+fi
