@@ -1,7 +1,41 @@
 #!/bin/sh
-# WM-agnostic i3mux terminal launcher
-if [ -n "$SWAYSOCK" ]; then
-    TERMINAL=foot i3mux terminal 2>>/tmp/i3mux-debug.log
-else
-    TERMINAL=xterm i3mux terminal 2>>/tmp/i3mux-debug.log
+# WM-agnostic i3mux terminal launcher with color support
+#
+# Usage: launch_terminal [COLOR]
+# COLOR: red, green, blue, yellow, magenta, cyan (default: cycles through colors)
+
+# Color codes for ANSI backgrounds
+get_color_code() {
+    case "$1" in
+        red)     echo 41 ;;
+        green)   echo 42 ;;
+        yellow)  echo 43 ;;
+        blue)    echo 44 ;;
+        magenta) echo 45 ;;
+        cyan)    echo 46 ;;
+        *)       echo 41 ;;  # default red
+    esac
+}
+
+# Get color from argument or use auto-incrementing counter
+COLOR_NAME="${1:-auto}"
+if [ "$COLOR_NAME" = "auto" ]; then
+    # Use a counter file to cycle through colors
+    COUNTER_FILE="/tmp/launch_terminal_counter"
+    if [ -f "$COUNTER_FILE" ]; then
+        COUNT=$(cat "$COUNTER_FILE")
+    else
+        COUNT=0
+    fi
+    COLORS="red green blue yellow magenta cyan"
+    COLOR_NAME=$(echo "$COLORS" | tr ' ' '\n' | sed -n "$(( (COUNT % 6) + 1 ))p")
+    echo $(( COUNT + 1 )) > "$COUNTER_FILE"
 fi
+
+COLOR_CODE=$(get_color_code "$COLOR_NAME")
+
+I3MUX_BIN="${I3MUX_BIN:-/usr/local/bin/i3mux}"
+
+# Launch terminal through i3mux with color script
+# This ensures the terminal is managed by i3mux (closes on detach, restores on attach)
+"$I3MUX_BIN" terminal -e "/opt/i3mux-test/color-scripts/color-fill.sh $COLOR_CODE solid"

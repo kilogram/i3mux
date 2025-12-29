@@ -39,7 +39,9 @@ RUN git clone https://github.com/martanne/abduco.git /tmp/abduco && \
 RUN useradd -m -s /bin/bash testuser && \
     echo 'testuser:testpass' | chpasswd && \
     usermod -aG sudo testuser && \
-    echo 'testuser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+    echo 'testuser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
+    # Suppress sudo hint message
+    touch /home/testuser/.sudo_as_admin_successful
 
 # Configure SSH server
 RUN mkdir -p /var/run/sshd && \
@@ -71,6 +73,27 @@ COPY scripts/msg /opt/i3mux-test/bin/msg
 COPY scripts/launch_terminal /opt/i3mux-test/bin/launch_terminal
 RUN chmod +x /opt/i3mux-test/bin/*
 ENV PATH="/opt/i3mux-test/bin:$PATH"
+
+# Create color-fill script for test terminals
+RUN mkdir -p /opt/i3mux-test/color-scripts && \
+    cat > /opt/i3mux-test/color-scripts/color-fill.sh << 'SCRIPT'
+#!/bin/bash
+# color-fill.sh - Fill terminal with solid color and sleep until killed
+export TERM=${TERM:-xterm}
+COLOR=${1:-41}
+clear 2>/dev/null; tput civis 2>/dev/null
+trap 'tput cnorm 2>/dev/null; clear 2>/dev/null; exit 0' INT TERM EXIT HUP
+fill() {
+    local ROWS=$(tput lines 2>/dev/null || echo 24)
+    local COLS=$(tput cols 2>/dev/null || echo 80)
+    clear 2>/dev/null
+    echo -ne "\033[${COLOR}m"
+    for ((i=0;i<ROWS;i++)); do printf "%${COLS}s\n" " "; done
+}
+trap fill WINCH; fill
+while true; do sleep 1; done
+SCRIPT
+RUN chmod +x /opt/i3mux-test/color-scripts/color-fill.sh
 
 # Create SSH config for ControlMaster
 RUN echo "Host i3mux-remote-ssh" > /root/.ssh/config && \

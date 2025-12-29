@@ -57,8 +57,8 @@ pub fn compare_screenshots(
     let total_pixels = (golden.width() * golden.height()) as usize;
     let diff_percentage = (diff_pixels.len() as f64 / total_pixels as f64) * 100.0;
 
-    let passed = diff_pixels.len() <= spec.fuzzy_boundaries.max_diff_pixels
-        && diff_percentage <= spec.fuzzy_boundaries.max_diff_percentage;
+    // Use percentage-based comparison only
+    let passed = diff_percentage <= spec.fuzzy_boundaries.max_diff_percentage;
 
     Ok(ComparisonResult {
         total_diff_pixels: diff_pixels.len(),

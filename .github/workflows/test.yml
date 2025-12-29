@@ -5,11 +5,27 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  merge_group:
+    types: [ checks_requested ]
 
 jobs:
-  # ============ i3 (X11) Tests ============
+  # ============ Unit Tests ============
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run unit tests
+        run: cargo test --bins
+
+  # ============ T1: Integration Tests (i3) ============
   test-i3:
-    name: Tests (i3/X11)
+    name: T1 Integration (i3)
     runs-on: ubuntu-latest
 
     steps:
@@ -31,18 +47,12 @@ jobs:
       - name: Build i3mux binary (musl)
         run: cargo build --target x86_64-unknown-linux-musl
 
-      - name: Run unit tests
-        run: cargo test --bins
-
       - name: Build test containers
         run: |
           cd tests/docker
           docker-compose build i3mux-test-xephyr i3mux-remote-ssh
 
-      - name: Integration smoke test
-        run: ./tests/integration.sh test_basic_infrastructure -- --nocapture
-
-      - name: Run integration tests
+      - name: Run T1 integration tests (i3)
         run: ./tests/integration.sh -- --nocapture
 
       - name: Upload test failure artifacts
@@ -53,9 +63,9 @@ jobs:
           path: tests/test-output/failures/
           if-no-files-found: ignore
 
-  # ============ Sway (Wayland) Tests ============
+  # ============ T1: Integration Tests (Sway) ============
   test-sway:
-    name: Tests (Sway/Wayland)
+    name: T1 Integration (Sway)
     runs-on: ubuntu-latest
 
     steps:
@@ -82,10 +92,7 @@ jobs:
           cd tests/docker
           docker-compose build i3mux-test-sway i3mux-remote-ssh-sway
 
-      - name: Integration smoke test (Sway)
-        run: I3MUX_TEST_WM=sway ./tests/integration.sh test_basic_infrastructure -- --nocapture
-
-      - name: Run integration tests (Sway)
+      - name: Run T1 integration tests (Sway)
         run: I3MUX_TEST_WM=sway ./tests/integration.sh -- --nocapture
 
       - name: Upload test failure artifacts
@@ -93,5 +100,47 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-failures-sway
+          path: tests/test-output/failures/
+          if-no-files-found: ignore
+
+  # ============ T2: Full Matrix (Merge Queue Only) ============
+  test-full-matrix:
+    name: T2 Full Matrix (cross-WM)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-unknown-linux-musl
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            docker-compose \
+            musl-tools
+
+      - name: Build i3mux binary (musl)
+        run: cargo build --target x86_64-unknown-linux-musl
+
+      - name: Build all test containers
+        run: |
+          cd tests/docker
+          docker-compose build
+
+      - name: Run T2 full matrix tests
+        run: |
+          I3MUX_FULL_MATRIX=1 cargo test --test integration -- --include-ignored --nocapture
+
+      - name: Upload test failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failures-full-matrix
           path: tests/test-output/failures/
           if-no-files-found: ignore
