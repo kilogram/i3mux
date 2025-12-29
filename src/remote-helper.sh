@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 
 # Check if abduco is available (sources login profile for PATH)
 cmd_check_deps() {
@@ -21,11 +21,21 @@ cmd_check_deps() {
     command -v abduco
 }
 
-# Attach to an abduco session (runs in user's shell)
+# Attach to an abduco session (runs specified command or user's shell)
+# Usage: attach <socket> [-- <cmd>]
 cmd_attach() {
     local socket="$1"
-    # Attach to abduco session
-    exec abduco -A "/tmp/$socket" "$SHELL"
+    shift
+
+    # Check for -- separator
+    if [[ "${1:-}" == "--" ]]; then
+        shift
+        # Run the specified command in abduco
+        exec abduco -A "/tmp/$socket" "$@"
+    else
+        # Default: run user's shell
+        exec abduco -A "/tmp/$socket" "$SHELL"
+    fi
 }
 
 # Check if any abduco sessions exist for a workspace prefix, clean up if none

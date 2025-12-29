@@ -119,7 +119,11 @@ enum Commands {
     },
 
     /// Launch terminal (called by i3 keybind)
-    Terminal,
+    Terminal {
+        /// Command to run instead of shell (e.g., -e '/path/to/script arg1 arg2')
+        #[arg(short = 'e', long = "exec")]
+        exec: Option<String>,
+    },
 
     /// Clean up workspace state if no sessions remain (internal command)
     #[command(hide = true)]
@@ -213,7 +217,7 @@ fn main() -> Result<()> {
         }) => attach(remote.or(cli.remote), session.or(cli.session), force),
         Some(Commands::Sessions { remote }) => list_sessions(remote.or(cli.remote)),
         Some(Commands::Kill { remote, session }) => kill_session(remote.or(cli.remote), session),
-        Some(Commands::Terminal) => terminal(),
+        Some(Commands::Terminal { exec }) => terminal(exec.as_deref()),
         Some(Commands::CleanupWorkspace { workspace }) => cleanup_workspace(&workspace),
     }
 }
@@ -385,7 +389,7 @@ fn activate(remote: Option<String>, session_name: Option<String>) -> Result<()> 
     }
 
     // Launch first terminal
-    terminal()?;
+    terminal(None)?;
 
     Ok(())
 }
@@ -627,7 +631,7 @@ fn kill_session(remote: Option<String>, session: String) -> Result<()> {
 }
 
 /// Launch terminal (smart detection)
-fn terminal() -> Result<()> {
+fn terminal(exec: Option<&str>) -> Result<()> {
     let backend = WmBackend::connect()?;
     let (ws_name, _) = get_focused_workspace(&backend)?;
 
@@ -635,13 +639,13 @@ fn terminal() -> Result<()> {
 
     // Check if workspace is i3mux-bound
     if state.workspaces.get(&ws_name).is_none() {
-        return launch_normal_terminal(backend.wm_type());
+        return launch_normal_terminal(backend.wm_type(), exec);
     }
 
     // Workspace is i3mux-bound - always launch i3mux terminal
     // (The old logic checked focused window type, but that doesn't make sense:
     //  if the workspace is bound to i3mux, ALL terminals should be i3mux terminals)
-    launch_i3mux_terminal(&ws_name, backend.wm_type())?;
+    launch_i3mux_terminal(&ws_name, backend.wm_type(), exec)?;
 
     Ok(())
 }
@@ -704,14 +708,20 @@ fn get_user_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string())
 }
 
-fn launch_normal_terminal(wm_type: WmType) -> Result<()> {
-    Command::new(get_terminal_command(wm_type))
-        .spawn()
-        .context("Failed to launch terminal")?;
+fn launch_normal_terminal(wm_type: WmType, exec: Option<&str>) -> Result<()> {
+    let terminal = get_terminal_command(wm_type);
+    let mut cmd = Command::new(&terminal);
+
+    // If exec is provided, use terminal's -e flag to run the command
+    if let Some(exec_cmd) = exec {
+        cmd.arg("-e").arg("sh").arg("-c").arg(exec_cmd);
+    }
+
+    cmd.spawn().context("Failed to launch terminal")?;
     Ok(())
 }
 
-fn launch_i3mux_terminal(ws_name: &str, wm_type: WmType) -> Result<()> {
+fn launch_i3mux_terminal(ws_name: &str, wm_type: WmType, exec: Option<&str>) -> Result<()> {
     debug!("launch_i3mux_terminal called for workspace: {}", ws_name);
 
     // Ensure wrapper script exists
@@ -747,22 +757,31 @@ fn launch_i3mux_terminal(ws_name: &str, wm_type: WmType) -> Result<()> {
         // Escape the title for use in PROMPT_COMMAND (needs extra escaping for SSH)
         let title_for_prompt = title.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$");
 
-        let user_shell = get_user_shell();
-        debug!("Using user shell: {}", user_shell);
+        // Use exec command if provided, otherwise use user's shell
+        let cmd_to_run = exec.map(String::from).unwrap_or_else(get_user_shell);
+        debug!("Command to run: {}", cmd_to_run);
 
         let attach_cmd = if ws_state.session_type == "local" {
             // Local: Direct abduco attach
             let prompt_cmd_val = format!("echo -ne \\\"\\\\033]0;{}\\\\007\\\"", title_for_prompt);
             format!(
                 r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} {}""#,
-                prompt_cmd_val, socket, user_shell
+                prompt_cmd_val, socket, cmd_to_run
             )
         } else {
             // Remote: Use helper script to attach (ensures PATH is set correctly)
-            format!(
-                r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -tt {} 'bash -l -c "exec {} attach {}"'"#,
-                ws_state.host, REMOTE_HELPER_PATH, socket
-            )
+            // When exec is provided, pass it to the attach command
+            if exec.is_some() {
+                format!(
+                    r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -tt {} 'bash -l -c "exec {} attach {} -- {}"'"#,
+                    ws_state.host, REMOTE_HELPER_PATH, socket, cmd_to_run
+                )
+            } else {
+                format!(
+                    r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -tt {} 'bash -l -c "exec {} attach {}"'"#,
+                    ws_state.host, REMOTE_HELPER_PATH, socket
+                )
+            }
         };
 
         // Cleanup script to run after terminal exits
@@ -915,56 +934,172 @@ fn restore_layout(
     _ws_name: &str,
     remote_host: &str,
 ) -> Result<()> {
-    // Generate i3 commands to recreate layout
-    let commands = session.layout.generate_i3_commands(0);
-
-    // Get sockets to restore
     let sockets = session.layout.get_sockets();
-
     println!("Restoring layout with {} terminals...", sockets.len());
 
-    // Launch terminals in order, executing layout commands between them
-    for (i, socket_id) in sockets.iter().enumerate() {
-        // Launch terminal for this socket
-        let title = format!("{}{}:{}", MARKER, remote_host, socket_id);
+    // Use recursive restore that properly handles nested layouts
+    restore_layout_recursive(backend, &session.layout, remote_host)?;
 
-        // Generate instance name (same format as marks)
-        let instance = I3muxWindow::mark_from_parts(remote_host, socket_id);
+    Ok(())
+}
 
-        let attach_cmd = format!(
-            r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'exec bash -lc "{} attach {}"'"#,
-            remote_host, REMOTE_HELPER_PATH, socket_id
-        );
+/// Recursively restore a layout by walking the tree and creating the proper structure
+fn restore_layout_recursive(
+    backend: &WmBackend,
+    layout: &Layout,
+    remote_host: &str,
+) -> Result<()> {
+    match layout {
+        Layout::Terminal { socket, .. } => {
+            // Launch and wait for this terminal
+            launch_terminal_for_socket(backend, remote_host, socket)?;
+        }
+        Layout::HSplit { children, .. } => {
+            // Restore first child
+            if let Some(first) = children.first() {
+                restore_layout_recursive(backend, first, remote_host)?;
+            }
+            // Set split mode ONCE, then create all remaining children
+            // They will join the same horizontal split container as equal siblings
+            if children.len() > 1 {
+                backend.run_command("split h")?;
+                for child in children.iter().skip(1) {
+                    restore_layout_recursive(backend, child, remote_host)?;
+                }
+            }
+        }
+        Layout::VSplit { children, .. } => {
+            // Restore first child
+            if let Some(first) = children.first() {
+                restore_layout_recursive(backend, first, remote_host)?;
+            }
+            // Set split mode ONCE, then create all remaining children
+            if children.len() > 1 {
+                backend.run_command("split v")?;
+                for child in children.iter().skip(1) {
+                    restore_layout_recursive(backend, child, remote_host)?;
+                }
+            }
+        }
+        Layout::Tabbed { children } => {
+            // Restore first child
+            if let Some(first) = children.first() {
+                restore_layout_recursive(backend, first, remote_host)?;
+            }
 
-        let wrapper = format!(
-            r#"echo -ne '\033]0;{}\007'; {}; echo 'Session ended.'"#,
-            title, attach_cmd
-        );
+            if children.len() > 1 {
+                // For nested containers, go up to workspace/parent container level
+                // We need to go past the split container to set tabbed on its parent
+                let first_is_container = matches!(
+                    children.first(),
+                    Some(Layout::HSplit { .. } | Layout::VSplit { .. } | Layout::Tabbed { .. } | Layout::Stacked { .. })
+                );
+                if first_is_container {
+                    // Go from leaf to split container, then to workspace
+                    backend.run_command("focus parent")?;
+                    backend.run_command("focus parent")?;
+                }
 
-        // Build terminal command with instance-specific args
-        let terminal = get_terminal_command(backend.wm_type());
-        let instance_args = build_terminal_instance_args(&terminal, &instance, backend.wm_type());
+                // Set tabbed layout
+                backend.run_command("layout tabbed")?;
 
-        // Spawn terminal with instance set via terminal-specific CLI args
-        let mut cmd = Command::new(&terminal);
-        cmd.args(&instance_args)
-            .arg("-T")
-            .arg(&title)
-            .arg("-e")
-            .arg("bash")
-            .arg("-c")
-            .arg(&wrapper);
+                // For nested containers, ensure we're at the tabbed level before adding children
+                // The new children should be tabs, not nested inside the first child
+                if first_is_container {
+                    // "layout tabbed" keeps focus at workspace, but new windows might
+                    // still join the last focused child. Force focus back to workspace.
+                    backend.run_command("focus parent")?;
+                }
 
-        cmd.spawn().context("Failed to spawn terminal for layout restore")?;
+                for child in children.iter().skip(1) {
+                    restore_layout_recursive(backend, child, remote_host)?;
+                }
 
-        // Wait for window to appear and apply i3mux mark
-        wait_for_window_and_mark(backend, &instance, remote_host, socket_id)?;
+                // For nested containers, focus the first tab for consistency
+                if first_is_container {
+                    // Go up to tabbed container level, then left to first tab
+                    backend.run_command("focus parent")?;
+                    backend.run_command("focus parent")?;
+                    backend.run_command("focus left")?;
+                }
+            }
+        }
+        Layout::Stacked { children } => {
+            // Restore first child
+            if let Some(first) = children.first() {
+                restore_layout_recursive(backend, first, remote_host)?;
+            }
 
-        // Execute layout command if available
-        if i < commands.len() {
-            backend.run_command(&commands[i])?;
+            if children.len() > 1 {
+                // For nested containers, go up to workspace/parent container level
+                let first_is_container = matches!(
+                    children.first(),
+                    Some(Layout::HSplit { .. } | Layout::VSplit { .. } | Layout::Tabbed { .. } | Layout::Stacked { .. })
+                );
+                if first_is_container {
+                    backend.run_command("focus parent")?;
+                    backend.run_command("focus parent")?;
+                }
+
+                // Set stacked layout
+                backend.run_command("layout stacking")?;
+
+                // For nested containers, ensure we're at the stacked level before adding children
+                if first_is_container {
+                    backend.run_command("focus parent")?;
+                }
+
+                for child in children.iter().skip(1) {
+                    restore_layout_recursive(backend, child, remote_host)?;
+                }
+
+                // For nested containers, focus the first item for consistency
+                if first_is_container {
+                    backend.run_command("focus parent")?;
+                    backend.run_command("focus parent")?;
+                    backend.run_command("focus up")?;
+                }
+            }
         }
     }
+    Ok(())
+}
+
+/// Launch a terminal for a specific socket and wait for it to appear
+fn launch_terminal_for_socket(
+    backend: &WmBackend,
+    remote_host: &str,
+    socket_id: &str,
+) -> Result<()> {
+    let title = format!("{}{}:{}", MARKER, remote_host, socket_id);
+    let instance = I3muxWindow::mark_from_parts(remote_host, socket_id);
+
+    let attach_cmd = format!(
+        r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'exec bash -lc "{} attach {}"'"#,
+        remote_host, REMOTE_HELPER_PATH, socket_id
+    );
+
+    let wrapper = format!(
+        r#"echo -ne '\033]0;{}\007'; {}; echo 'Session ended.'"#,
+        title, attach_cmd
+    );
+
+    let terminal = get_terminal_command(backend.wm_type());
+    let instance_args = build_terminal_instance_args(&terminal, &instance, backend.wm_type());
+
+    let mut cmd = Command::new(&terminal);
+    cmd.args(&instance_args)
+        .arg("-T")
+        .arg(&title)
+        .arg("-e")
+        .arg("bash")
+        .arg("-c")
+        .arg(&wrapper);
+
+    cmd.spawn().context("Failed to spawn terminal for layout restore")?;
+
+    // Wait for window to appear and apply i3mux mark
+    wait_for_window_and_mark(backend, &instance, remote_host, socket_id)?;
 
     Ok(())
 }

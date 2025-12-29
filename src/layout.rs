@@ -77,6 +77,19 @@ impl Layout {
         }
     }
 
+    /// Get the first (leftmost/topmost) terminal socket in this layout
+    pub fn get_first_socket(&self) -> Option<String> {
+        match self {
+            Layout::Terminal { socket, .. } => Some(socket.clone()),
+            Layout::HSplit { children, .. }
+            | Layout::VSplit { children, .. }
+            | Layout::Tabbed { children }
+            | Layout::Stacked { children } => {
+                children.first().and_then(|c| c.get_first_socket())
+            }
+        }
+    }
+
     /// Generate i3 commands to recreate this layout
     pub fn generate_i3_commands(&self, depth: usize) -> Vec<String> {
         let mut commands = Vec::new();
