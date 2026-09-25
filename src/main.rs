@@ -1,1105 +1,856 @@
-mod connection;
+//! i3mux: each Sway workspace is one "tmux window" of persistent shells.
+//!
+//! This file is the command line and the command handlers. Each handler
+//! resolves its input at the edge, then runs a core function over [`Ports`]:
+//! the state store, Sway, the terminal launcher, and a way to reach hosts.
+//! Tests run the core functions against fakes.
+//!
+//! Every core function that changes bindings, windows or shells holds the
+//! state lock from its first read to its last write, so concurrent i3mux
+//! commands never interleave (plan rule 4).
+
+mod host;
+mod launch;
 mod layout;
+mod mux;
 mod session;
+mod state;
+mod sway_ops;
 mod types;
 mod window;
 mod wm;
 
+use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-// Global verbose flag
-static VERBOSE: AtomicBool = AtomicBool::new(false);
+use host::{HostExec, HostRunner, RunnerConfig};
+use launch::{Launcher, TerminalLauncher};
+use layout::Step;
+use mux::{Choice, Shell};
+use serde_json::Value;
+use session::{SavedSession, SessionError};
+use state::{StateStore, WorkspaceState};
+use sway_ops::Sway;
+use types::{Host, SessionName, TerminalName};
+use window::Mark;
+use wm::{Wm, WorkspaceInfo};
 
-// Debug logging macro - only logs when verbose flag is set
-macro_rules! debug {
-    ($($arg:tt)*) => {
-        if VERBOSE.load(Ordering::Relaxed) {
-            eprintln!("[i3mux] {}", format!($($arg)*));
-        }
-    };
-}
+const FORCE_HELP: &str = "Disconnect any other client attached to these shells";
 
-use connection::create_connection;
-use layout::Layout;
-use session::RemoteSession;
-use types::{RemoteHost, SessionName};
-use window::{I3muxWindow, wait_for_window_and_mark};
-use wm::{WmBackend, WmType};
+/// Exit status of `attach` when several sessions fit and none was named.
+const EXIT_CHOOSE: u8 = 2;
 
-const MARKER: &str = "i3mux:"; // Marker prefix for window titles (for initial window matching)
-const LOCAL_DISPLAY: &str = "\x1b[3mlocal\x1b[0m"; // Italicized "local"
-
-// Remote helper script - uploaded to remote hosts for reliable command execution
-const REMOTE_HELPER_SCRIPT: &str = include_str!("remote-helper.sh");
-const REMOTE_HELPER_PATH: &str = "/tmp/i3mux-helper.sh";
-
-// Wrapper script - runs locally to launch terminals with proper setup
-const WRAPPER_SCRIPT: &str = include_str!("wrapper.sh");
-const WRAPPER_PATH: &str = "/tmp/i3mux-wrapper.sh";
+/// How long `detach` waits for closed windows' shells to lose their clients.
+const DISCONNECT_WAIT: Duration = Duration::from_secs(5);
+const DISCONNECT_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
-#[command(name = "i3mux")]
-#[command(about = "Persistent terminal sessions with i3 workspace integration")]
-#[command(version)]
+#[command(
+    name = "i3mux",
+    version,
+    about = "Persistent terminal sessions for Sway workspaces",
+    after_help = "Exit status: 0 success, 1 error, 2 usage error or (attach) several sessions to choose from."
+)]
 struct Cli {
-    /// Remote host (e.g., 'deepthought' or 'user@host')
-    #[arg(short, long)]
-    remote: Option<String>,
-
-    /// Session name (optional, required if multiple sessions exist)
-    #[arg(short, long)]
-    session: Option<String>,
-
-    /// Enable verbose debug logging
+    /// Print what i3mux does on stderr
     #[arg(short, long, global = true)]
     verbose: bool,
 
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: CliCommand,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Activate i3mux for current workspace
+enum CliCommand {
+    /// Bind the focused workspace to a session and open its first terminal
     Activate {
-        /// Remote host (for remote sessions)
+        /// Run the shells on this ssh host, e.g. 'deepthought' or 'user@host'
         #[arg(short, long)]
         remote: Option<String>,
-
-        /// Session name (optional)
+        /// Session name [default: wsN for workspace N]
         #[arg(short, long)]
         session: Option<String>,
     },
-
-    /// Detach current workspace and save session to remote
-    Detach {
-        /// Session name to save as
-        #[arg(short, long)]
-        session: Option<String>,
-    },
-
-    /// Attach to a saved session
-    Attach {
-        /// Remote host
-        #[arg(short, long)]
-        remote: Option<String>,
-
-        /// Session name
-        #[arg(short, long)]
-        session: Option<String>,
-
-        /// Force attach (break existing lock)
+    /// Open a terminal: a persistent shell in a bound workspace, else a plain terminal
+    Terminal {
+        /// Run CMD instead of the login shell; always starts a new shell
+        #[arg(short = 'e', long = "exec", value_name = "CMD")]
+        exec: Option<String>,
+        /// Start a new shell even if a shell without a window exists
         #[arg(long)]
+        new: bool,
+        #[arg(long, help = FORCE_HELP)]
         force: bool,
     },
-
-    /// List available sessions on remote
+    /// Save the focused workspace's layout on the session's host and close its windows
+    Detach,
+    /// Restore a saved session into the focused workspace
+    Attach {
+        /// The host that runs the shells [default: this machine]
+        #[arg(short, long)]
+        remote: Option<String>,
+        /// Session to restore [default: the only saved session not bound here]
+        #[arg(short, long)]
+        session: Option<String>,
+        #[arg(long, help = FORCE_HELP)]
+        force: bool,
+    },
+    /// List the sessions on a host
     Sessions {
-        /// Remote host
+        /// The host to list [default: this machine]
         #[arg(short, long)]
         remote: Option<String>,
     },
-
-    /// Kill a saved session
+    /// End a session: close its windows, kill its shells, delete its saved layout
     Kill {
-        /// Remote host
-        #[arg(short, long)]
+        /// The host that runs the shells [default: this machine]
+        #[arg(short, long, requires = "session")]
         remote: Option<String>,
-
-        /// Session name
+        /// Session to end [default: the session of the focused workspace]
         #[arg(short, long)]
-        session: String,
+        session: Option<String>,
     },
+}
 
-    /// Launch terminal (called by i3 keybind)
-    Terminal {
-        /// Command to run instead of shell (e.g., -e '/path/to/script arg1 arg2')
-        #[arg(short = 'e', long = "exec")]
-        exec: Option<String>,
-    },
+/// Debug output on stderr, enabled by `-v`.
+#[derive(Debug, Clone, Copy)]
+struct Log {
+    verbose: bool,
+}
 
-    /// Clean up workspace state if no sessions remain (internal command)
-    #[command(hide = true)]
-    CleanupWorkspace {
-        /// Workspace name (e.g., "4" for workspace 4)
+impl Log {
+    fn debug(self, message: impl FnOnce() -> String) {
+        if self.verbose {
+            eprintln!("i3mux: {}", message());
+        }
+    }
+}
+
+/// Gives the commands of a host: a real runner in production, a fake in tests.
+type HostFactory = dyn Fn(&Host) -> Box<dyn HostExec> + Sync;
+
+/// Everything a core function touches outside this process.
+struct Ports<'a> {
+    store: &'a StateStore,
+    sway: &'a (dyn Sway + Sync),
+    launcher: &'a (dyn Launcher + Sync),
+    hosts: &'a HostFactory,
+    log: Log,
+    /// How long `detach` waits for shells to lose their clients.
+    disconnect_wait: Duration,
+}
+
+/// A command refused to act. The messages are the plan's user-facing text.
+#[derive(Debug, thiserror::Error)]
+enum CommandError {
+    #[error("Workspace {0} is not bound to a session; run 'i3mux activate' first")]
+    Unbound(String),
+    #[error("Workspace {0} has no number, so it has no default session name; pass --session NAME")]
+    NoDefaultSession(String),
+    #[error("Workspace {workspace} has no windows of session '{session}'; nothing to detach (to end the session, run 'i3mux kill')")]
+    NothingToDetach {
         workspace: String,
+        session: SessionName,
+    },
+    #[error("Workspace {0} already has i3mux terminals; detach or close them first")]
+    WorkspaceHasTerminals(String),
+    #[error(
+        "Session '{0}' is already attached from another terminal or host; use --force to take over"
+    )]
+    AlreadyAttached(TerminalName),
+    #[error("No saved session '{session}' on {host}; run 'i3mux sessions' to list sessions")]
+    NoSavedSession { session: SessionName, host: Host },
+    #[error("No saved sessions on {0} that are not already bound here")]
+    NoSavedSessions(Host),
+    #[error("No session '{session}' on {host}")]
+    NoSuchSession { session: SessionName, host: Host },
+    #[error(
+        "Session '{session}' is detached, but the windows of session {session} did not \
+         disconnect from their shells ({terminals}) within {waited_ms} ms; \
+         if 'i3mux attach' refuses them, add --force"
+    )]
+    StillAttached {
+        session: SessionName,
+        terminals: String,
+        waited_ms: u128,
     },
 }
 
-/// Local ephemeral state (current workspace activations)
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct LocalState {
-    /// Active workspace sessions
-    workspaces: HashMap<String, WorkspaceState>,
-
-    /// Lock holder processes (kept alive to maintain server-side locks)
-    #[serde(skip)]
-    lock_holders: HashMap<String, std::process::Child>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct WorkspaceState {
-    session_type: String, // "local" or "remote"
-    host: String,
-    session_name: Option<String>,
-    next_socket_id: u32,
-    sockets: HashMap<String, SocketInfo>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct SocketInfo {
-    socket_id: String,
-}
-
-impl LocalState {
-    fn path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir()
-            .context("Could not find config directory")?
-            .join("i3mux");
-        fs::create_dir_all(&config_dir)?;
-        Ok(config_dir.join("state.json"))
-    }
-
-    fn load() -> Result<Self> {
-        let path = Self::path()?;
-        if !path.exists() {
-            return Ok(LocalState::default());
-        }
-        let contents = fs::read_to_string(&path)?;
-        Ok(serde_json::from_str(&contents)?)
-    }
-
-    fn save(&self) -> Result<()> {
-        let path = Self::path()?;
-        let contents = serde_json::to_string_pretty(self)?;
-        fs::write(&path, contents)?;
-        Ok(())
-    }
-}
-
-impl Drop for LocalState {
-    fn drop(&mut self) {
-        // Clean up any remaining lock holder processes
-        for (lock_key, mut lock_process) in self.lock_holders.drain() {
-            eprintln!("Cleaning up lock holder for {}", lock_key);
-            let _ = lock_process.kill();
-            let _ = lock_process.wait();
-        }
-    }
-}
-
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    match run(cli) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("i3mux: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    // Set global verbose flag
-    VERBOSE.store(cli.verbose, Ordering::Relaxed);
-
+/// Wire the real ports and dispatch.
+fn run(cli: Cli) -> Result<ExitCode> {
+    let wm = Wm::connect()?;
+    let store = StateStore::from_env()?;
+    let private_dir = private_runtime_dir()?;
+    let launcher = TerminalLauncher::install(terminal_program(), &private_dir)?;
+    let config = RunnerConfig {
+        local_home: dirs::home_dir().context("cannot find the home directory; set HOME")?,
+        ssh_control_dir: private_dir,
+    };
+    let hosts = move |host: &Host| -> Box<dyn HostExec> {
+        Box::new(HostRunner::new(host.clone(), config.clone()))
+    };
+    let ports = Ports {
+        store: &store,
+        sway: &wm,
+        launcher: &launcher,
+        hosts: &hosts,
+        log: Log {
+            verbose: cli.verbose,
+        },
+        disconnect_wait: DISCONNECT_WAIT,
+    };
     match cli.command {
-        None => {
-            // Default: activate current workspace
-            activate(cli.remote, cli.session)
+        CliCommand::Activate { remote, session } => cmd_activate(&ports, &wm, remote, session),
+        CliCommand::Terminal { exec, new, force } => {
+            let request = TerminalRequest {
+                command: exec,
+                new,
+                force,
+            };
+            cmd_terminal(&ports, &wm, &launcher, &request)
         }
-        Some(Commands::Activate { remote, session }) => {
-            activate(remote.or(cli.remote), session.or(cli.session))
-        }
-        Some(Commands::Detach { session }) => detach(session),
-        Some(Commands::Attach {
+        CliCommand::Detach => cmd_detach(&ports, &wm),
+        CliCommand::Attach {
             remote,
             session,
             force,
-        }) => attach(remote.or(cli.remote), session.or(cli.session), force),
-        Some(Commands::Sessions { remote }) => list_sessions(remote.or(cli.remote)),
-        Some(Commands::Kill { remote, session }) => kill_session(remote.or(cli.remote), session),
-        Some(Commands::Terminal { exec }) => terminal(exec.as_deref()),
-        Some(Commands::CleanupWorkspace { workspace }) => cleanup_workspace(&workspace),
+        } => cmd_attach(&ports, &wm, remote, session, force),
+        CliCommand::Sessions { remote } => cmd_sessions(&ports, remote),
+        CliCommand::Kill { remote, session } => cmd_kill(&ports, &wm, remote, session),
     }
 }
 
-/// Check if abduco is available locally
-fn check_abduco_local() -> Result<()> {
-    match Command::new("which").arg("abduco").output() {
-        Ok(output) if output.status.success() => Ok(()),
-        _ => anyhow::bail!(
-            "abduco not found. Please install it:\n\
-            - Arch Linux: sudo pacman -S abduco\n\
-            - Debian/Ubuntu: sudo apt install abduco\n\
-            - macOS: brew install abduco\n\
-            - Or build from source: https://github.com/martanne/abduco"
-        ),
-    }
+/// `$XDG_RUNTIME_DIR/i3mux`, created with mode 0700. Holds the terminal
+/// wrapper and the ssh control sockets (plan decision 8: nothing in /tmp).
+fn private_runtime_dir() -> Result<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .context(
+            "XDG_RUNTIME_DIR is not set; i3mux keeps its terminal wrapper and ssh sockets there",
+        )?;
+    let dir = PathBuf::from(runtime).join("i3mux");
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("cannot restrict {}", dir.display()))?;
+    Ok(dir)
 }
 
-/// Check if abduco is available on remote host using helper script
-fn check_abduco_remote(remote_host: &str) -> Result<()> {
-    // Ensure helper script is uploaded
-    ensure_remote_helper(remote_host)?;
-
-    // Use helper script to check dependencies
-    let output = Command::new("ssh")
-        .arg(remote_host)
-        .arg(format!("bash -lc '{} check-deps'", REMOTE_HELPER_PATH))
-        .output()
-        .context("Failed to check for abduco on remote host")?;
-
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{}", error_msg.trim());
-    }
-
-    debug!("abduco found at: {}", String::from_utf8_lossy(&output.stdout).trim());
-    Ok(())
+/// `$TERMINAL`, or foot.
+fn terminal_program() -> String {
+    std::env::var("TERMINAL")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "foot".to_owned())
 }
 
-/// Ensure the wrapper script exists locally
-fn ensure_wrapper_script() -> Result<()> {
-    use std::io::Write;
-
-    let path = std::path::Path::new(WRAPPER_PATH);
-
-    // Always write the script (it's cheap and ensures we have latest version)
-    let mut file = std::fs::File::create(path)
-        .context("Failed to create wrapper script")?;
-    file.write_all(WRAPPER_SCRIPT.as_bytes())
-        .context("Failed to write wrapper script")?;
-
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms)?;
-    }
-
-    Ok(())
+fn parse_session(session: Option<String>) -> Result<Option<SessionName>> {
+    Ok(session.map(SessionName::new).transpose()?)
 }
 
-/// Ensure the helper script is uploaded and executable on a remote host
-fn ensure_remote_helper(remote_host: &str) -> Result<()> {
-    debug!("Ensuring helper script is present on {}", remote_host);
-
-    // Check if script exists and has correct version
-    let version_check = Command::new("ssh")
-        .arg(remote_host)
-        .arg(format!("{} version 2>/dev/null || echo ''", REMOTE_HELPER_PATH))
-        .output()
-        .context("Failed to check remote helper version")?;
-
-    let remote_version = String::from_utf8_lossy(&version_check.stdout).trim().to_string();
-
-    // Extract version from script (look for VERSION="x.x.x")
-    let local_version = REMOTE_HELPER_SCRIPT
-        .lines()
-        .find(|line| line.contains("VERSION="))
-        .and_then(|line| line.split('"').nth(1))
-        .unwrap_or("unknown");
-
-    if remote_version == local_version {
-        debug!("Remote helper already at version {}", local_version);
-        return Ok(());
-    }
-
-    debug!("Uploading helper script to remote (version {})", local_version);
-
-    // Upload script via stdin
-    let mut upload = Command::new("ssh")
-        .arg(remote_host)
-        .arg(format!("cat > {}", REMOTE_HELPER_PATH))
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to start SSH upload")?;
-
-    if let Some(mut stdin) = upload.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(REMOTE_HELPER_SCRIPT.as_bytes())
-            .context("Failed to write helper script")?;
-    }
-
-    let status = upload.wait().context("Failed to wait for upload")?;
-    if !status.success() {
-        anyhow::bail!("Failed to upload helper script to {}", remote_host);
-    }
-
-    // Make script executable
-    let chmod = Command::new("ssh")
-        .arg(remote_host)
-        .arg(format!("chmod +x {}", REMOTE_HELPER_PATH))
-        .status()
-        .context("Failed to make helper script executable")?;
-
-    if !chmod.success() {
-        anyhow::bail!("Failed to make helper script executable on {}", remote_host);
-    }
-
-    debug!("Helper script uploaded to remote successfully");
-    Ok(())
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
-/// Activate i3mux for current workspace
-fn activate(remote: Option<String>, session_name: Option<String>) -> Result<()> {
-    let backend = WmBackend::connect()?;
-    let (ws_name, ws_num) = get_focused_workspace(&backend)?;
+// ---------------------------------------------------------------- commands
 
-    let mut state = LocalState::load()?;
-
-    // Validate inputs at CLI boundary
-    let remote_host = remote.map(|r| RemoteHost::new(r)).transpose()?;
-
-    let validated_session_name = session_name.map(|name| SessionName::new(name)).transpose()?;
-
-    // Check abduco availability
-    match &remote_host {
-        None => check_abduco_local()?,
-        Some(host) => check_abduco_remote(host.as_str())?,
-    }
-
-    // Ensure SSH control socket directory exists
-    if remote_host.is_some() {
-        std::fs::create_dir_all("/tmp/i3mux/sockets")?;
-    }
-
-    let (session_type, host_str) = match &remote_host {
-        None => ("local", None),
-        Some(h) => ("remote", Some(h.as_str().to_string())),
-    };
-
-    state.workspaces.insert(
-        ws_name.clone(),
-        WorkspaceState {
-            session_type: session_type.to_string(),
-            host: host_str.clone().unwrap_or_else(|| "local".to_string()),
-            session_name: validated_session_name.map(|n| n.as_str().to_string()),
-            next_socket_id: 1,
-            sockets: HashMap::new(),
-        },
-    );
-
-    state.save()?;
-
-    println!("✓ Workspace {} activated", ws_num);
-    if let Some(host) = &host_str {
-        println!("  Remote: {}", host);
-    }
-
-    // Launch first terminal
-    terminal(None)?;
-
-    Ok(())
-}
-
-/// Detach current workspace and save session
-fn detach(session_name: Option<String>) -> Result<()> {
-    let backend = WmBackend::connect()?;
-    let (ws_name, ws_num) = get_focused_workspace(&backend)?;
-
-    let mut state = LocalState::load()?;
-
-    let ws_state = state
-        .workspaces
-        .get(&ws_name)
-        .context("Workspace not i3mux-bound")?
-        .clone();
-
-    if ws_state.session_type == "local" {
-        anyhow::bail!("Cannot detach local sessions (use remote sessions for detach/attach)");
-    }
-
-    // Capture layout using marks (most reliable identification method)
-    let layout = Layout::capture_from_workspace_num(ws_num, &backend)?
-        .context("No i3mux terminals found in workspace")?;
-
-    // Determine session name and validate at boundary
-    let final_session_name_str = session_name
-        .or(ws_state.session_name)
-        .unwrap_or_else(|| format!("ws{}", ws_num));
-    let final_session_name = SessionName::new(final_session_name_str)?;
-
-    // Parse remote host (if "local", use None)
-    let remote_host = if ws_state.host == "local" {
-        None
-    } else {
-        Some(RemoteHost::new(ws_state.host.clone())?)
-    };
-
-    // Create remote session (internal code uses validated inputs)
-    let remote_session = RemoteSession::new(
-        final_session_name.as_str().to_string(),
-        ws_name.clone(),
-        ws_state.host.clone(),
-        layout,
-    )?;
-
-    // Save to remote
-    let host_conn = create_connection(remote_host.as_ref().map(|h| h.as_str()))?;
-    remote_session.save_to_remote(host_conn.as_ref())?;
-
-    println!("✓ Session '{}' saved to {}", final_session_name, ws_state.host);
-    println!("  Layout captured: {} terminals", remote_session.layout.get_sockets().len());
-
-    // Close all i3mux terminals (identified by marks)
-    window::kill_i3mux_windows_in_workspace(&backend, ws_num)?;
-
-    // Clean up lock holder process and release lock
-    let lock_key = format!("{}:{}", ws_state.host, final_session_name.as_str());
-    if let Some(mut lock_process) = state.lock_holders.remove(&lock_key) {
-        // Kill the lock holder process (this will cause remote lock cleanup via EXIT trap)
-        let _ = lock_process.kill();
-        let _ = lock_process.wait();
-    }
-
-    // Explicitly release lock on remote
-    let _ = host_conn.release_lock(final_session_name.as_str());
-
-    // Remove from local state
-    state.workspaces.remove(&ws_name);
-    state.save()?;
-
-    println!("✓ Workspace {} detached", ws_num);
-
-    Ok(())
-}
-
-/// Attach to a saved session
-fn attach(
+fn cmd_activate(
+    ports: &Ports,
+    wm: &Wm,
     remote: Option<String>,
-    session_name: Option<String>,
-    force: bool,
-) -> Result<()> {
-    // Validate remote host at CLI boundary
-    let remote_host = remote.map(|r| RemoteHost::new(r)).transpose()?;
-
-    // Check abduco availability
-    match &remote_host {
-        None => check_abduco_local()?,
-        Some(host) => check_abduco_remote(host.as_str())?,
-    }
-
-    // Ensure SSH control socket directory exists
-    if remote_host.is_some() {
-        std::fs::create_dir_all("/tmp/i3mux/sockets")?;
-    }
-
-    // Create connection (None = local, Some = remote)
-    let host_conn = create_connection(remote_host.as_ref().map(|h| h.as_str()))?;
-
-    // List available sessions
-    let sessions = RemoteSession::list_remote_sessions(host_conn.as_ref())?;
-
-    let host_display = remote_host.as_ref()
-        .map(|h| h.as_str().to_string())
-        .unwrap_or_else(|| LOCAL_DISPLAY.to_string());
-
-    if sessions.is_empty() {
-        anyhow::bail!("No sessions found on {}", host_display);
-    }
-
-    // Determine which session to attach
-    let final_session_name_str = if let Some(name) = session_name {
-        if !sessions.contains(&name) {
-            anyhow::bail!("Session '{}' not found on {}", name, host_display);
-        }
-        name
-    } else if sessions.len() == 1 {
-        sessions[0].clone()
-    } else {
-        // Multiple sessions, return exit code 2 for rofi integration
-        eprintln!("Multiple sessions available:");
-        for s in &sessions {
-            eprintln!("  - {}", s);
-        }
-        eprintln!("\nSpecify session with -s/--session");
-        std::process::exit(2);
-    };
-
-    // Validate session name at CLI boundary
-    let final_session_name = SessionName::new(final_session_name_str)?;
-
-    // Load session
-    let mut session = RemoteSession::load_from_remote(host_conn.as_ref(), final_session_name.as_str())?;
-
-    // Acquire lock
-    let (lock, lock_holder) = host_conn.acquire_lock(final_session_name.as_str(), force)?;
-    session.lock = Some(lock.clone());
-    session.save_to_remote(host_conn.as_ref())?;
-
-    println!("✓ Lock acquired for session '{}'", final_session_name);
-
-    // Check workspace doesn't have existing i3mux terminals (non-i3mux windows are fine)
-    let backend = WmBackend::connect()?;
-    let (ws_name, ws_num) = get_focused_workspace(&backend)?;
-
-    if window::workspace_has_i3mux_windows(ws_num, &backend)? {
-        anyhow::bail!("Workspace {} already has i3mux terminals. Detach or clear them first.", ws_num);
-    }
-
-    // Restore layout and launch terminals
-    restore_layout(&backend, &session, &ws_name, &host_display)?;
-
-    // Update local state
-    let mut state = LocalState::load()?;
-    let (session_type, host_str) = match &remote_host {
-        None => ("local", "local".to_string()),
-        Some(h) => ("remote", h.as_str().to_string()),
-    };
-
-    state.workspaces.insert(
-        ws_name.clone(),
-        WorkspaceState {
-            session_type: session_type.to_string(),
-            host: host_str.clone(),
-            session_name: Some(final_session_name.as_str().to_string()),
-            next_socket_id: session.layout.get_sockets().len() as u32 + 1,
-            sockets: session
-                .layout
-                .get_sockets()
-                .into_iter()
-                .map(|s| (s.clone(), SocketInfo { socket_id: s }))
-                .collect(),
-        },
+    session: Option<String>,
+) -> Result<ExitCode> {
+    let host = Host::from_remote_arg(remote)?;
+    let session = parse_session(session)?;
+    let workspace = wm.focused_workspace()?;
+    let (session, choice) = activate(ports, &host, &workspace, session)?;
+    println!(
+        "✓ Workspace {} bound to session '{session}' on {host}",
+        workspace.name()
     );
-
-    // Store lock holder process if present
-    if let Some(lock_process) = lock_holder {
-        let lock_key = format!("{}:{}", host_str, final_session_name.as_str());
-        state.lock_holders.insert(lock_key, lock_process);
-    }
-
-    state.save()?;
-
-    println!("✓ Attached to session '{}' in workspace {}", final_session_name, ws_num);
-
-    Ok(())
+    println!("  {}", describe_choice(&choice));
+    Ok(ExitCode::SUCCESS)
 }
 
-/// List sessions on remote
-fn list_sessions(remote: Option<String>) -> Result<()> {
-    // Validate remote host at CLI boundary
-    let remote_host = remote.map(|r| RemoteHost::new(r)).transpose()?;
-    let host_display = remote_host.as_ref()
-        .map(|h| h.as_str().to_string())
-        .unwrap_or_else(|| LOCAL_DISPLAY.to_string());
-
-    let host_conn = create_connection(remote_host.as_ref().map(|h| h.as_str()))?;
-    let sessions = RemoteSession::list_remote_sessions(host_conn.as_ref())?;
-
-    if sessions.is_empty() {
-        println!("No sessions on {}", host_display);
-        return Ok(());
+fn cmd_terminal(
+    ports: &Ports,
+    wm: &Wm,
+    launcher: &TerminalLauncher,
+    request: &TerminalRequest,
+) -> Result<ExitCode> {
+    let workspace = wm.focused_workspace()?;
+    if ports.store.load()?.get(workspace.name()).is_none() {
+        launcher.spawn_plain(request.command.as_deref())?;
+    } else {
+        let choice = open_terminal(ports, workspace.name(), request)?;
+        ports.log.debug(|| describe_choice(&choice));
     }
+    Ok(ExitCode::SUCCESS)
+}
 
-    println!("Sessions on {}:\n", host_display);
-    for name in &sessions {
-        let session = RemoteSession::load_from_remote(host_conn.as_ref(), name)?;
-        let locked = if let Some(lock) = &session.lock {
-            if host_conn.is_lock_valid(&lock)? {
-                format!(" [LOCKED by {}]", lock.locked_by)
-            } else {
-                " [stale lock]".to_string()
+fn cmd_detach(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
+    let workspace = wm.focused_workspace()?;
+    let detached = detach(ports, workspace.name(), now_unix())?;
+    println!(
+        "✓ Detached session '{}': layout of {} saved on {}",
+        detached.session,
+        count(detached.terminals, "terminal", "terminals"),
+        detached.host
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_attach(
+    ports: &Ports,
+    wm: &Wm,
+    remote: Option<String>,
+    session: Option<String>,
+    force: bool,
+) -> Result<ExitCode> {
+    let host = Host::from_remote_arg(remote)?;
+    let session = parse_session(session)?;
+    let workspace = wm.focused_workspace()?;
+    match attach(ports, &host, workspace.name(), session, force)? {
+        AttachOutcome::Choose(candidates) => {
+            eprintln!("Several saved sessions on {host}:");
+            for name in &candidates {
+                eprintln!("  {name}");
             }
-        } else {
-            "".to_string()
-        };
-
-        println!("  {} - {} terminals{}", name, session.layout.get_sockets().len(), locked);
-    }
-
-    Ok(())
-}
-
-/// Kill a saved session
-fn kill_session(remote: Option<String>, session: String) -> Result<()> {
-    // Validate inputs at CLI boundary
-    let remote_host = remote.map(|r| RemoteHost::new(r)).transpose()?;
-    let session_name = SessionName::new(session)?;
-    let host_display = remote_host.as_ref()
-        .map(|h| h.as_str().to_string())
-        .unwrap_or_else(|| LOCAL_DISPLAY.to_string());
-
-    // Create connection and delete session (None = local, Some = remote)
-    let host_conn = create_connection(remote_host.as_ref().map(|h| h.as_str()))?;
-    host_conn.delete_session(session_name.as_str())?;
-
-    println!("✓ Session '{}' deleted from {}", session_name, host_display);
-    Ok(())
-}
-
-/// Launch terminal (smart detection)
-fn terminal(exec: Option<&str>) -> Result<()> {
-    let backend = WmBackend::connect()?;
-    let (ws_name, _) = get_focused_workspace(&backend)?;
-
-    let state = LocalState::load()?;
-
-    // Check if workspace is i3mux-bound
-    if state.workspaces.get(&ws_name).is_none() {
-        return launch_normal_terminal(backend.wm_type(), exec);
-    }
-
-    // Workspace is i3mux-bound - always launch i3mux terminal
-    // (The old logic checked focused window type, but that doesn't make sense:
-    //  if the workspace is bound to i3mux, ALL terminals should be i3mux terminals)
-    launch_i3mux_terminal(&ws_name, backend.wm_type(), exec)?;
-
-    Ok(())
-}
-
-// Helper functions
-
-fn get_focused_workspace(backend: &WmBackend) -> Result<(String, i32)> {
-    let workspaces = backend.get_workspaces()?;
-    for ws in workspaces {
-        if ws.focused {
-            return Ok((ws.num.to_string(), ws.num));
+            eprintln!("Choose one with --session NAME.");
+            Ok(ExitCode::from(EXIT_CHOOSE))
+        }
+        AttachOutcome::Attached(a) => {
+            println!(
+                "✓ Attached session '{}' from {} to workspace {} ({})",
+                a.session,
+                host,
+                workspace.name(),
+                count(a.total, "terminal", "terminals")
+            );
+            if a.recreated > 0 {
+                println!(
+                    "  recreated {} of {} shells: the host had lost them, for example after a reboot",
+                    a.recreated, a.total
+                );
+            }
+            Ok(ExitCode::SUCCESS)
         }
     }
-    anyhow::bail!("No focused workspace found")
 }
 
-/// Build terminal-specific arguments to set window instance/app_id
-///
-/// Different terminals have different CLI options for setting the window identifier.
-/// On X11 (i3), this sets the WM_CLASS instance. On Wayland (Sway), this sets the app_id.
-fn build_terminal_instance_args(terminal: &str, instance: &str, wm_type: WmType) -> Vec<String> {
-    // Extract just the binary name from the path
-    let terminal_name = std::path::Path::new(terminal)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(terminal);
+fn cmd_sessions(ports: &Ports, remote: Option<String>) -> Result<ExitCode> {
+    let host = Host::from_remote_arg(remote)?;
+    let rows = sessions(ports, &host)?;
+    if rows.is_empty() {
+        eprintln!("No sessions on {host}");
+    }
+    for line in format_rows(&rows) {
+        println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
-    match terminal_name {
-        // Wayland-native terminals
-        "foot" => vec!["--app-id".to_string(), instance.to_string()],
+fn cmd_kill(
+    ports: &Ports,
+    wm: &Wm,
+    remote: Option<String>,
+    session: Option<String>,
+) -> Result<ExitCode> {
+    let (host, session) = if let Some(session) = parse_session(session)? {
+        (Host::from_remote_arg(remote)?, session)
+    } else {
+        let workspace = wm.focused_workspace()?;
+        let binding = ports
+            .store
+            .load()?
+            .get(workspace.name())
+            .cloned()
+            .ok_or_else(|| CommandError::Unbound(workspace.name().to_owned()))?;
+        (binding.host().clone(), binding.session().clone())
+    };
+    let killed = kill(ports, &host, &session)?;
+    println!(
+        "✓ Killed session '{session}' on {host}: {}, {}{}",
+        count(killed.shells, "shell", "shells"),
+        count(killed.windows, "window", "windows"),
+        if killed.layout_deleted {
+            ", saved layout deleted"
+        } else {
+            ""
+        }
+    );
+    Ok(ExitCode::SUCCESS)
+}
 
-        // Terminals that work on both X11 and Wayland
-        "alacritty" => match wm_type {
-            WmType::Sway => vec!["--class".to_string(), instance.to_string()],
-            WmType::I3 => vec!["--class".to_string(), format!("Alacritty,{}", instance)],
-        },
-        "kitty" => vec!["--class".to_string(), instance.to_string()],
-
-        // X11-only terminals
-        "xterm" => vec!["-name".to_string(), instance.to_string()],
-        "urxvt" | "rxvt-unicode" => vec!["-name".to_string(), instance.to_string()],
-        "st" => vec!["-n".to_string(), instance.to_string()],
-
-        // Default based on WM type
-        _ => match wm_type {
-            WmType::Sway => vec!["--app-id".to_string(), instance.to_string()],
-            WmType::I3 => vec!["-name".to_string(), instance.to_string()],
-        },
+fn describe_choice(choice: &Choice) -> String {
+    match choice {
+        Choice::Reattach(name) => format!("reattached shell {name}"),
+        Choice::Create(name) => format!("started shell {name}"),
     }
 }
 
-fn get_terminal_command(wm_type: WmType) -> String {
-    std::env::var("TERMINAL").unwrap_or_else(|_| match wm_type {
-        WmType::Sway => "foot".to_string(),
-        WmType::I3 => "i3-sensible-terminal".to_string(),
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+// ---------------------------------------------------------------- core
+
+/// A terminal to open in a bound workspace.
+#[derive(Debug, Default)]
+struct TerminalRequest {
+    /// Run this instead of the login shell (always a new shell).
+    command: Option<String>,
+    /// Start a new shell even if one has no window.
+    new: bool,
+    /// Take over shells attached elsewhere.
+    force: bool,
+}
+
+/// `wsN` for workspace N.
+fn default_session(workspace: &WorkspaceInfo) -> Result<SessionName, CommandError> {
+    workspace
+        .number()
+        .map(SessionName::for_workspace)
+        .ok_or_else(|| CommandError::NoDefaultSession(workspace.name().to_owned()))
+}
+
+/// Bind `workspace` to `session` on `host`, then open its first terminal.
+/// The host is checked (reachable, shpool installed) before anything is bound.
+fn activate(
+    ports: &Ports,
+    host: &Host,
+    workspace: &WorkspaceInfo,
+    session: Option<SessionName>,
+) -> Result<(SessionName, Choice)> {
+    let session = match session {
+        Some(session) => session,
+        None => default_session(workspace)?,
+    };
+    mux::list((ports.hosts)(host).as_ref())?;
+    let binding = WorkspaceState::new(host.clone(), session.clone());
+    ports
+        .store
+        .with_lock(|state| Ok(state.bind(workspace.name(), binding)?))?;
+    let choice = open_terminal(ports, workspace.name(), &TerminalRequest::default())?;
+    Ok((session, choice))
+}
+
+/// Open one window of the session bound to `workspace` (plan rule 4).
+///
+/// Under the state lock: list the host's shells, read the marked windows,
+/// choose (lowest orphan, or a new number), spawn, wait for the window,
+/// mark it. The mark is visible before the lock is released, so a
+/// concurrent call never picks the same shell.
+fn open_terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> Result<Choice> {
+    let lock = ports.store.lock()?;
+    let binding = lock
+        .state()
+        .get(workspace)
+        .cloned()
+        .ok_or_else(|| CommandError::Unbound(workspace.to_owned()))?;
+    let host = (ports.hosts)(binding.host());
+    let shells: Vec<Shell> = mux::list(host.as_ref())?
+        .into_iter()
+        .filter(|s| s.name().session() == binding.session())
+        .collect();
+    let mut in_use =
+        window::session_terminals(&ports.sway.get_tree()?, binding.host(), binding.session());
+    if !request.force {
+        in_use.extend(
+            shells
+                .iter()
+                .filter(|s| s.is_attached())
+                .map(|s| s.name().clone()),
+        );
+    }
+    let alive: Vec<TerminalName> = shells.iter().map(|s| s.name().clone()).collect();
+    let force_new = request.new || request.command.is_some();
+    let choice = mux::choose_terminal(binding.session(), &alive, &in_use, force_new);
+    open_window(
+        ports,
+        host.as_ref(),
+        choice.name(),
+        request.force,
+        request.command.as_deref(),
+    )?;
+    drop(lock);
+    Ok(choice)
+}
+
+/// Launch the window of `terminal` and mark it.
+fn open_window(
+    ports: &Ports,
+    host: &dyn HostExec,
+    terminal: &TerminalName,
+    force: bool,
+    command: Option<&str>,
+) -> Result<()> {
+    let mark = Mark::new(host.host().clone(), terminal.clone());
+    let argv = mux::attach_argv(host, terminal, force, command);
+    ports
+        .log
+        .debug(|| format!("opening {mark}: {}", shell_words::join(&argv)));
+    let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
+    ports.launcher.spawn(&mark.app_id(), &title, &argv)?;
+    sway_ops::wait_for_window_and_mark(ports.sway, &mark)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Detached {
+    session: SessionName,
+    host: Host,
+    terminals: usize,
+}
+
+/// Save the layout of `workspace` on the session's host, close its windows,
+/// disconnect their shells, and unbind it.
+///
+/// Plan rule 5: at least one i3mux window is required. Plan rule 7: the
+/// layout is written before any window closes, so a failed write leaves
+/// every window open.
+///
+/// Sway closes windows asynchronously, so their shpool clients can outlive
+/// the kill; an `attach` right after would then see the shells as attached
+/// elsewhere and refuse them. So `detach` disconnects the closed windows'
+/// shells with `shpool detach` and waits, still under the lock, until
+/// `shpool list` shows none of them attached. The binding is committed
+/// before the wait: if the wait times out, the session is detached and the
+/// error only warns that the next `attach` may need `--force`.
+fn detach(ports: &Ports, workspace: &str, saved_at_unix: u64) -> Result<Detached> {
+    let mut lock = ports.store.lock()?;
+    let binding = lock
+        .state()
+        .get(workspace)
+        .cloned()
+        .ok_or_else(|| CommandError::Unbound(workspace.to_owned()))?;
+    let (host, name) = (binding.host(), binding.session());
+    let tree = ports.sway.get_tree()?;
+    let layout = window::find_workspace(&tree, workspace)
+        .and_then(|ws| layout::capture(ws, host, name))
+        .ok_or_else(|| CommandError::NothingToDetach {
+            workspace: workspace.to_owned(),
+            session: name.clone(),
+        })?;
+    let saved = SavedSession::new(name.clone(), host.clone(), layout, saved_at_unix)?;
+    let exec = (ports.hosts)(host);
+    session::save(exec.as_ref(), &saved)?;
+    let closed = sway_ops::kill_all(ports.sway, host, name)?;
+    mux::detach(exec.as_ref(), &closed)?;
+    lock.state_mut().unbind(workspace);
+    lock.commit()?;
+    wait_until_disconnected(exec.as_ref(), name, &closed, ports.disconnect_wait)?;
+    Ok(Detached {
+        session: name.clone(),
+        host: host.clone(),
+        terminals: saved.layout().terminals().len(),
     })
 }
 
-fn get_user_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string())
-}
-
-fn launch_normal_terminal(wm_type: WmType, exec: Option<&str>) -> Result<()> {
-    let terminal = get_terminal_command(wm_type);
-    let mut cmd = Command::new(&terminal);
-
-    // If exec is provided, use terminal's -e flag to run the command
-    if let Some(exec_cmd) = exec {
-        cmd.arg("-e").arg("sh").arg("-c").arg(exec_cmd);
-    }
-
-    cmd.spawn().context("Failed to launch terminal")?;
-    Ok(())
-}
-
-fn launch_i3mux_terminal(ws_name: &str, wm_type: WmType, exec: Option<&str>) -> Result<()> {
-    debug!("launch_i3mux_terminal called for workspace: {}", ws_name);
-
-    // Ensure wrapper script exists
-    ensure_wrapper_script()?;
-
-    let mut state = LocalState::load()?;
-
-    let socket = {
-        let ws_state = state
-            .workspaces
-            .get_mut(ws_name)
-            .context("Workspace not i3mux-bound")?;
-
-        let socket = format!("ws{}-{:03}", ws_name, ws_state.next_socket_id);
-        debug!("Generated socket ID: {}", socket);
-        ws_state.next_socket_id += 1;
-        ws_state.sockets.insert(socket.clone(), SocketInfo { socket_id: socket.clone() });
-        socket
-    };
-
-    let (title, attach_cmd, cleanup_cmd) = {
-        let ws_state = state
-            .workspaces
-            .get(ws_name)
-            .context("Workspace not i3mux-bound")?;
-
-        let title = if ws_state.session_type == "local" {
-            format!("{}local:{}", MARKER, socket)
-        } else {
-            format!("{}{}:{}", MARKER, ws_state.host, socket)
-        };
-
-        // Escape the title for use in PROMPT_COMMAND (needs extra escaping for SSH)
-        let title_for_prompt = title.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$");
-
-        // Use exec command if provided, otherwise use user's shell
-        let cmd_to_run = exec.map(String::from).unwrap_or_else(get_user_shell);
-        debug!("Command to run: {}", cmd_to_run);
-
-        let attach_cmd = if ws_state.session_type == "local" {
-            // Local: Direct abduco attach
-            let prompt_cmd_val = format!("echo -ne \\\"\\\\033]0;{}\\\\007\\\"", title_for_prompt);
-            format!(
-                r#"bash -c "export PROMPT_COMMAND='{}'; exec abduco -A /tmp/{} {}""#,
-                prompt_cmd_val, socket, cmd_to_run
-            )
-        } else {
-            // Remote: Use helper script to attach (ensures PATH is set correctly)
-            // When exec is provided, pass it to the attach command
-            if exec.is_some() {
-                format!(
-                    r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -tt {} 'bash -l -c "exec {} attach {} -- {}"'"#,
-                    ws_state.host, REMOTE_HELPER_PATH, socket, cmd_to_run
-                )
-            } else {
-                format!(
-                    r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -tt {} 'bash -l -c "exec {} attach {}"'"#,
-                    ws_state.host, REMOTE_HELPER_PATH, socket
-                )
+/// Poll `shpool list` until none of `names` has a client.
+fn wait_until_disconnected(
+    exec: &dyn HostExec,
+    session: &SessionName,
+    names: &[TerminalName],
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let attached: Vec<String> = mux::list(exec)?
+            .into_iter()
+            .filter(|s| s.is_attached() && names.contains(s.name()))
+            .map(|s| s.name().to_string())
+            .collect();
+        if attached.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(CommandError::StillAttached {
+                session: session.clone(),
+                terminals: attached.join(", "),
+                waited_ms: timeout.as_millis(),
             }
-        };
+            .into());
+        }
+        std::thread::sleep(DISCONNECT_POLL);
+    }
+}
 
-        // Cleanup script to run after terminal exits
-        // This cleans up remote session files AND local workspace state
-        let cleanup_cmd = {
-            let ws_prefix = format!("ws{}", ws_name);
-            let session_cleanup = if let Some(session_name) = &ws_state.session_name {
-                if ws_state.session_type == "local" {
-                    // Local cleanup: Remove session files if no sockets remain
-                    format!(
-                        r#"if ! ls /tmp/{ws_prefix}-* &>/dev/null; then rm -f /tmp/i3mux/sessions/{session}.json /tmp/i3mux/locks/{session}.lock; fi"#,
-                        ws_prefix = ws_prefix,
-                        session = session_name
-                    )
-                } else {
-                    // Remote cleanup: Use helper script to check and clean up remote session files
-                    format!(
-                        r#"ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p {host} 'bash -lc "{helper} cleanup-check {ws_prefix} {session}"' 2>/dev/null || true"#,
-                        host = ws_state.host,
-                        helper = REMOTE_HELPER_PATH,
-                        ws_prefix = ws_prefix,
-                        session = session_name
-                    )
-                }
-            } else {
-                String::new()
-            };
+#[derive(Debug)]
+enum AttachOutcome {
+    Attached(Attached),
+    /// Several saved sessions fit; the user must name one.
+    Choose(Vec<SessionName>),
+}
 
-            // Always clean up workspace state if no sockets remain (for both local and remote)
-            // Get the binary path for i3mux
-            let i3mux_bin = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "i3mux".to_string());
+#[derive(Debug)]
+struct Attached {
+    session: SessionName,
+    total: usize,
+    /// Shells the host no longer had, started fresh (plan rule 11).
+    recreated: usize,
+}
 
-            format!(
-                r#"{session_cleanup}; {bin} cleanup-workspace {ws} 2>/dev/null || true"#,
-                session_cleanup = session_cleanup,
-                bin = i3mux_bin,
-                ws = ws_name
-            )
-        };
-
-        (title, attach_cmd, cleanup_cmd)
+/// Restore a saved session of `host` into `workspace`.
+///
+/// Refuses a shell attached elsewhere unless `force` (plan rule 10), and a
+/// workspace that already has i3mux windows (plan rule 6). The workspace is
+/// bound before any window opens, so an interrupted attach leaves a bound
+/// workspace that `detach` or `kill` can clean up.
+fn attach(
+    ports: &Ports,
+    host: &Host,
+    workspace: &str,
+    requested: Option<SessionName>,
+    force: bool,
+) -> Result<AttachOutcome> {
+    let exec = (ports.hosts)(host);
+    let name = match requested {
+        Some(name) => name,
+        None => match pick_saved_session(ports, exec.as_ref())? {
+            Pick::One(name) => name,
+            Pick::Several(candidates) => return Ok(AttachOutcome::Choose(candidates)),
+        },
     };
+    let saved =
+        session::load(exec.as_ref(), &name)?.ok_or_else(|| CommandError::NoSavedSession {
+            session: name.clone(),
+            host: host.clone(),
+        })?;
+    let terminals: Vec<TerminalName> = saved.layout().terminals().into_iter().cloned().collect();
+    let shells = mux::list(exec.as_ref())?;
+    let find = |t: &TerminalName| shells.iter().find(|s| s.name() == t);
+    if !force {
+        if let Some(busy) = terminals
+            .iter()
+            .find(|t| find(t).is_some_and(Shell::is_attached))
+        {
+            return Err(CommandError::AlreadyAttached(busy.clone()).into());
+        }
+    }
+    let recreated = terminals.iter().filter(|t| find(t).is_none()).count();
 
-    state.save()?;
+    let mut lock = ports.store.lock()?;
+    let tree = ports.sway.get_tree()?;
+    if window::find_workspace(&tree, workspace)
+        .is_some_and(|ws| !window::i3mux_windows_in(ws).is_empty())
+    {
+        return Err(CommandError::WorkspaceHasTerminals(workspace.to_owned()).into());
+    }
+    lock.state_mut()
+        .bind(workspace, WorkspaceState::new(host.clone(), name.clone()))?;
+    lock.commit()?;
+    for step in layout::restore_plan(saved.layout()) {
+        match step {
+            Step::Launch(terminal) => open_window(ports, exec.as_ref(), &terminal, force, None)?,
+            Step::Sway(command) => ports.sway.run(command)?,
+        }
+    }
+    Ok(AttachOutcome::Attached(Attached {
+        session: name,
+        total: terminals.len(),
+        recreated,
+    }))
+}
 
-    let ws_state = state.workspaces.get(ws_name).unwrap();
+enum Pick {
+    One(SessionName),
+    Several(Vec<SessionName>),
+}
 
-    debug!("Session type: {}", ws_state.session_type);
-    debug!("Host: {}", ws_state.host);
-    debug!("Title: {}", title);
-    debug!("Attach command: {}", attach_cmd);
+/// The saved sessions of the host that are not bound on this machine.
+fn pick_saved_session(ports: &Ports, exec: &dyn HostExec) -> Result<Pick> {
+    let state = ports.store.load()?;
+    let mut candidates: Vec<SessionName> = session::list(exec)?
+        .into_iter()
+        .filter(|s| state.workspace_of(exec.host(), s).is_none())
+        .collect();
+    match candidates.len() {
+        0 => Err(CommandError::NoSavedSessions(exec.host().clone()).into()),
+        1 => Ok(Pick::One(candidates.remove(0))),
+        _ => Ok(Pick::Several(candidates)),
+    }
+}
 
-    // Build wrapper script invocation
-    // Pass PROMPT_COMMAND for remote sessions to maintain title
-    let prompt_cmd = if ws_state.session_type == "remote" {
-        format!("echo -ne \"\\033]0;{}\\007\"", title.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$"))
+#[derive(Debug)]
+struct Killed {
+    windows: usize,
+    shells: usize,
+    layout_deleted: bool,
+}
+
+/// End `session` on `host`, in this order: check that the host answers,
+/// close the windows (before the shells, so no wrapper shows an error),
+/// kill the shells, delete the saved layout, remove the binding. An
+/// unreachable host therefore leaves every window open.
+fn kill(ports: &Ports, host: &Host, name: &SessionName) -> Result<Killed> {
+    let exec = (ports.hosts)(host);
+    let mut lock = ports.store.lock()?;
+    mux::list(exec.as_ref())?;
+    let windows = sway_ops::kill_all(ports.sway, host, name)?.len();
+    let shells = mux::kill_session(exec.as_ref(), name)?.len();
+    let layout_deleted = session::delete(exec.as_ref(), name)?;
+    let unbound = lock.state_mut().unbind_session(host, name).is_some();
+    if windows == 0 && shells == 0 && !layout_deleted && !unbound {
+        return Err(CommandError::NoSuchSession {
+            session: name.clone(),
+            host: host.clone(),
+        }
+        .into());
+    }
+    lock.commit()?;
+    Ok(Killed {
+        windows,
+        shells,
+        layout_deleted,
+    })
+}
+
+/// One line of `i3mux sessions`.
+#[derive(Debug, PartialEq, Eq)]
+struct SessionRow {
+    name: SessionName,
+    host: Host,
+    status: RowStatus,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RowStatus {
+    /// Bound to a workspace on this machine.
+    Bound { windows: usize, orphans: usize },
+    /// Not bound here, but a terminal elsewhere shows at least one shell.
+    AttachedElsewhere { shells: usize },
+    /// Not bound here, no shell attached; a saved layout exists.
+    Detached { saved: usize },
+    /// Not bound here, no shell attached; the saved layout is corrupt.
+    Unreadable,
+    /// Not bound here, no shell attached, nothing saved, but shells run.
+    Running { shells: usize },
+}
+
+/// The sessions of `host`: bound here, saved there, or with live shells.
+/// A corrupt saved layout is one row, not an error for the whole list.
+fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
+    let exec = (ports.hosts)(host);
+    let shells = mux::list(exec.as_ref())?;
+    let saved = session::list(exec.as_ref())?;
+    let state = ports.store.load()?;
+    let bound: Vec<&SessionName> = state
+        .bindings()
+        .filter(|(_, b)| b.host() == host)
+        .map(|(_, b)| b.session())
+        .collect();
+    let tree = if bound.is_empty() {
+        None
     } else {
-        String::new()
+        Some(ports.sway.get_tree()?)
     };
 
-    let wrapper_args = vec![
-        socket.as_str(),
-        &title,
-        &attach_cmd,
-        &cleanup_cmd,
-        &prompt_cmd,
-    ];
-
-    debug!("Wrapper script: {} with args: {:?}", WRAPPER_PATH, wrapper_args);
-    debug!("Terminal command: {}", get_terminal_command(wm_type));
-
-    // Get the host for creating the I3muxWindow identity
-    let host = ws_state.host.clone();
-
-    // Generate instance name (same format as marks)
-    let instance = I3muxWindow::mark_from_parts(&host, &socket);
-
-    // Build terminal command with instance-specific args
-    let terminal = get_terminal_command(wm_type);
-    let instance_args = build_terminal_instance_args(&terminal, &instance, wm_type);
-
-    debug!("Instance name: {}", instance);
-    debug!("Terminal args: {:?}", instance_args);
-
-    // Spawn the terminal with instance set via terminal-specific CLI args
-    let mut cmd = Command::new(&terminal);
-    cmd.args(&instance_args)
-        .arg("-T")
-        .arg(&title)
-        .arg("-e")
-        .arg(WRAPPER_PATH)
-        .args(&wrapper_args);
-
-    cmd.spawn().context("Failed to launch i3mux terminal")?;
-
-    // Wait for window to appear and apply i3mux mark
-    let backend = WmBackend::connect()?;
-    wait_for_window_and_mark(&backend, &instance, &host, &socket)?;
-
-    debug!("launch_i3mux_terminal completed successfully");
-    Ok(())
-}
-
-/// Clean up workspace state if no active sessions remain
-fn cleanup_workspace(ws_name: &str) -> Result<()> {
-    debug!("cleanup_workspace called for workspace: {}", ws_name);
-
-    let mut state = LocalState::load()?;
-
-    // Check if workspace exists in state
-    if !state.workspaces.contains_key(ws_name) {
-        debug!("Workspace {} not in state, nothing to clean up", ws_name);
-        return Ok(());
+    let names: BTreeSet<&SessionName> = shells
+        .iter()
+        .map(|s| s.name().session())
+        .chain(saved.iter())
+        .chain(bound.iter().copied())
+        .collect();
+    let mut rows = Vec::new();
+    for name in names {
+        let alive: Vec<&Shell> = shells
+            .iter()
+            .filter(|s| s.name().session() == name)
+            .collect();
+        let status = match &tree {
+            Some(tree) if bound.contains(&name) => bound_status(tree, host, name, &alive),
+            _ if alive.iter().any(|s| s.is_attached()) => RowStatus::AttachedElsewhere {
+                shells: alive.len(),
+            },
+            _ if saved.contains(name) => saved_status(exec.as_ref(), name)?,
+            _ => RowStatus::Running {
+                shells: alive.len(),
+            },
+        };
+        rows.push(SessionRow {
+            name: name.clone(),
+            host: host.clone(),
+            status,
+        });
     }
+    Ok(rows)
+}
 
-    // Check if any socket files exist for this workspace
-    let ws_prefix = format!("ws{}", ws_name);
-    let socket_pattern = format!("/tmp/{}-*", ws_prefix);
-
-    debug!("Checking for socket files: {}", socket_pattern);
-
-    // Use glob to check for socket files
-    let has_sockets = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("ls {} 2>/dev/null", socket_pattern))
-        .output()?
-        .status
-        .success();
-
-    if has_sockets {
-        debug!("Socket files still exist, not cleaning up workspace state");
-        return Ok(());
+/// Windows of a session bound here, and its shells without a window.
+fn bound_status(tree: &Value, host: &Host, name: &SessionName, alive: &[&Shell]) -> RowStatus {
+    let marked = window::session_terminals(tree, host, name);
+    let orphans = alive
+        .iter()
+        .filter(|s| !s.is_attached() && !marked.contains(s.name()))
+        .count();
+    RowStatus::Bound {
+        windows: marked.len(),
+        orphans,
     }
-
-    // No sockets remain, remove workspace state
-    debug!("No socket files found, removing workspace state for {}", ws_name);
-    state.workspaces.remove(ws_name);
-    state.save()?;
-
-    debug!("Workspace {} state cleaned up successfully", ws_name);
-    Ok(())
 }
 
-fn restore_layout(
-    backend: &WmBackend,
-    session: &RemoteSession,
-    _ws_name: &str,
-    remote_host: &str,
-) -> Result<()> {
-    let sockets = session.layout.get_sockets();
-    println!("Restoring layout with {} terminals...", sockets.len());
-
-    // Use recursive restore that properly handles nested layouts
-    restore_layout_recursive(backend, &session.layout, remote_host)?;
-
-    Ok(())
-}
-
-/// Recursively restore a layout by walking the tree and creating the proper structure
-fn restore_layout_recursive(
-    backend: &WmBackend,
-    layout: &Layout,
-    remote_host: &str,
-) -> Result<()> {
-    match layout {
-        Layout::Terminal { socket, .. } => {
-            // Launch and wait for this terminal
-            launch_terminal_for_socket(backend, remote_host, socket)?;
-        }
-        Layout::HSplit { children, .. } => {
-            // Restore first child
-            if let Some(first) = children.first() {
-                restore_layout_recursive(backend, first, remote_host)?;
-            }
-            // Set split mode ONCE, then create all remaining children
-            // They will join the same horizontal split container as equal siblings
-            if children.len() > 1 {
-                backend.run_command("split h")?;
-                for child in children.iter().skip(1) {
-                    restore_layout_recursive(backend, child, remote_host)?;
-                }
-            }
-        }
-        Layout::VSplit { children, .. } => {
-            // Restore first child
-            if let Some(first) = children.first() {
-                restore_layout_recursive(backend, first, remote_host)?;
-            }
-            // Set split mode ONCE, then create all remaining children
-            if children.len() > 1 {
-                backend.run_command("split v")?;
-                for child in children.iter().skip(1) {
-                    restore_layout_recursive(backend, child, remote_host)?;
-                }
-            }
-        }
-        Layout::Tabbed { children } => {
-            // Restore first child
-            if let Some(first) = children.first() {
-                restore_layout_recursive(backend, first, remote_host)?;
-            }
-
-            if children.len() > 1 {
-                // For nested containers, go up to workspace/parent container level
-                // We need to go past the split container to set tabbed on its parent
-                let first_is_container = matches!(
-                    children.first(),
-                    Some(Layout::HSplit { .. } | Layout::VSplit { .. } | Layout::Tabbed { .. } | Layout::Stacked { .. })
-                );
-                if first_is_container {
-                    // Go from leaf to split container, then to workspace
-                    backend.run_command("focus parent")?;
-                    backend.run_command("focus parent")?;
-                }
-
-                // Set tabbed layout
-                backend.run_command("layout tabbed")?;
-
-                // For nested containers, ensure we're at the tabbed level before adding children
-                // The new children should be tabs, not nested inside the first child
-                if first_is_container {
-                    // "layout tabbed" keeps focus at workspace, but new windows might
-                    // still join the last focused child. Force focus back to workspace.
-                    backend.run_command("focus parent")?;
-                }
-
-                for child in children.iter().skip(1) {
-                    restore_layout_recursive(backend, child, remote_host)?;
-                }
-
-                // For nested containers, focus the first tab for consistency
-                if first_is_container {
-                    // Go up to tabbed container level, then left to first tab
-                    backend.run_command("focus parent")?;
-                    backend.run_command("focus parent")?;
-                    backend.run_command("focus left")?;
-                }
-            }
-        }
-        Layout::Stacked { children } => {
-            // Restore first child
-            if let Some(first) = children.first() {
-                restore_layout_recursive(backend, first, remote_host)?;
-            }
-
-            if children.len() > 1 {
-                // For nested containers, go up to workspace/parent container level
-                let first_is_container = matches!(
-                    children.first(),
-                    Some(Layout::HSplit { .. } | Layout::VSplit { .. } | Layout::Tabbed { .. } | Layout::Stacked { .. })
-                );
-                if first_is_container {
-                    backend.run_command("focus parent")?;
-                    backend.run_command("focus parent")?;
-                }
-
-                // Set stacked layout
-                backend.run_command("layout stacking")?;
-
-                // For nested containers, ensure we're at the stacked level before adding children
-                if first_is_container {
-                    backend.run_command("focus parent")?;
-                }
-
-                for child in children.iter().skip(1) {
-                    restore_layout_recursive(backend, child, remote_host)?;
-                }
-
-                // For nested containers, focus the first item for consistency
-                if first_is_container {
-                    backend.run_command("focus parent")?;
-                    backend.run_command("focus parent")?;
-                    backend.run_command("focus up")?;
-                }
-            }
-        }
+/// The saved layout's size, or [`RowStatus::Unreadable`] if it is corrupt.
+fn saved_status(exec: &dyn HostExec, name: &SessionName) -> Result<RowStatus> {
+    match session::load(exec, name) {
+        Ok(saved) => Ok(RowStatus::Detached {
+            saved: saved.map_or(0, |s| s.layout().terminals().len()),
+        }),
+        Err(SessionError::Corrupt { .. }) => Ok(RowStatus::Unreadable),
+        Err(err) => Err(err.into()),
     }
-    Ok(())
 }
 
-/// Launch a terminal for a specific socket and wait for it to appear
-fn launch_terminal_for_socket(
-    backend: &WmBackend,
-    remote_host: &str,
-    socket_id: &str,
-) -> Result<()> {
-    let title = format!("{}{}:{}", MARKER, remote_host, socket_id);
-    let instance = I3muxWindow::mark_from_parts(remote_host, socket_id);
-
-    let attach_cmd = format!(
-        r#"TERM=xterm-256color ssh -o ControlPath=/tmp/i3mux/sockets/%r@%h:%p -o ControlMaster=auto -o ControlPersist=10m -t {} 'exec bash -lc "{} attach {}"'"#,
-        remote_host, REMOTE_HELPER_PATH, socket_id
-    );
-
-    let wrapper = format!(
-        r#"echo -ne '\033]0;{}\007'; {}; echo 'Session ended.'"#,
-        title, attach_cmd
-    );
-
-    let terminal = get_terminal_command(backend.wm_type());
-    let instance_args = build_terminal_instance_args(&terminal, &instance, backend.wm_type());
-
-    let mut cmd = Command::new(&terminal);
-    cmd.args(&instance_args)
-        .arg("-T")
-        .arg(&title)
-        .arg("-e")
-        .arg("bash")
-        .arg("-c")
-        .arg(&wrapper);
-
-    cmd.spawn().context("Failed to spawn terminal for layout restore")?;
-
-    // Wait for window to appear and apply i3mux mark
-    wait_for_window_and_mark(backend, &instance, remote_host, socket_id)?;
-
-    Ok(())
+/// `ws4  (deepthought)  3 windows, 1 orphan`. The first word is the session
+/// name; scripts/i3mux-rofi relies on that.
+fn format_rows(rows: &[SessionRow]) -> Vec<String> {
+    let width = rows
+        .iter()
+        .map(|r| r.name.as_str().chars().count())
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|row| {
+            let status = match row.status {
+                RowStatus::Bound { windows, orphans } if orphans > 0 => format!(
+                    "{}, {}",
+                    count(windows, "window", "windows"),
+                    count(orphans, "orphan", "orphans")
+                ),
+                RowStatus::Bound { windows, .. } => count(windows, "window", "windows"),
+                RowStatus::AttachedElsewhere { shells } => {
+                    format!("attached elsewhere, {}", count(shells, "shell", "shells"))
+                }
+                RowStatus::Detached { saved } => {
+                    format!("detached, {} saved", count(saved, "terminal", "terminals"))
+                }
+                RowStatus::Unreadable => "unreadable saved layout".to_owned(),
+                RowStatus::Running { shells } => {
+                    format!("{}, no saved layout", count(shells, "shell", "shells"))
+                }
+            };
+            format!("{:<width$}  ({})  {status}", row.name.as_str(), row.host)
+        })
+        .collect()
 }
+
+#[cfg(test)]
+mod handler_tests;

@@ -1,176 +1,480 @@
-//! Type-safe wrappers for validated user input.
+//! Validated identifiers shared by every module.
 //!
-//! All user input is validated at the CLI boundary and wrapped in these types.
-//! Internal code can trust that these values are safe to use in shell commands.
+//! Each type is built only through validation, so code that holds one never
+//! checks it again. The guarantees:
+//!
+//! - [`SessionName`]: non-empty; only alphanumerics, `-` and `_`; never starts
+//!   with `-`. Safe as a file name, a shpool argument, and a mark component.
+//! - [`RemoteHost`]: `[user@]host`; never empty, never starts with `-` (so ssh
+//!   cannot read it as an option), never the literal `local` (reserved for
+//!   [`Host::Local`]), never contains `:` (the mark separator).
+//! - [`Host`]: its [`Host::label`] parses back to the same value.
+//! - [`TerminalName`]: always `{session}-{NNN}`. `Display` and `FromStr`
+//!   round-trip, and [`TerminalName::parse`] matches one session exactly
+//!   (plan rule 3).
 
-use anyhow::Result;
+use std::fmt;
+use std::str::FromStr;
 
-/// A validated session name.
-///
-/// Only contains alphanumeric characters, hyphens, and underscores.
-/// Safe to use in shell commands without escaping.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+/// A name failed validation. The message names the input and the rule.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidName {
+    #[error("invalid session name '{value}': {reason}")]
+    Session { value: String, reason: &'static str },
+    #[error("invalid remote host '{value}': {reason}")]
+    Host { value: String, reason: &'static str },
+    #[error("invalid terminal name '{0}': expected {{session}}-{{NNN}}, for example ws4-001")]
+    Terminal(String),
+}
+
+/// The name of an i3mux session, for example `ws4`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct SessionName(String);
 
 impl SessionName {
-    /// Creates a new SessionName after validation.
+    /// Validate `name` as a session name.
     ///
     /// # Errors
-    /// Returns error if the name is empty or contains invalid characters.
-    pub fn new(name: impl Into<String>) -> Result<Self> {
-        let name = name.into();
-
-        if name.is_empty() {
-            anyhow::bail!("Session name cannot be empty");
+    /// [`InvalidName::Session`] if `name` is empty, starts with `-`, or has a
+    /// character other than an alphanumeric, `-` or `_`.
+    pub fn new(name: impl Into<String>) -> Result<Self, InvalidName> {
+        let value = name.into();
+        let reason = if value.is_empty() {
+            Some("it is empty")
+        } else if value.starts_with('-') {
+            Some("it starts with '-'")
+        } else if !value.chars().all(is_name_char) {
+            Some("only letters, digits, '-' and '_' are allowed")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => Err(InvalidName::Session { value, reason }),
+            None => Ok(Self(value)),
         }
-
-        if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-            anyhow::bail!(
-                "Invalid session name '{}': only alphanumeric characters, hyphens, and underscores are allowed",
-                name
-            );
-        }
-
-        Ok(Self(name))
     }
 
-    /// Returns the session name as a string slice.
+    /// The default session for a numbered workspace: `ws{number}`.
+    #[must_use]
+    pub fn for_workspace(number: u32) -> Self {
+        // Valid by construction: "ws" followed by ASCII digits.
+        Self(format!("ws{number}"))
+    }
+
+    /// The name as a string slice.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl std::fmt::Display for SessionName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
+impl fmt::Display for SessionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-impl AsRef<str> for SessionName {
-    fn as_ref(&self) -> &str {
-        &self.0
+impl TryFrom<String> for SessionName {
+    type Error = InvalidName;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
     }
 }
 
-/// A validated remote host identifier.
-///
-/// Represents a remote SSH host. Can be either:
-/// - A hostname (alphanumeric, hyphens, dots)
-/// - user@hostname format
-///
-/// Safe to use in SSH commands.
-/// Note: Local connections are represented by `None`, not a RemoteHost.
+impl From<SessionName> for String {
+    fn from(name: SessionName) -> Self {
+        name.0
+    }
+}
+
+/// An ssh destination, `host` or `user@host`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteHost(String);
 
 impl RemoteHost {
-    /// Creates a new RemoteHost after validation.
+    /// Validate `host` as an ssh destination.
     ///
     /// # Errors
-    /// Returns error if the host string is invalid.
-    pub fn new(host: impl Into<String>) -> Result<Self> {
-        let host = host.into();
-
-        if host.is_empty() {
-            anyhow::bail!("Remote host cannot be empty");
+    /// [`InvalidName::Host`] if `host` is empty, starts with `-`, is `local`,
+    /// or its user or host part has characters other than alphanumerics,
+    /// `-`, `_` (and `.` in the host part).
+    pub fn new(host: impl Into<String>) -> Result<Self, InvalidName> {
+        let value = host.into();
+        match remote_host_problem(&value) {
+            Some(reason) => Err(InvalidName::Host { value, reason }),
+            None => Ok(Self(value)),
         }
-
-        // Split on @ if present
-        let (user_part, host_part) = if let Some(idx) = host.find('@') {
-            (Some(&host[..idx]), &host[idx + 1..])
-        } else {
-            (None, host.as_str())
-        };
-
-        // Validate username if present
-        if let Some(user) = user_part {
-            if user.is_empty() {
-                anyhow::bail!("Username cannot be empty in '{}'", host);
-            }
-            if !user.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-                anyhow::bail!(
-                    "Invalid username in '{}': only alphanumeric, hyphens, and underscores allowed",
-                    host
-                );
-            }
-        }
-
-        // Validate hostname
-        if host_part.is_empty() {
-            anyhow::bail!("Hostname cannot be empty");
-        }
-
-        if !host_part.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_') {
-            anyhow::bail!(
-                "Invalid hostname in '{}': only alphanumeric, hyphens, dots, and underscores allowed",
-                host
-            );
-        }
-
-        Ok(Self(host))
     }
 
-    /// Returns the host string as a slice.
+    /// The destination as passed to ssh.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl std::fmt::Display for RemoteHost {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+fn remote_host_problem(value: &str) -> Option<&'static str> {
+    if value.is_empty() {
+        return Some("it is empty");
+    }
+    if value.starts_with('-') {
+        return Some("it starts with '-'");
+    }
+    if value == Host::LOCAL_LABEL {
+        return Some("'local' means this machine; omit --remote for a local session");
+    }
+    let (user, hostname) = match value.split_once('@') {
+        Some((user, hostname)) => (Some(user), hostname),
+        None => (None, value),
+    };
+    if let Some(user) = user {
+        if user.is_empty() || !user.chars().all(is_name_char) {
+            return Some("the user part may only have letters, digits, '-' and '_'");
+        }
+    }
+    if hostname.is_empty() || !hostname.chars().all(|c| is_name_char(c) || c == '.') {
+        return Some("the host part may only have letters, digits, '-', '_' and '.'");
+    }
+    None
+}
+
+impl fmt::Display for RemoteHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-impl AsRef<str> for RemoteHost {
-    fn as_ref(&self) -> &str {
-        &self.0
+/// Where a session's shells run: this machine, or a remote host over ssh.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Host {
+    Local,
+    Ssh(RemoteHost),
+}
+
+impl Host {
+    /// The label of [`Host::Local`]. [`RemoteHost`] rejects it, so labels are
+    /// unambiguous.
+    pub const LOCAL_LABEL: &'static str = "local";
+
+    /// `Local` when `remote` is `None`, else the validated remote host.
+    ///
+    /// # Errors
+    /// [`InvalidName::Host`] if `remote` is not a valid [`RemoteHost`].
+    pub fn from_remote_arg(remote: Option<String>) -> Result<Self, InvalidName> {
+        remote.map_or(Ok(Self::Local), |r| RemoteHost::new(r).map(Self::Ssh))
+    }
+
+    /// Parse a label produced by [`Host::label`].
+    ///
+    /// # Errors
+    /// [`InvalidName::Host`] if `label` is neither `local` nor a valid remote host.
+    pub fn from_label(label: &str) -> Result<Self, InvalidName> {
+        if label == Self::LOCAL_LABEL {
+            Ok(Self::Local)
+        } else {
+            RemoteHost::new(label).map(Self::Ssh)
+        }
+    }
+
+    /// `local`, or the remote host string. Used in window marks and state.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Local => Self::LOCAL_LABEL,
+            Self::Ssh(remote) => remote.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl TryFrom<String> for Host {
+    type Error = InvalidName;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_label(&value)
+    }
+}
+
+impl From<Host> for String {
+    fn from(host: Host) -> Self {
+        host.label().to_owned()
+    }
+}
+
+/// One persistent shell of a session: shpool session `{session}-{NNN}`.
+///
+/// Ordering is by session, then number.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TerminalName {
+    session: SessionName,
+    number: u32,
+}
+
+impl TerminalName {
+    /// Terminal `number` of `session`.
+    #[must_use]
+    pub fn new(session: &SessionName, number: u32) -> Self {
+        Self {
+            session: session.clone(),
+            number,
+        }
+    }
+
+    /// Parse `text` as a terminal of exactly `session`.
+    ///
+    /// Strips exactly `{session}-` and requires the rest to be the canonical
+    /// number digits, so session `ws4` never matches `ws4-x-001` (plan rule 3).
+    #[must_use]
+    pub fn parse(session: &SessionName, text: &str) -> Option<Self> {
+        let digits = text.strip_prefix(session.as_str())?.strip_prefix('-')?;
+        Some(Self::new(session, parse_canonical_number(digits)?))
+    }
+
+    /// The session this terminal belongs to.
+    #[must_use]
+    pub fn session(&self) -> &SessionName {
+        &self.session
+    }
+
+    /// The terminal number within its session.
+    #[must_use]
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+}
+
+/// Digits as `Display` writes them (`{:03}`), so parsing round-trips.
+fn parse_canonical_number(digits: &str) -> Option<u32> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number: u32 = digits.parse().ok()?;
+    (format!("{number:03}") == digits).then_some(number)
+}
+
+impl fmt::Display for TerminalName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{:03}", self.session, self.number)
+    }
+}
+
+impl FromStr for TerminalName {
+    type Err = InvalidName;
+
+    /// Split at the last `-`: the session is everything before it.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidName::Terminal(text.to_owned());
+        let (session, digits) = text.rsplit_once('-').ok_or_else(invalid)?;
+        let session = SessionName::new(session).map_err(|_| invalid())?;
+        let number = parse_canonical_number(digits).ok_or_else(invalid)?;
+        Ok(Self { session, number })
+    }
+}
+
+impl TryFrom<String> for TerminalName {
+    type Error = InvalidName;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<TerminalName> for String {
+    fn from(name: TerminalName) -> Self {
+        name.to_string()
+    }
+}
+
+#[cfg(test)]
+pub mod strategies {
+    //! proptest strategies for the validated types.
+    use super::{Host, RemoteHost, SessionName, TerminalName};
+    use proptest::prelude::*;
+
+    pub fn session_name() -> impl Strategy<Value = SessionName> {
+        "[a-zA-Z0-9_][a-zA-Z0-9_-]{0,15}".prop_map(|s| SessionName::new(s).unwrap())
+    }
+
+    pub fn host() -> impl Strategy<Value = Host> {
+        let remote = "([a-z_][a-z0-9_-]{0,7}@)?[a-z0-9][a-z0-9.-]{0,15}"
+            .prop_filter("'local' is reserved", |s| s != "local")
+            .prop_map(|s| Host::Ssh(RemoteHost::new(s).unwrap()));
+        prop_oneof![Just(Host::Local), remote]
+    }
+
+    pub fn terminal_name() -> impl Strategy<Value = TerminalName> {
+        (session_name(), any::<u32>()).prop_map(|(s, n)| TerminalName::new(&s, n))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    #[test]
-    fn test_valid_session_names() {
-        assert!(SessionName::new("my-session").is_ok());
-        assert!(SessionName::new("session_123").is_ok());
-        assert!(SessionName::new("abc123").is_ok());
+    fn session(name: &str) -> SessionName {
+        SessionName::new(name).unwrap()
     }
 
     #[test]
-    fn test_invalid_session_names() {
-        assert!(SessionName::new("").is_err());
-        assert!(SessionName::new("my session").is_err()); // Space
-        assert!(SessionName::new("my/session").is_err()); // Slash
-        assert!(SessionName::new("my;session").is_err()); // Semicolon
+    fn valid_session_names() {
+        for name in ["my-session", "session_123", "abc123", "ws4"] {
+            assert!(SessionName::new(name).is_ok(), "{name}");
+        }
     }
 
     #[test]
-    fn test_valid_remote_hosts() {
-        assert!(RemoteHost::new("local").is_ok());
-        assert!(RemoteHost::new("myserver").is_ok());
-        assert!(RemoteHost::new("server.example.com").is_ok());
-        assert!(RemoteHost::new("user@server").is_ok());
-        assert!(RemoteHost::new("user@server.example.com").is_ok());
+    fn invalid_session_names() {
+        for name in [
+            "",
+            "my session",
+            "my/session",
+            "my;session",
+            "-f",
+            "a:b",
+            "a.b",
+        ] {
+            assert!(
+                matches!(SessionName::new(name), Err(InvalidName::Session { .. })),
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn test_invalid_remote_hosts() {
-        assert!(RemoteHost::new("").is_err());
-        assert!(RemoteHost::new("@server").is_err()); // Empty username
-        assert!(RemoteHost::new("user@").is_err()); // Empty hostname
-        assert!(RemoteHost::new("user name@server").is_err()); // Space in username
+    fn default_session_for_workspace_is_valid() {
+        let name = SessionName::for_workspace(4);
+        assert_eq!(name.as_str(), "ws4");
+        assert_eq!(SessionName::new("ws4").unwrap(), name);
     }
 
-    // TODO: Implement is_local() method
-    // #[test]
-    // fn test_remote_host_is_local() {
-    //     let local = RemoteHost::new("local").unwrap();
-    //     assert!(local.is_local());
-    //
-    //     let remote = RemoteHost::new("server").unwrap();
-    //     assert!(!remote.is_local());
-    // }
+    #[test]
+    fn valid_remote_hosts() {
+        for host in ["myserver", "server.example.com", "user@server", "localhost"] {
+            assert!(RemoteHost::new(host).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn invalid_remote_hosts() {
+        for host in [
+            "",
+            "@server",
+            "user@",
+            "user name@server",
+            "-oProxyCommand=x",
+            "local",
+            "host:22",
+            "a@b@c",
+        ] {
+            assert!(
+                matches!(RemoteHost::new(host), Err(InvalidName::Host { .. })),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_from_remote_arg() {
+        assert_eq!(Host::from_remote_arg(None).unwrap(), Host::Local);
+        assert_eq!(
+            Host::from_remote_arg(Some("deepthought".into())).unwrap(),
+            Host::Ssh(RemoteHost::new("deepthought").unwrap())
+        );
+        assert!(Host::from_remote_arg(Some("-x".into())).is_err());
+    }
+
+    #[test]
+    fn host_serializes_as_its_label() {
+        let json = serde_json::to_string(&Host::Local).unwrap();
+        assert_eq!(json, "\"local\"");
+        let remote: Host = serde_json::from_str("\"u@h.example\"").unwrap();
+        assert_eq!(remote.label(), "u@h.example");
+        assert!(serde_json::from_str::<Host>("\"-bad\"").is_err());
+    }
+
+    #[test]
+    fn terminal_name_display_pads_to_three_digits() {
+        assert_eq!(TerminalName::new(&session("ws4"), 2).to_string(), "ws4-002");
+        assert_eq!(
+            TerminalName::new(&session("ws4"), 1234).to_string(),
+            "ws4-1234"
+        );
+    }
+
+    #[test]
+    fn terminal_name_prefix_is_exact() {
+        let ws4 = session("ws4");
+        assert_eq!(
+            TerminalName::parse(&ws4, "ws4-001"),
+            Some(TerminalName::new(&ws4, 1))
+        );
+        // Another session whose name starts with "ws4-" never matches.
+        assert_eq!(TerminalName::parse(&ws4, "ws4-x-001"), None);
+        assert_eq!(TerminalName::parse(&ws4, "ws4-001-002"), None);
+        // Nor a session that merely shares a prefix.
+        assert_eq!(TerminalName::parse(&ws4, "ws40-001"), None);
+        assert_eq!(TerminalName::parse(&session("ws"), "ws4-001"), None);
+        // The number is canonical digits only.
+        for bad in ["ws4-", "ws4-01", "ws4-0001", "ws4-+01", "ws4-1a", "ws4001"] {
+            assert_eq!(TerminalName::parse(&ws4, bad), None, "{bad}");
+        }
+        // The session of a longer name is parsed as the longer session.
+        let other: TerminalName = "ws4-x-001".parse().unwrap();
+        assert_eq!(other.session().as_str(), "ws4-x");
+    }
+
+    #[test]
+    fn terminal_name_from_str_rejects_malformed() {
+        for bad in [
+            "",
+            "ws4",
+            "-001",
+            "ws4-",
+            "ws 4-001",
+            "ws4-0001",
+            "ws4-99999999999",
+        ] {
+            assert!(bad.parse::<TerminalName>().is_err(), "{bad}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn terminal_name_round_trips(name in strategies::terminal_name()) {
+            let text = name.to_string();
+            prop_assert_eq!(text.parse::<TerminalName>().unwrap(), name.clone());
+            prop_assert_eq!(TerminalName::parse(name.session(), &text), Some(name.clone()));
+            let json = serde_json::to_string(&name).unwrap();
+            prop_assert_eq!(serde_json::from_str::<TerminalName>(&json).unwrap(), name);
+        }
+
+        #[test]
+        fn host_label_round_trips(host in strategies::host()) {
+            prop_assert_eq!(Host::from_label(host.label()).unwrap(), host);
+        }
+
+        #[test]
+        fn session_name_never_matches_foreign_terminal(
+            a in strategies::session_name(),
+            b in strategies::session_name(),
+            n in any::<u32>(),
+        ) {
+            prop_assume!(a != b);
+            let foreign = TerminalName::new(&b, n).to_string();
+            prop_assert_eq!(TerminalName::parse(&a, &foreign), None);
+        }
+    }
 }

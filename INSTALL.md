@@ -1,141 +1,104 @@
-# i3mux Installation Guide
+# Installing i3mux
 
-## Prerequisites
+## Requirements
 
-i3mux requires the following to be installed:
+- Sway.
+- A Wayland terminal: `foot` (default), `alacritty` or `kitty`. Set `TERMINAL`
+  to pick one.
+- `shpool` on every host that runs shells: the desktop for local sessions
+  and each remote host.
+- Rust toolchain to build i3mux.
+- Optional: `rofi` and `notify-send` for the menu script.
 
-### Required
+## Install shpool
 
-- **i3 window manager** - The window manager i3mux integrates with
-- **abduco** - Session management tool (like tmux/screen but simpler)
-- **Rust toolchain** - To build i3mux (or use pre-built binary)
+Arch Linux (AUR):
 
-### Optional
-
-- **rofi** - For the interactive menu (`i3mux-rofi` script)
-- **notify-send** - For desktop notifications
-
-## Installing abduco
-
-abduco is the core session management tool that i3mux uses to maintain persistent sessions.
-
-### Arch Linux
 ```bash
-sudo pacman -S abduco
+paru -S shpool
 ```
 
-### Debian/Ubuntu
+Any Linux, prebuilt static binary:
+
 ```bash
-sudo apt install abduco
+curl -L https://github.com/shell-pool/shpool/releases/download/v0.11.5/shpool-x86_64-unknown-linux-musl.tar.gz \
+  | tar xz
+sudo install -Dm755 shpool /usr/local/bin/shpool
+# or, without root:
+install -Dm755 shpool ~/.local/bin/shpool
 ```
 
-### Fedora/RHEL
+With cargo:
+
 ```bash
-sudo dnf install abduco
+cargo install shpool
 ```
 
-### macOS
-```bash
-brew install abduco
-```
+Check: `shpool version`.
 
-### Build from source
-```bash
-git clone https://github.com/martanne/abduco
-cd abduco
-make
-sudo make install
-```
+i3mux runs its own shpool daemon per host. It never touches a shpool
+daemon you run yourself. The i3mux daemon uses the socket
+`~/.local/run/i3mux/shpool.socket` and the config
+`~/.config/i3mux/shpool.toml`. i3mux writes that config once, with
+`session_restore_mode = { lines = 10000 }`, and never overwrites it. Edit it
+if you want a different scrollback size.
 
-## Installing i3mux
-
-### From source (recommended)
+## Install i3mux
 
 ```bash
-# Clone the repository
-cd ~/src
-git clone <repository-url>
+git clone https://github.com/kilogram/i3mux.git
 cd i3mux
-
-# Build and install
 cargo build --release
-sudo cp target/release/i3mux /usr/local/bin/
-
-# Optional: Install rofi script
-sudo cp scripts/i3mux-rofi /usr/local/bin/
-sudo chmod +x /usr/local/bin/i3mux-rofi
+sudo install -Dm755 target/release/i3mux /usr/local/bin/i3mux
+sudo install -Dm755 scripts/i3mux-rofi /usr/local/bin/i3mux-rofi   # optional
 ```
 
-### Test installation
+## Configure Sway
 
-```bash
-# Check abduco is available
-which abduco
-
-# Check i3mux is available
-which i3mux
-
-# Try activating a local session
-i3mux activate
-```
-
-## Remote Setup
-
-For remote sessions, abduco must be installed on the remote host as well:
-
-```bash
-# SSH to your remote host
-ssh user@remote-host
-
-# Install abduco on the remote
-sudo pacman -S abduco  # or apt/dnf/etc.
-
-# Verify it's installed
-which abduco
-```
-
-## i3 Configuration
-
-Add i3mux keybindings to your `~/.config/i3/config`:
+Add to `~/.config/sway/config` (see `example-sway-config`):
 
 ```
-# i3mux session management
-bindsym $mod+m exec i3mux-rofi
-
-# Quick terminal spawn
 bindsym $mod+Return exec i3mux terminal
+bindsym $mod+m exec i3mux-rofi
+for_window [con_mark="^_i3mux:"] border normal 2
 ```
 
-See `examples/i3-config-example` for a complete configuration.
+Reload with `$mod+Shift+c`.
+
+## Remote hosts
+
+1. Install `shpool` on the remote host. i3mux looks in the login-shell
+   `PATH` plus `~/.local/bin` and `~/.cargo/bin`, so a user-local install
+   with no root access works.
+2. Use key-based ssh: `ssh-copy-id user@host`.
+3. The remote login shell must be POSIX-compatible (bash, zsh, dash). i3mux
+   runs `bash -lc` there, so `~/.bash_profile` and `~/.profile` must not print
+   to stdout in non-interactive shells; i3mux parses that output.
+4. Keep shells alive after you log out. On systemd hosts run
+   `loginctl enable-linger $USER` once. Without it some distributions kill
+   user processes when the last ssh session ends.
+
+i3mux opens ssh with `ControlMaster=auto` and a control socket under
+`$XDG_RUNTIME_DIR/i3mux/`, so the second and later terminals reuse the
+first connection.
+
+## Check the install
+
+```bash
+shpool version
+i3mux --help
+i3mux activate          # binds the focused workspace and opens a terminal
+i3mux sessions
+```
 
 ## Troubleshooting
 
-### "abduco not found" error
-
-Make sure abduco is installed:
-- Locally: `which abduco` should show a path
-- Remote: `ssh user@host which abduco` should show a path
-
-### Terminals die immediately
-
-This is usually because:
-1. abduco is not installed (see above)
-2. SSH connection to remote failed (check SSH keys, permissions)
-3. Check logs in `/tmp/i3mux-*.log` for detailed error messages
-
-### SSH issues for remote sessions
-
-Make sure you can SSH to the remote without password:
-```bash
-# Test SSH connection
-ssh user@remote-host echo "connected"
-
-# If prompted for password, set up SSH keys:
-ssh-copy-id user@remote-host
-```
-
-## Next Steps
-
-- Read `scripts/README.md` for rofi script usage
-- Read `examples/i3-config-example` for keybinding examples
-- Try the basic workflow: activate → detach → attach
+- "shpool not found": install it on the host named in the error. For a
+  remote, test with `ssh host bash -lc 'command -v shpool'`.
+- A terminal opens and shows a shpool error, then waits for Enter: read the
+  error. "already attached" means another client holds that shell. Run
+  `i3mux terminal --force` or `i3mux attach --force` to take it over.
+- Shells vanish after you close the ssh connection: enable linger on the
+  remote (see above).
+- Inspect the daemon directly:
+  `shpool --socket ~/.local/run/i3mux/shpool.socket list`.

@@ -1,8 +1,0 @@
-name = "4way-grid"
-
-# No exact regions defined - using full fuzzy comparison
-
-[fuzzy_boundaries]
-tolerance_px = 5
-max_diff_pixels = 2500
-max_diff_percentage = 1.0

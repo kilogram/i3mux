@@ -2,227 +2,106 @@
 
 [![Tests](https://github.com/kilogram/i3mux/actions/workflows/test.yml/badge.svg)](https://github.com/kilogram/i3mux/actions/workflows/test.yml)
 
-**Bind i3 workspaces to persistent terminal sessions (local or remote)**
+**A Sway workspace that behaves like a tmux window.**
 
-i3mux bridges i3 window manager with persistent terminal sessions using `abduco`. Each i3 workspace can be bound to a session (local or remote via SSH), and all terminals opened in that workspace become persistent, reattachable shells.
+Bind a workspace to a session, local or on a remote host over ssh. Every
+terminal you open there is a persistent shell. Close the window, lose the
+network, reboot the desktop: the shell keeps running, and the next terminal
+you open in that workspace picks it back up with its scrollback. Detach the
+workspace and attach it later, on the same machine or another, and the
+window layout comes back too.
 
-> **Note**: This project was entirely written by AI (Claude). No human-authored code. The project direction, requirements, and review are provided by a human maintainer.
+Sway does the window management. [shpool](https://github.com/shell-pool/shpool)
+keeps the shells alive. i3mux glues the two together and stays out of the way:
+no prefix key, no status bar, no alternate screen, native terminal scrolling.
 
----
+> This project was written by AI (Claude) under human direction and review.
 
-## Why i3mux?
+## Install
 
-We love tmux. But my muscle memory fights me when using tmux for remote sessions,
-and i3 for local ones. i3mux bridges that gap, allowing remote, persistent
-sessions with preserved scrollback history (like tmux) but with window management
-in i3.
+See [INSTALL.md](INSTALL.md). Short version: install `shpool` on every host,
+build i3mux with `cargo build --release`, and add two bindings to your Sway
+config:
 
-**Use cases:**
-- Remote development - survive network drops, pick up exactly where you left off
-- Long-running tasks - close the terminal, come back later, output is still there
-- Workspace organization - each workspace gets its own isolated session environment
-
-## Features
-
-- **Dead simple**: Single Rust binary, no daemon required
-- **Lightning fast**: <1ms overhead per terminal launch
-- **SSH integration**: Built-in support for remote sessions
-- **Smart terminal detection**: Automatically inherits terminal type from focused window
-- **Persistent sessions**: Full scrollback, survives network drops
-- **Visual distinction**: Thin titlebars on i3mux terminals only
-- **Rofi integration**: Interactive menu for session management
-
----
-
-## Quick Start
-
-### 1. Install dependencies
-
-**Required:**
-- `i3` window manager
-- `abduco` - session management (`pacman -S abduco` / `apt install abduco`)
-
-**Optional:**
-- `rofi` - for interactive menu
-- `notify-send` - for desktop notifications
-
-### 2. Build and install
-
-```bash
-git clone https://github.com/kilogram/i3mux.git
-cd i3mux
-cargo build --release
-sudo cp target/release/i3mux /usr/local/bin/
-
-# Optional: Install rofi integration script
-sudo cp scripts/i3mux-rofi /usr/local/bin/
-sudo chmod +x /usr/local/bin/i3mux-rofi
 ```
-
-### 3. Configure i3
-
-Add to `~/.config/i3/config`:
-
-```i3config
-# i3mux session management (recommended: use rofi script)
-bindsym $mod+m exec i3mux-rofi
-
-# Launch smart terminal (respects i3mux binding)
 bindsym $mod+Return exec i3mux terminal
-
-# Optional: force normal terminal
-bindsym $mod+Shift+Return exec i3-sensible-terminal
-
-# Visual styling for i3mux terminals
-default_border none
-for_window [title=".*:ws.*"] border normal 2
-for_window [title=".*:ws.*"] title_format "%title"
+bindsym $mod+m exec i3mux-rofi
+for_window [con_mark="^_i3mux:"] border normal 2
 ```
 
-Reload i3: `$mod+Shift+r`
-
-### 4. Try it out
-
-1. Press `$mod+m` to open the rofi menu
-2. Select "local" or type a remote host (e.g., `user@server.com`)
-3. Press `$mod+Return` to open persistent terminals
-4. Close a terminal, press `$mod+m` → "Attach" to reattach
-
----
-
-## Using i3mux-rofi (Recommended)
-
-The included `i3mux-rofi` script provides an interactive menu for all i3mux operations. See [scripts/README.md](scripts/README.md) for full documentation.
-
-**Menu options:**
-- **Activate local/remote** - Bind current workspace to a session
-- **Detach** - Detach the current workspace session (terminals close, session persists)
-- **Attach** - Reattach to a previously detached session
-- **List** - View all sessions
-- **Kill** - Terminate a session
-
-**Quick workflow:**
-```
-$mod+m → "local" (activate local session)
-$mod+Return (open terminals)
-$mod+m → "Detach" (save and close)
-$mod+m → "Attach" → select session (resume)
-```
-
----
-
-## CLI Commands
-
-For scripting or when you prefer the command line:
+## Use
 
 ```bash
-# Activate i3mux for current workspace
-i3mux activate              # local session
-i3mux activate --remote user@host  # remote session
-
-# Detach current workspace (save session)
-i3mux detach
-
-# Attach to a session
-i3mux attach --session <name>
-i3mux attach --remote user@host --session <name>
-
-# List sessions
-i3mux sessions              # local
-i3mux sessions --remote user@host
-
-# Launch terminal (called by i3 keybind)
-i3mux terminal
-
-# Kill a session
-i3mux kill --session <name>
+i3mux activate                    # bind focused workspace to a local session, open a shell
+i3mux activate --remote dev-box   # same, shells run on dev-box over ssh
+i3mux terminal                    # another shell (reattaches an orphan first)
+i3mux terminal --new              # always a fresh shell
+i3mux terminal -e htop            # run a command in a fresh persistent shell
+i3mux detach                      # save the layout, close the windows, keep the shells
+i3mux attach --session ws3        # restore the layout and reattach every shell
+i3mux sessions [--remote host]    # what exists, where, and in what state
+i3mux kill --session ws3          # kill the shells and forget the layout
 ```
 
----
+The default session name is `ws` plus the workspace number. `--session`
+overrides it on `activate`, `attach` and `kill`.
 
-## How It Works
+## How it works
 
 ```
-i3 workspace 2 (bound to user@remote)
-├─ Terminal A → ssh user@remote → abduco session ws2-001
-├─ Terminal B → ssh user@remote → abduco session ws2-002
-├─ Terminal C → normal local terminal (not focused when spawned)
-└─ Firefox → unaffected
+ Sway workspace 3  ──bound to──►  session "ws3" on dev-box
+   ├─ window  _i3mux:dev-box:ws3-001  ── ssh dev-box ── shpool attach ws3-001
+   ├─ window  _i3mux:dev-box:ws3-002  ── ssh dev-box ── shpool attach ws3-002
+   └─ Firefox                         (not an i3mux window, ignored)
+
+ ~/.config/i3mux/state.json          which workspace is bound to which session
+ dev-box:~/.local/state/i3mux/       saved layouts, one JSON file per session
+ dev-box:~/.local/run/i3mux/         the i3mux shpool daemon socket
 ```
 
-1. **Workspace Binding**: `i3mux activate` binds current workspace to a session
-2. **Smart Launching**: `i3mux terminal` checks i3 tree to determine terminal type
-3. **Session Management**: Each terminal connects to unique `abduco` socket
-4. **Visual Distinction**: i3mux terminals have thin titlebar with session info
+1. `activate` records the binding and opens the first terminal.
+2. `terminal` asks the host's shpool daemon which shells exist. If one has no
+   window, it reattaches it. Otherwise it creates the next number.
+3. Each window carries a hidden Sway mark, `_i3mux:{host}:{shell}`. Marks are
+   the only way i3mux recognises its windows.
+4. `detach` captures the workspace tree, saves it on the host, then closes
+   every marked window. The shells stay alive in shpool.
+5. `attach` replays the saved tree with `swaymsg` commands and opens one
+   terminal per shell. shpool restores the last 10 000 lines of each.
 
-State is stored in `~/.config/i3mux/state.json`.
+Closing a window never kills a shell. Only `exit` in the shell or
+`i3mux kill` does.
 
----
+## Remote hosts
 
-## Remote Sessions
+Shells run under the remote user's login shell with the login `PATH`, so
+`shpool` only needs to be on the path there. i3mux uses ssh `ControlMaster`,
+so the second terminal opens in tens of milliseconds. Run
+`loginctl enable-linger` on the remote so shells survive the last logout.
 
-### SSH Setup (Required for remote)
+Tailscale ssh does not deliver `SIGWINCH` in command mode, so windows will not
+resize correctly through it. Use OpenSSH; see
+[docs/tailscale-ssh-sigwinch.md](docs/tailscale-ssh-sigwinch.md).
 
-For instant terminal attachment, configure SSH ControlMaster:
+## Why shpool
+
+abduco, the previous backend, forwards bytes and keeps no terminal state.
+On reattach it restores nothing, and while attached it holds the terminal on
+the alternate screen, which disables scrolling in foot and alacritty. tmux
+restores the visible screen only and wants a prefix key. shpool keeps a
+bounded output spool and replays it on reattach without the alternate screen.
+Measurements and the full design are in
+[docs/PLAN-sway-shpool.md](docs/PLAN-sway-shpool.md).
+
+## Development
 
 ```bash
-# ~/.ssh/config
-Host *
-  ControlMaster auto
-  ControlPath ~/.ssh/sockets/%r@%h:%p
-  ControlPersist 10m
+just check       # fmt, clippy, unit tests, boundary check
+just check-int   # container integration suite (podman or docker)
 ```
 
-Create socket directory:
-```bash
-mkdir -p ~/.ssh/sockets
-```
-
-### Remote Prerequisites
-
-`abduco` must be installed on the remote host:
-```bash
-ssh user@remote-host
-sudo pacman -S abduco  # or apt/dnf/brew
-```
-
----
-
-## Troubleshooting
-
-**"abduco not found"**
-- Install abduco locally and on remote hosts
-- Verify: `which abduco` and `ssh user@host which abduco`
-
-**Terminals close immediately**
-- Check SSH keys are set up: `ssh-copy-id user@host`
-- Verify abduco is installed
-
-**SSH connections slow**
-- Enable ControlMaster (see above)
-- Check `~/.ssh/sockets/` directory exists
-
-**Terminal type not detected**
-- i3mux supports common terminals (alacritty, kitty, urxvt, st, etc.)
-- Focus an i3mux terminal before pressing `$mod+Return`
-
----
-
-## Documentation
-
-- [INSTALL.md](INSTALL.md) - Detailed installation guide
-- [scripts/README.md](scripts/README.md) - Rofi script documentation
-- [TESTING.md](TESTING.md) - Running the test suite
-- [example-i3-config](example-i3-config) - Complete i3 configuration example
-
----
+See [TESTING.md](TESTING.md).
 
 ## License
 
-GPLv3 - see [LICENSE.txt](LICENSE.txt)
-
----
-
-## Contributing
-
-PRs welcome! This is an AI-generated codebase under human direction - contributions from both humans and AI are valued.
+GPL-3.0-only. See [LICENSE.txt](LICENSE.txt).

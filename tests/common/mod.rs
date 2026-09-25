@@ -1,18 +1,13 @@
-// Common test utilities and infrastructure
+//! Shared infrastructure of the container integration suite.
+
 pub mod comparison_spec;
 pub mod diff_image;
 pub mod docker;
 pub mod environment;
 pub mod i3mux;
-pub mod network;
 pub mod screenshot;
-pub mod tier;
 
-// Re-export commonly used types
-pub use comparison_spec::ComparisonSpec;
-pub use docker::{DualContainerManager, TestWmType};
-pub use environment::{ColorScript, DualTestEnvironment, Session, TestEnvironment};
-pub use tier::{is_full_matrix_enabled, AttachTarget, OpOrder, SessionType, WmType, ALL_SPECS};
-
-// Re-export common external types
 pub use anyhow::Result;
+pub use comparison_spec::ComparisonSpec;
+pub use environment::{assert_same_screen, wait_until, HostShell, TestEnvironment};
+pub use i3mux::{terminal, Session};

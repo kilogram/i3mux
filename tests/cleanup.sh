@@ -1,22 +1,27 @@
-#!/bin/bash
-# Cleanup script for i3mux test containers
+#!/usr/bin/env bash
+# Remove every i3mux test container (compose-started or testcontainers-started).
+set -euo pipefail
 
-DOCKER_CMD="podman"
-if ! command -v podman &> /dev/null; then
-    DOCKER_CMD="docker"
+IMAGE="i3mux-test-sway:latest"
+
+if command -v podman >/dev/null 2>&1; then
+    cli=podman
+else
+    cli=docker
 fi
 
-echo "Cleaning up i3mux test containers..."
+mapfile -t ids < <(
+    {
+        "$cli" ps -aq --filter "ancestor=$IMAGE"
+        "$cli" ps -aq --filter "ancestor=localhost/$IMAGE"
+        "$cli" ps -aq --filter "name=i3mux-test"
+        "$cli" ps -aq --filter "name=i3mux-remote"
+    } 2>/dev/null | sort -u
+)
 
-# Stop and remove all test containers
-$DOCKER_CMD rm -f \
-    $($DOCKER_CMD ps -aq --filter "ancestor=localhost/docker_i3mux-test-xephyr:latest") \
-    $($DOCKER_CMD ps -aq --filter "ancestor=localhost/docker_i3mux-remote-ssh:latest") \
-    2>/dev/null
-
-# Also clean by name pattern
-$DOCKER_CMD rm -f $($DOCKER_CMD ps -aq --filter "name=i3mux-test") 2>/dev/null
-$DOCKER_CMD rm -f $($DOCKER_CMD ps -aq --filter "name=i3mux-remote") 2>/dev/null
-
-echo "✓ Cleanup complete"
-$DOCKER_CMD ps -a | grep -E "i3mux|docker_i3mux" || echo "  No i3mux containers remaining"
+if ((${#ids[@]} > 0)); then
+    "$cli" rm -f "${ids[@]}" >/dev/null
+    echo "Removed ${#ids[@]} i3mux test container(s)."
+else
+    echo "No i3mux test containers found."
+fi

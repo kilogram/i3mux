@@ -2,145 +2,68 @@ name: Tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   merge_group:
-    types: [ checks_requested ]
+    types: [checks_requested]
 
 jobs:
-  # ============ Unit Tests ============
-  unit-tests:
-    name: Unit Tests
+  unit:
+    name: Unit (just check)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
 
-      - name: Run unit tests
-        run: cargo test --bins
+      # Prebuilt `just`; version pinned so CI matches local recipes.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.58.0
 
-  # ============ T1: Integration Tests (i3) ============
-  test-i3:
-    name: T1 Integration (i3)
+      - run: just check
+
+      # Same pinned release and checksum as tests/docker/Dockerfile.
+      - name: Install shpool
+        env:
+          SHPOOL_VERSION: 0.11.5
+          SHPOOL_SHA256: 132f786bd275749a46224c17a071474a850f0be1fbb752b1c96d910778543c9b
+        run: |
+          curl -fsSL -o /tmp/shpool.tar.gz \
+            "https://github.com/shell-pool/shpool/releases/download/v${SHPOOL_VERSION}/shpool-x86_64-unknown-linux-musl.tar.gz"
+          echo "${SHPOOL_SHA256}  /tmp/shpool.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/shpool.tar.gz -C "$HOME/.local/bin" shpool
+          echo "SHPOOL_BIN=$HOME/.local/bin/shpool" >> "$GITHUB_ENV"
+
+      - run: just check-mux
+
+  integration:
+    name: Integration (headless Sway + sshd containers)
     runs-on: ubuntu-latest
-
+    env:
+      # Runners ship Docker with the compose v2 plugin, not podman.
+      COMPOSE: docker compose
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: x86_64-unknown-linux-musl
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            docker-compose \
-            musl-tools
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.58.0
 
-      - name: Build i3mux binary (musl)
-        run: cargo build --target x86_64-unknown-linux-musl
+      - run: just check-int -- --nocapture
 
-      - name: Build test containers
-        run: |
-          cd tests/docker
-          docker-compose build i3mux-test-xephyr i3mux-remote-ssh
-
-      - name: Run T1 integration tests (i3)
-        run: ./tests/integration.sh -- --nocapture
-
-      - name: Upload test failure artifacts
+      - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-failures-i3
-          path: tests/test-output/failures/
-          if-no-files-found: ignore
-
-  # ============ T1: Integration Tests (Sway) ============
-  test-sway:
-    name: T1 Integration (Sway)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: x86_64-unknown-linux-musl
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            docker-compose \
-            musl-tools
-
-      - name: Build i3mux binary (musl)
-        run: cargo build --target x86_64-unknown-linux-musl
-
-      - name: Build Sway test containers
-        run: |
-          cd tests/docker
-          docker-compose build i3mux-test-sway i3mux-remote-ssh-sway
-
-      - name: Run T1 integration tests (Sway)
-        run: I3MUX_TEST_WM=sway ./tests/integration.sh -- --nocapture
-
-      - name: Upload test failure artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-failures-sway
-          path: tests/test-output/failures/
-          if-no-files-found: ignore
-
-  # ============ T2: Full Matrix (Merge Queue Only) ============
-  test-full-matrix:
-    name: T2 Full Matrix (cross-WM)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'merge_group'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: x86_64-unknown-linux-musl
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            docker-compose \
-            musl-tools
-
-      - name: Build i3mux binary (musl)
-        run: cargo build --target x86_64-unknown-linux-musl
-
-      - name: Build all test containers
-        run: |
-          cd tests/docker
-          docker-compose build
-
-      - name: Run T2 full matrix tests
-        run: |
-          I3MUX_FULL_MATRIX=1 cargo test --test integration -- --include-ignored --nocapture
-
-      - name: Upload test failure artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-failures-full-matrix
+          name: integration-failures
           path: tests/test-output/failures/
           if-no-files-found: ignore

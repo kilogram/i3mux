@@ -1,0 +1,8 @@
+name = "scrollback-after-attach"
+description = "The last of 300 printed lines, replayed after detach and attach"
+
+# Text must match almost exactly: a blank terminal or a replay shifted by
+# one row changes several percent of the pixels.
+[fuzzy_boundaries]
+tolerance_px = 1
+max_diff_percentage = 0.2

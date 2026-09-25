@@ -1,0 +1,20 @@
+# i3mux snippet for ~/.config/sway/config
+
+# Open a terminal. In a bound workspace this is a persistent shell.
+bindsym $mod+Return exec i3mux terminal
+
+# Always open a fresh persistent shell, even if an orphan exists.
+bindsym $mod+Shift+Return exec i3mux terminal --new
+
+# Session menu (activate, detach, attach, list, kill).
+bindsym $mod+m exec i3mux-rofi
+
+# Bind the focused workspace to a local session and open the first shell.
+# bindsym $mod+Shift+m exec i3mux activate
+
+# Mark i3mux terminals with a thin title bar.
+default_border none
+for_window [con_mark="^_i3mux:"] border normal 2
+
+# Pick the terminal i3mux launches (foot is the default).
+# exec_always systemctl --user set-environment TERMINAL=alacritty

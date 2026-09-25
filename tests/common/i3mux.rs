@@ -1,238 +1,166 @@
-// i3mux command wrappers for testing
+//! The `i3mux` command line as the tests run it: inside the Sway container,
+//! with the Sway environment loaded, foot as `$TERMINAL`, and a UTF-8
+//! locale (without one, foot prints a locale warning into every terminal,
+//! and the goldens would show it).
 
-use anyhow::{Context, Result};
-use super::docker::{ContainerManager, TestWmType};
-use super::environment::{Session, ColorScript};
+use std::fmt;
 
-pub struct I3muxRunner<'a> {
-    container_mgr: &'a ContainerManager,
+use anyhow::{bail, Result};
+
+use super::docker::{Containers, LOCAL_HOME, REMOTE_HOME, REMOTE_HOST};
+
+/// Where a test session's shells run. Every session-level test runs once
+/// for each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Session {
+    /// Shells in the Sway container itself.
+    Local,
+    /// Shells in the sshd container, reached as `--remote i3mux-remote-ssh`.
+    Remote,
 }
 
-impl<'a> I3muxRunner<'a> {
-    pub fn new(container_mgr: &'a ContainerManager) -> Self {
-        Self { container_mgr }
-    }
-
-    /// Get environment prefix for commands based on WM type
-    fn env_prefix(&self) -> &'static str {
-        match self.container_mgr.wm_type() {
-            TestWmType::I3 => "DISPLAY=:99",
-            TestWmType::Sway => "source /tmp/sway-env.sh &&",
+impl Session {
+    /// The `--remote` option for this session, with a leading space, or "".
+    #[must_use]
+    pub fn remote_flag(self) -> String {
+        match self {
+            Self::Local => String::new(),
+            Self::Remote => format!(" --remote {REMOTE_HOST}"),
         }
     }
 
-    /// Get the WM message command
-    fn wm_msg(&self) -> &'static str {
-        match self.container_mgr.wm_type() {
-            TestWmType::I3 => "i3-msg",
-            TestWmType::Sway => "swaymsg",
+    /// The host label i3mux prints and puts in window marks.
+    #[must_use]
+    pub fn host_label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => REMOTE_HOST,
         }
     }
 
-    /// Get the default terminal for this WM
-    fn default_terminal(&self) -> &'static str {
-        match self.container_mgr.wm_type() {
-            TestWmType::I3 => "xterm",
-            TestWmType::Sway => "foot",
+    /// The home directory of the user that owns the shells.
+    #[must_use]
+    pub fn home(self) -> &'static str {
+        match self {
+            Self::Local => LOCAL_HOME,
+            Self::Remote => REMOTE_HOME,
         }
     }
 
-    /// Activate i3mux for a workspace
-    pub fn activate(&self, session: &Session, workspace: &str) -> Result<()> {
-        let env = self.env_prefix();
-        let msg = self.wm_msg();
-        let term = self.default_terminal();
+    /// The window mark of terminal `number` of `session`.
+    #[must_use]
+    pub fn mark(self, session: &str, number: u32) -> String {
+        format!("_i3mux:{}:{}", self.host_label(), terminal(session, number))
+    }
+}
 
-        let cmd = match session {
-            Session::Local => format!(
-                "{} {} workspace {} && {} TERMINAL={} i3mux activate",
-                env, msg, workspace, env, term
-            ),
-            Session::Remote(host) => format!(
-                "{} {} workspace {} && {} TERMINAL={} i3mux activate --remote {}",
-                env, msg, workspace, env, term, host
-            ),
-        };
+/// The shpool session name of terminal `number` of `session`: `ws4-001`.
+#[must_use]
+pub fn terminal(session: &str, number: u32) -> String {
+    format!("{session}-{number:03}")
+}
 
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
+/// What an `i3mux` run printed and how it exited.
+#[derive(Debug, Clone)]
+pub struct CmdOutput {
+    pub command: String,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
 
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux activate failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        Ok(())
+impl CmdOutput {
+    #[must_use]
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
     }
 
-    /// Detach current session
-    pub fn detach(&self, name: &str) -> Result<()> {
-        let cmd = format!("{} i3mux detach --session {}", self.env_prefix(), name);
-
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux detach failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    /// Fail unless the command exited 0; return its stdout.
+    pub fn ok(self) -> Result<String> {
+        if !self.success() {
+            bail!("{self}");
         }
-
-        Ok(())
+        Ok(self.stdout)
     }
 
-    /// Attach to a session
-    pub fn attach(&self, session: &Session, name: &str, force: bool) -> Result<()> {
-        let force_flag = if force { "--force" } else { "" };
-        let env = self.env_prefix();
-        let term = self.default_terminal();
-
-        let cmd = match session {
-            Session::Local => format!("{} TERMINAL={} i3mux attach {} --session {}", env, term, force_flag, name),
-            Session::Remote(host) => format!(
-                "{} TERMINAL={} i3mux attach --remote {} {} --session {}",
-                env, term, host, force_flag, name
-            ),
-        };
-
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux attach failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+    /// Fail unless the command exited with `code`; return its stderr.
+    pub fn failed_with(self, code: i32) -> Result<String> {
+        if self.code != Some(code) {
+            bail!("expected exit {code}; got {self}");
         }
+        Ok(self.stderr)
+    }
+}
 
-        Ok(())
+impl fmt::Display for CmdOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` exited {:?}\nstdout: {}\nstderr: {}",
+            self.command,
+            self.code,
+            self.stdout.trim(),
+            self.stderr.trim()
+        )
+    }
+}
+
+/// Runs `i3mux` subcommands in the Sway container.
+pub struct I3mux<'a> {
+    containers: &'a Containers,
+}
+
+impl<'a> I3mux<'a> {
+    #[must_use]
+    pub fn new(containers: &'a Containers) -> Self {
+        Self { containers }
     }
 
-    /// Launch a terminal with a color script
-    pub fn launch_terminal(&self, color: &ColorScript) -> Result<u64> {
-        let color_code = match color {
-            ColorScript::Red => 41,
-            ColorScript::Green => 42,
-            ColorScript::Blue => 44,
-            ColorScript::Yellow => 43,
-            ColorScript::Magenta => 45,
-            ColorScript::Cyan => 46,
-        };
-
-        let env = self.env_prefix();
-        let term_exec = match self.container_mgr.wm_type() {
-            TestWmType::I3 => "xterm -e",
-            TestWmType::Sway => "foot",  // foot doesn't need -e for direct command
-        };
-
-        let cmd = format!(
-            "{} TERMINAL='{}' i3mux terminal -- /opt/i3mux-test/color-scripts/color-fill.sh {} solid",
-            env, term_exec, color_code
-        );
-
-        // Get window count before launch
-        let before = self.get_window_count()?;
-
-        // Launch terminal
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux terminal failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Wait for window to appear
-        for _ in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let after = self.get_window_count()?;
-            if after > before {
-                return self.get_focused_container_id();
-            }
-        }
-
-        anyhow::bail!("Terminal window did not appear within timeout")
+    /// `i3mux ARGS`; `args` is shell text (quote arguments yourself).
+    pub fn run(&self, args: &str) -> Result<CmdOutput> {
+        let command = format!("i3mux {args}");
+        let output = self.containers.exec_in_sway(&format!(
+            "source /tmp/sway-env.sh && export TERMINAL=foot LANG=C.UTF-8 && {command}"
+        ))?;
+        Ok(CmdOutput {
+            command,
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 
-    /// List sessions (kept for potential future session management tests)
-    #[allow(dead_code)]
-    pub fn list_sessions(&self, session: &Session) -> Result<Vec<String>> {
-        let env = self.env_prefix();
-        let cmd = match session {
-            Session::Local => format!("{} i3mux list", env),
-            Session::Remote(host) => format!("{} i3mux list --remote {}", env, host),
-        };
-
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        if !output.status.success() {
-            return Ok(Vec::new());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let sessions: Vec<String> = stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| line.trim().to_string())
-            .collect();
-
-        Ok(sessions)
+    /// `i3mux activate [--remote H]` on the focused workspace.
+    pub fn activate(&self, session: Session) -> Result<String> {
+        self.run(&format!("activate{}", session.remote_flag()))?
+            .ok()
     }
 
-    /// Kill a session (kept for potential future session management tests)
-    #[allow(dead_code)]
-    pub fn kill_session(&self, session: &Session, name: &str) -> Result<()> {
-        let env = self.env_prefix();
-        let cmd = match session {
-            Session::Local => format!("{} i3mux kill {}", env, name),
-            Session::Remote(host) => format!("{} i3mux kill --remote {} {}", env, host, name),
-        };
-
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux kill failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        Ok(())
+    /// `i3mux terminal ARGS` on the focused workspace.
+    pub fn terminal(&self, args: &str) -> Result<String> {
+        self.run(&format!("terminal {args}"))?.ok()
     }
 
-    /// Get number of windows/containers in current workspace
-    fn get_window_count(&self) -> Result<usize> {
-        // Count containers with app_id (Sway) or window (i3) properties
-        let cmd = format!(
-            "{} {} -t get_tree | grep -c -E '\"(app_id|window)\"'",
-            self.env_prefix(),
-            self.wm_msg()
-        );
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        let count_str = String::from_utf8_lossy(&output.stdout);
-        let count = count_str.trim().parse().unwrap_or(0);
-
-        Ok(count)
+    /// `i3mux detach` on the focused workspace.
+    pub fn detach(&self) -> Result<String> {
+        self.run("detach")?.ok()
     }
 
-    /// Get focused container ID
-    fn get_focused_container_id(&self) -> Result<u64> {
-        // Use container ID (works for both i3 and Sway)
-        let cmd = format!(
-            "{} {} -t get_tree | jq -r '.. | select(.focused? == true and (.app_id? != null or .window? != null)) | .id' | head -1",
-            self.env_prefix(),
-            self.wm_msg()
-        );
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
+    /// `i3mux attach [--remote H] ARGS`, which may fail.
+    pub fn attach(&self, session: Session, args: &str) -> Result<CmdOutput> {
+        self.run(&format!("attach{} {args}", session.remote_flag()))
+    }
 
-        let id_str = String::from_utf8_lossy(&output.stdout);
-        let id = id_str
-            .trim()
-            .parse()
-            .context("Failed to parse container ID")?;
+    /// The lines of `i3mux sessions [--remote H]`.
+    pub fn sessions(&self, session: Session) -> Result<Vec<String>> {
+        let out = self
+            .run(&format!("sessions{}", session.remote_flag()))?
+            .ok()?;
+        Ok(out.lines().map(str::to_owned).collect())
+    }
 
-        Ok(id)
+    /// `i3mux kill ARGS`, which may fail. Pass `--remote` in `args` if needed.
+    pub fn kill(&self, args: &str) -> Result<CmdOutput> {
+        self.run(&format!("kill {args}"))
     }
 }

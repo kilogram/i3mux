@@ -1,384 +1,247 @@
-// Detach/attach tests for remote sessions
+//! `detach` and `attach` for local and remote sessions (plan decisions 3
+//! and 6, rules 5, 6 and 10).
 
-use super::common::*;
-use std::time::Duration;
+use rstest::rstest;
 
-#[test]
-fn test_remote_detach_attach() -> Result<()> {
-    // Test detach/attach with remote session
-    let env = TestEnvironment::new()?;
+use super::common::{terminal, wait_until, HostShell, Result, Session, TestEnvironment};
 
-    env.cleanup_workspace("11")?;
-    env.i3_exec("workspace 11")?;
+const WS: u32 = 4;
+const NAME: &str = "ws4";
 
-    // Activate remote i3mux session (gives us first terminal via SSH)
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "11")?;
-    std::thread::sleep(Duration::from_secs(3)); // Wait for SSH terminal
-
-    // Get initial window count (should be 1 from activate)
-    let initial_windows = env.get_workspace_windows()?;
-    let initial_count = initial_windows.len();
-    assert!(initial_count >= 1, "Should have at least 1 terminal from activate");
-
-    // Detach session (this saves layout and kills terminals)
-    env.i3mux_detach("ws11")?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Verify workspace is now empty
-    let windows_after_detach = env.get_workspace_windows()?;
-    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
-
-    // Attach session back (this should restore layout)
-    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws11")?;
-    std::thread::sleep(Duration::from_secs(3)); // Wait for restoration
-
-    // Verify windows are restored
-    let windows_after_attach = env.get_workspace_windows()?;
-    assert_eq!(
-        windows_after_attach.len(),
-        initial_count,
-        "Should restore same number of windows"
-    );
-
-    println!("✓ Remote detach/attach test passed (detached {} terminals, restored {})",
-        initial_count, windows_after_attach.len());
-
-    Ok(())
+fn layout_file(session: &str) -> String {
+    format!(".local/state/i3mux/sessions/{session}.json")
 }
 
-#[test]
-fn test_detach_attach_multiple_terminals() -> Result<()> {
-    // Test detach/attach with multiple terminals in a complex layout
-    let env = TestEnvironment::new()?;
-
-    env.cleanup_workspace("12")?;
-    env.i3_exec("workspace 12")?;
-
-    // Activate remote i3mux session
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "12")?;
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Create a complex layout: hsplit with 2 terminals, then vsplit one of them
-    env.i3_exec("split h")?;
-    env.launch_i3mux_terminal()?;  // Waits for terminal to appear
-
-    // Check marks immediately after first launch
-    println!("\n=== After first manual launch ===");
-    let windows_after_first = env.get_workspace_windows()?;
-    for win_id in &windows_after_first {
-        let info = env.get_window_info(*win_id)?;
-        println!("Window {}: {}", win_id, info);
-    }
-
-    // Add delay to avoid rapid terminal launches
-    std::thread::sleep(Duration::from_millis(1000));
-
-    env.i3_exec("split v")?;
-    env.launch_i3mux_terminal()?;  // Waits for terminal to appear
-
-    // Check marks immediately after second launch
-    println!("\n=== After second manual launch ===");
-    let windows_after_second = env.get_workspace_windows()?;
-    for win_id in &windows_after_second {
-        let info = env.get_window_info(*win_id)?;
-        println!("Window {}: {}", win_id, info);
-    }
-
-    // Print i3mux debug log to see what mark commands were executed
-    println!("\n=== i3mux debug log ===");
-    if let Ok(log) = env.read_debug_log() {
-        println!("{}", log);
-    }
-
-    // Should have 3 terminals total (1 from activate + 2 created)
-    let initial_windows = env.get_workspace_windows()?;
-    assert_eq!(initial_windows.len(), 3, "Should have 3 terminals before detach");
-
-    // Debug: Check if windows have the i3mux-terminal mark
-    println!("\n=== Before detach ===");
-    for win_id in &initial_windows {
-        let info = env.get_window_info(*win_id)?;
-        println!("Window {}: {}", win_id, info);
-    }
-
-    // Detach session
-    env.i3mux_detach("ws12")?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Verify workspace is empty
-    let windows_after_detach = env.get_workspace_windows()?;
-    if windows_after_detach.len() != 0 {
-        for win_id in &windows_after_detach {
-            let info = env.get_window_info(*win_id)?;
-            println!("Window {} still present: {}", win_id, info);
-        }
-    }
-    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
-
-    // Attach session back
-    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws12")?;
-    std::thread::sleep(Duration::from_secs(3));
-
-    // Verify all terminals are restored
-    let windows_after_attach = env.get_workspace_windows()?;
-    assert_eq!(
-        windows_after_attach.len(),
-        3,
-        "Should restore all 3 terminals"
-    );
-
-    println!("✓ Detach/attach with multiple terminals passed");
-
-    Ok(())
+fn pids(shells: &[HostShell]) -> Vec<(String, u64)> {
+    shells.iter().map(|s| (s.name.clone(), s.pid)).collect()
 }
 
-#[test]
-fn test_detach_attach_mixed_windows() -> Result<()> {
-    // Test detach/attach when workspace has both i3mux and non-i3mux windows
+/// Detach saves the layout on the host and closes the windows; attach
+/// reattaches the very same shells (same pids), nothing recreated.
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote)]
+fn attach_brings_back_the_shells_that_detach_left(#[case] session: Session) -> Result<()> {
     let env = TestEnvironment::new()?;
+    let host = session.host_label();
+    env.activate(session, WS)?;
+    env.sway("split h")?;
+    env.i3mux().terminal("")?;
+    let marks = env.marks(WS)?;
+    assert_eq!(marks, [session.mark(NAME, 1), session.mark(NAME, 2)]);
+    let before = env.shells(session)?;
 
-    env.cleanup_workspace("13")?;
-    env.i3_exec("workspace 13")?;
-
-    // Activate remote i3mux session
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "13")?;
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Add another i3mux terminal
-    env.i3_exec("split h")?;
-    env.launch_i3mux_terminal()?;  // Waits for terminal to appear
-
-    // Add a regular (non-i3mux) terminal window
-    env.i3_exec("split v")?;
-    env.launch_terminal_with_command("/opt/i3mux-test/color-scripts/color-fill.sh 43")?;
-    std::thread::sleep(Duration::from_millis(800));
-
-    // Should have 3 windows total (2 i3mux + 1 regular)
-    let initial_windows = env.get_workspace_windows()?;
-    assert_eq!(initial_windows.len(), 3, "Should have 3 windows before detach");
-
-    // Detach session - should only detach i3mux terminals
-    env.i3mux_detach("ws13")?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Regular window should still be there, i3mux terminals should be gone
-    let windows_after_detach = env.get_workspace_windows()?;
-    assert_eq!(
-        windows_after_detach.len(),
-        1,
-        "Only the non-i3mux window should remain"
-    );
-
-    // Attach session back
-    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws13")?;
-    std::thread::sleep(Duration::from_secs(3));
-
-    // Should restore 2 i3mux terminals (regular window + 2 restored = 3 total)
-    let windows_after_attach = env.get_workspace_windows()?;
-    assert_eq!(
-        windows_after_attach.len(),
-        3,
-        "Should have 2 i3mux terminals + 1 regular window"
-    );
-
-    println!("✓ Detach/attach with mixed windows passed (gracefully ignored non-i3mux window)");
-
-    Ok(())
-}
-
-#[test]
-fn test_detach_attach_default_session_name() -> Result<()> {
-    // Test detach/attach without specifying session name (should use default ws-based name)
-    let env = TestEnvironment::new()?;
-
-    env.cleanup_workspace("14")?;
-    env.i3_exec("workspace 14")?;
-
-    // Activate without session name - should default to workspace-based name
-    // Use the i3mux_activate helper which is WM-agnostic
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "14")?;
-    std::thread::sleep(Duration::from_secs(3));
-
-    let initial_windows = env.get_workspace_windows()?;
-    assert!(initial_windows.len() >= 1, "Should have at least 1 terminal");
-
-    // Detach without session name - should use default "ws14"
-    env.i3mux_detach("ws14")?;
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let windows_after_detach = env.get_workspace_windows()?;
-    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
-
-    // Attach using the default session name
-    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws14")?;
-    std::thread::sleep(Duration::from_secs(3));
-
-    let windows_after_attach = env.get_workspace_windows()?;
+    let out = env.i3mux().detach()?;
     assert!(
-        windows_after_attach.len() >= 1,
-        "Should restore terminals with default session name"
+        out.contains(&format!("layout of 2 terminals saved on {host}")),
+        "{out}"
+    );
+    env.wait_for_window_count(WS, 0)?;
+    assert!(env.host_file(session, &layout_file(NAME))?.is_some());
+    assert_eq!(
+        env.i3mux().sessions(session)?,
+        [format!("{NAME}  ({host})  detached, 2 terminals saved")]
     );
 
-    println!("✓ Detach/attach with default session name passed");
-
+    let out = env.i3mux().attach(session, "")?.ok()?;
+    assert!(out.contains("(2 terminals)"), "{out}");
+    assert!(!out.contains("recreated"), "{out}");
+    assert_eq!(env.marks(WS)?, marks);
+    assert_eq!(
+        pids(&env.shells(session)?),
+        pids(&before),
+        "shells were replaced"
+    );
+    assert_eq!(
+        env.i3mux().sessions(session)?,
+        [format!("{NAME}  ({host})  2 windows")]
+    );
     Ok(())
 }
 
-#[test]
-fn test_detach_attach_tabbed_layout() -> Result<()> {
-    // Test that tabbed layouts are properly saved and restored
+/// Plan rule 11: when the host lost some shells (a reboot), attach starts
+/// fresh ones under the saved names, says how many, and keeps the rest.
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote)]
+fn attach_recreates_the_shells_the_host_lost(#[case] session: Session) -> Result<()> {
     let env = TestEnvironment::new()?;
+    env.activate(session, WS)?;
+    env.i3mux().terminal("")?;
+    let marks = env.marks(WS)?;
+    env.i3mux().detach()?;
+    let kept = env.shell(session, &terminal(NAME, 2))?.unwrap().pid;
+    env.kill_host_shell(session, &terminal(NAME, 1))?;
+    wait_until("the killed shell is gone", || {
+        Ok(env.shell(session, &terminal(NAME, 1))?.is_none())
+    })?;
 
-    env.cleanup_workspace("30")?;
-    env.i3_exec("workspace 30")?;
-
-    // Activate remote session
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "30")?;
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Set to tabbed layout
-    env.i3_exec("layout tabbed")?;
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Add second terminal
-    env.launch_i3mux_terminal()?;
-
-    // Add third terminal
-    env.launch_i3mux_terminal()?;
-
-    // Verify we have 3 terminals
-    let initial_windows = env.get_workspace_windows()?;
-    assert_eq!(initial_windows.len(), 3, "Should have 3 terminals before detach");
-
-    // Detach
-    env.i3mux_detach("ws30")?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Verify empty
-    let windows_after_detach = env.get_workspace_windows()?;
-    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
-
-    // Attach
-    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws30")?;
-    std::thread::sleep(Duration::from_secs(4)); // Extra time for 3 terminals
-
-    // Verify all terminals restored
-    let windows_after_attach = env.get_workspace_windows()?;
-    assert_eq!(
-        windows_after_attach.len(),
-        3,
-        "Should restore all 3 terminals in tabbed layout"
-    );
-
-    // Verify layout is still tabbed by checking if we can cycle through tabs
-    // (if it were a split, focus left/right would move to different windows, not cycle)
-    env.focus_prev_tab()?;
-    std::thread::sleep(Duration::from_millis(200));
-    env.focus_prev_tab()?;
-    std::thread::sleep(Duration::from_millis(200));
-
-    println!("✓ Detach/attach with tabbed layout passed");
-
+    let out = env.i3mux().attach(session, "")?.ok()?;
+    assert!(out.contains("recreated 1 of 2 shells"), "{out}");
+    assert_eq!(env.marks(WS)?, marks);
+    let shells = env.shells(session)?;
+    let names: Vec<&str> = shells.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["ws4-001", "ws4-002"]);
+    assert_eq!(env.shell(session, &terminal(NAME, 2))?.unwrap().pid, kept);
     Ok(())
 }
 
-#[test]
-fn test_detach_attach_stacked_layout() -> Result<()> {
-    // Test that stacked layouts are properly saved and restored
+/// Detach closes only i3mux windows; a plain terminal on the workspace
+/// stays, and attach adds the i3mux windows back next to it.
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote)]
+fn detach_leaves_other_windows_alone(#[case] session: Session) -> Result<()> {
     let env = TestEnvironment::new()?;
+    env.activate(session, WS)?;
+    env.launch_plain_terminal(WS, "sleep 100000")?;
+    assert_eq!(env.windows(WS)?.len(), 2);
 
-    env.cleanup_workspace("31")?;
-    env.i3_exec("workspace 31")?;
+    env.i3mux().detach()?;
+    env.wait_for_window_count(WS, 1)?;
+    let left = env.windows(WS)?;
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].0, "foot", "the plain terminal must stay: {left:?}");
 
-    // Activate remote session
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "31")?;
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Set to stacked layout
-    env.i3_exec("layout stacking")?;
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Add second terminal
-    env.launch_i3mux_terminal()?;
-
-    // Verify we have 2 terminals
-    let initial_windows = env.get_workspace_windows()?;
-    assert_eq!(initial_windows.len(), 2, "Should have 2 terminals before detach");
-
-    // Detach
-    env.i3mux_detach("ws31")?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Verify empty
-    let windows_after_detach = env.get_workspace_windows()?;
-    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
-
-    // Attach
-    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws31")?;
-    std::thread::sleep(Duration::from_secs(3));
-
-    // Verify terminals restored
-    let windows_after_attach = env.get_workspace_windows()?;
-    assert_eq!(
-        windows_after_attach.len(),
-        2,
-        "Should restore both terminals in stacked layout"
-    );
-
-    println!("✓ Detach/attach with stacked layout passed");
-
+    env.i3mux().attach(session, "")?.ok()?;
+    assert_eq!(env.marks(WS)?, [session.mark(NAME, 1)]);
+    assert_eq!(env.windows(WS)?.len(), 2);
     Ok(())
 }
 
+/// Plan rule 5: detach needs a bound workspace, and says how to bind one.
 #[test]
-fn test_detach_attach_nested_tabs_splits() -> Result<()> {
-    // Test complex nested layout: HSplit(Tabs(t1,t2), t3)
+fn detach_of_an_unbound_workspace_fails_with_a_hint() -> Result<()> {
     let env = TestEnvironment::new()?;
-
-    env.cleanup_workspace("32")?;
-    env.i3_exec("workspace 32")?;
-
-    // Activate remote session
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "32")?;
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Create tabbed container with 2 terminals
-    env.i3_exec("layout tabbed")?;
-    std::thread::sleep(Duration::from_millis(200));
-    env.launch_i3mux_terminal()?;
-
-    // Add hsplit and third terminal
-    env.i3_exec("focus parent")?;
-    std::thread::sleep(Duration::from_millis(200));
-    env.i3_exec("split h")?;
-    std::thread::sleep(Duration::from_millis(200));
-    env.launch_i3mux_terminal()?;
-
-    // Verify we have 3 terminals
-    let initial_windows = env.get_workspace_windows()?;
-    assert_eq!(initial_windows.len(), 3, "Should have 3 terminals before detach");
-
-    // Detach
-    env.i3mux_detach("ws32")?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Verify empty
-    let windows_after_detach = env.get_workspace_windows()?;
-    assert_eq!(windows_after_detach.len(), 0, "Workspace should be empty after detach");
-
-    // Attach
-    env.i3mux_attach(Session::Remote("testuser@i3mux-remote-ssh"), "ws32")?;
-    std::thread::sleep(Duration::from_secs(4));
-
-    // Verify all terminals restored
-    let windows_after_attach = env.get_workspace_windows()?;
-    assert_eq!(
-        windows_after_attach.len(),
-        3,
-        "Should restore all 3 terminals with nested layout"
+    env.focus_workspace(9)?;
+    let stderr = env.i3mux().run("detach")?.failed_with(1)?;
+    assert!(
+        stderr.contains("Workspace 9 is not bound to a session; run 'i3mux activate' first"),
+        "{stderr}"
     );
-
-    println!("✓ Detach/attach with nested tabs/splits passed");
-
     Ok(())
+}
+
+/// Plan rule 6: attach refuses a workspace that has i3mux windows, and the
+/// refusal changes nothing: the saved session stays detached and saved.
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote)]
+fn attach_refuses_a_workspace_with_i3mux_windows(#[case] session: Session) -> Result<()> {
+    let env = TestEnvironment::new()?;
+    let host = session.host_label();
+    env.activate(session, 1)?;
+    env.i3mux().detach()?;
+    env.activate(session, 2)?;
+
+    let stderr = env
+        .i3mux()
+        .attach(session, "--session ws1")?
+        .failed_with(1)?;
+    assert!(
+        stderr.contains("Workspace 2 already has i3mux terminals; detach or close them first"),
+        "{stderr}"
+    );
+    assert_eq!(env.marks(2)?, [session.mark("ws2", 1)]);
+    assert!(env.host_file(session, &layout_file("ws1"))?.is_some());
+    assert!(!env.shell(session, &terminal("ws1", 1))?.unwrap().attached);
+    assert_eq!(
+        env.i3mux().sessions(session)?,
+        [
+            format!("ws1  ({host})  detached, 1 terminal saved"),
+            format!("ws2  ({host})  1 window"),
+        ]
+    );
+    Ok(())
+}
+
+/// Plan rule 10: a shell attached from another client makes attach fail
+/// with the `--force` hint and change nothing; `--force` takes the shell
+/// over, disconnects the other client, and keeps the same shells.
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote)]
+fn attach_force_takes_over_a_shell_attached_elsewhere(#[case] session: Session) -> Result<()> {
+    let env = TestEnvironment::new()?;
+    let host = session.host_label();
+    env.activate(session, WS)?;
+    env.i3mux().terminal("")?;
+    env.i3mux().detach()?;
+    env.attach_second_client(session, &terminal(NAME, 1))?;
+    let before = env.shells(session)?;
+
+    let stderr = env.i3mux().attach(session, "")?.failed_with(1)?;
+    assert!(
+        stderr.contains(
+            "Session 'ws4-001' is already attached from another terminal or host; \
+             use --force to take over"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        env.windows(WS)?.is_empty(),
+        "a refused attach opened windows"
+    );
+    assert_eq!(
+        env.i3mux().sessions(session)?,
+        [format!("{NAME}  ({host})  attached elsewhere, 2 shells")],
+        "a refused attach must not bind the workspace"
+    );
+    assert!(env.second_client_running(session)?);
+
+    let out = env.i3mux().attach(session, "--force")?.ok()?;
+    assert!(!out.contains("recreated"), "{out}");
+    assert_eq!(
+        env.marks(WS)?,
+        [session.mark(NAME, 1), session.mark(NAME, 2)]
+    );
+    wait_until("the other client is disconnected", || {
+        Ok(!env.second_client_running(session)?)
+    })?;
+    assert_eq!(
+        pids(&env.shells(session)?),
+        pids(&before),
+        "shells were replaced"
+    );
+    Ok(())
+}
+
+/// With several saved sessions and no `--session`, attach lists them, exits
+/// 2, and opens nothing.
+#[test]
+fn attach_without_a_name_lists_the_candidates_and_exits_2() -> Result<()> {
+    let env = TestEnvironment::new()?;
+    for ws in [1, 2] {
+        env.activate(Session::Local, ws)?;
+        env.i3mux().detach()?;
+    }
+    env.focus_workspace(3)?;
+
+    let stderr = env.i3mux().attach(Session::Local, "")?.failed_with(2)?;
+    assert!(
+        stderr.contains(
+            "Several saved sessions on local:\n  ws1\n  ws2\nChoose one with --session NAME."
+        ),
+        "{stderr}"
+    );
+    assert!(env.windows(3)?.is_empty());
+
+    env.i3mux().attach(Session::Local, "--session ws2")?.ok()?;
+    assert_eq!(env.marks(3)?, [Session::Local.mark("ws2", 1)]);
+    Ok(())
+}
+
+/// Sway closes windows asynchronously, so their shpool clients can outlive
+/// `detach`; `attach` trusts `shpool list`. `detach` therefore runs
+/// `shpool detach` on the closed windows' shells and waits until none is
+/// attached, so an immediate local `attach` is never refused (it was, 4 of 4
+/// runs, before that fix).
+#[test]
+fn local_attach_right_after_detach_is_not_refused() {
+    let env = TestEnvironment::new().unwrap();
+    env.activate(Session::Local, WS).unwrap();
+    env.i3mux().terminal("").unwrap();
+    env.i3mux().detach().unwrap();
+    let out = env.i3mux().attach(Session::Local, "").unwrap();
+    assert!(out.success(), "false refusal right after detach: {out}");
 }

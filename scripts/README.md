@@ -1,72 +1,44 @@
 # i3mux-rofi
 
-Simple rofi interface for i3mux session management.
+A rofi menu for i3mux.
 
-## Installation
+## Install
 
-1. Copy `i3mux-rofi` to somewhere in your PATH or a known location
-2. Make it executable: `chmod +x i3mux-rofi`
-3. Add to your i3 config:
-
-```
-bindsym $mod+m exec /path/to/i3mux-rofi
+```bash
+sudo install -Dm755 scripts/i3mux-rofi /usr/local/bin/i3mux-rofi
 ```
 
-## Usage
-
-Press `Mod+m` to open the rofi menu. You'll see:
+Add to `~/.config/sway/config`:
 
 ```
-Activate: local
-Activate: last-server.com     (if you've used a remote before)
+bindsym $mod+m exec i3mux-rofi
+```
+
+## Menu
+
+```
+<last remote>   (shown once you have used a remote)
 Detach
 Attach
-List Sessions
-Kill Session
+List
+Kill
 ```
 
-### Activate a Session
+- Press Enter on an empty line to bind the focused workspace to a local
+  session and open the first shell.
+- Type a host such as `user@dev-box` to bind it to that host instead. The
+  script remembers the host in `~/.config/i3mux/last_remote`.
+- `Detach` saves the layout and closes the windows of the focused workspace.
+- `Attach` lists sessions on local and on the last remote, then restores the
+  one you pick into the focused workspace.
+- `List` shows the same list read-only.
+- `Kill` asks for confirmation, then kills the shells and deletes the layout.
 
-- Select `Activate: local` to activate the current workspace locally
-- **Edit** `Activate: local` to `Activate: user@server.com` and press Enter to activate remote
-- The script remembers your last remote for quick access
+The list lines come straight from `i3mux sessions`, prefixed with the host
+they were read from:
 
-### Attach to a Session
-
-- Select `Attach` to see all available sessions (local + last remote)
-- Sessions show as `[host] sessionname - N terminals`
-- Select one to attach
-
-### Detach
-
-- Select `Detach` to detach the current workspace
-- Session is saved and terminals are closed
-- You can attach again later from any machine
-
-### Other Operations
-
-- `List Sessions`: Read-only view of all sessions
-- `Kill Session`: Select and confirm to delete a session
-
-## Tips
-
-- The script remembers your last used remote host in `~/.config/i3mux/last_remote`
-- You can edit any "Activate:" line in the menu to specify a different host
-- For quick access, just type part of the menu item to filter (rofi standard behavior)
-
-## Examples
-
-**Activate local session:**
-1. `Mod+m` → select "Activate: local" → Enter
-
-**Activate remote session:**
-1. `Mod+m` → edit "Activate: local" to "Activate: user@myserver" → Enter
-
-**Quick activate last remote:**
-1. `Mod+m` → select "Activate: myserver.com" (if shown) → Enter
-
-**Attach to session:**
-1. `Mod+m` → select "Attach" → select session from list → Enter
-
-**Detach:**
-1. `Mod+m` → select "Detach" → Enter
+```
+local|ws4  (local)  2 windows
+dev-box|ws3  (dev-box)  detached, 3 terminals saved
+dev-box|ws7  (dev-box)  2 shells, no saved layout
+```

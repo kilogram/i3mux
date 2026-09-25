@@ -1,49 +1,59 @@
-FROM ubuntu:22.04
+# One image for both test roles:
+#   start-sway.sh  -> headless Sway client (service i3mux-test-sway)
+#   sshd -D -e     -> remote host         (service i3mux-remote-ssh)
+FROM ubuntu:24.04
+
+# Pinned shpool release. Update both values together.
+ARG SHPOOL_VERSION=0.11.5
+ARG SHPOOL_SHA256=132f786bd275749a46224c17a071474a850f0be1fbb752b1c96d910778543c9b
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV XDG_RUNTIME_DIR=/tmp/runtime-root
+ENV WLR_BACKENDS=headless
+ENV WLR_LIBINPUT_NO_DEVICES=1
+ENV WLR_RENDERER=pixman
+ENV LIBGL_ALWAYS_SOFTWARE=1
 
-# Install all required packages
-RUN apt-get update && apt-get install -y \
-    # X11/GUI (for xephyr)
-    xvfb \
-    i3 \
-    xterm \
-    scrot \
-    imagemagick \
-    x11-xserver-utils \
-    dbus-x11 \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Sway/Wayland
+    sway \
+    foot \
+    grim \
+    wlr-randr \
     # SSH client and server
     openssh-client \
     openssh-server \
-    # Networking tools (for remote)
+    # Network fault injection (remote)
     iproute2 \
     iptables \
     iputils-ping \
     net-tools \
     sudo \
-    # Build tools for abduco
-    git \
-    build-essential \
-    libncurses-dev \
+    # shpool download, tree inspection in tests, tput in color-fill.sh
+    ca-certificates \
+    curl \
     jq \
+    ncurses-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Build and install abduco from source
-RUN git clone https://github.com/martanne/abduco.git /tmp/abduco && \
-    cd /tmp/abduco && \
-    make && \
-    make PREFIX=/usr install && \
-    rm -rf /tmp/abduco
+# shpool: prebuilt static binary. The tarball holds one file, ./shpool.
+RUN curl -fsSL -o /tmp/shpool.tar.gz \
+      "https://github.com/shell-pool/shpool/releases/download/v${SHPOOL_VERSION}/shpool-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${SHPOOL_SHA256}  /tmp/shpool.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/shpool.tar.gz -C /usr/local/bin shpool \
+    && chmod 755 /usr/local/bin/shpool \
+    && rm /tmp/shpool.tar.gz \
+    && shpool version
 
-# Create test user (for SSH remote)
+# Test user for the ssh remote. HOME is writable: i3mux keeps state in
+# ~/.local/{run,state}/i3mux and ~/.config/i3mux there.
 RUN useradd -m -s /bin/bash testuser && \
     echo 'testuser:testpass' | chpasswd && \
     usermod -aG sudo testuser && \
     echo 'testuser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
-    # Suppress sudo hint message
     touch /home/testuser/.sudo_as_admin_successful
 
-# Configure SSH server
+# SSH server
 RUN mkdir -p /var/run/sshd && \
     mkdir -p /home/testuser/.ssh && \
     chmod 700 /home/testuser/.ssh && \
@@ -52,29 +62,22 @@ RUN mkdir -p /var/run/sshd && \
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
     sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 
-# Create directories
 RUN mkdir -p /opt/i3mux-test \
     && mkdir -p /root/.ssh/sockets \
     && mkdir -p /tmp/screenshots \
-    && mkdir -p /tmp/i3mux/sessions /tmp/i3mux/locks \
+    && mkdir -p $XDG_RUNTIME_DIR \
     && chmod 700 /root/.ssh \
     && chmod 700 /root/.ssh/sockets \
-    && chown -R testuser:testuser /tmp/i3mux
+    && chmod 700 $XDG_RUNTIME_DIR
 
-# Copy i3 test config
-COPY i3-test-config /opt/i3mux-test/i3-test-config
-
-# Copy startup script
-COPY start-xephyr.sh /opt/i3mux-test/start-xephyr.sh
-RUN chmod +x /opt/i3mux-test/start-xephyr.sh
-
-# Copy WM-agnostic helper scripts
+COPY sway-test-config /opt/i3mux-test/sway-test-config
+COPY start-sway.sh /opt/i3mux-test/start-sway.sh
 COPY scripts/msg /opt/i3mux-test/bin/msg
 COPY scripts/launch_terminal /opt/i3mux-test/bin/launch_terminal
-RUN chmod +x /opt/i3mux-test/bin/*
+RUN chmod 755 /opt/i3mux-test/start-sway.sh /opt/i3mux-test/bin/*
 ENV PATH="/opt/i3mux-test/bin:$PATH"
 
-# Create color-fill script for test terminals
+# color-fill.sh: fill the terminal with one color and sleep until killed
 RUN mkdir -p /opt/i3mux-test/color-scripts && \
     cat > /opt/i3mux-test/color-scripts/color-fill.sh << 'SCRIPT'
 #!/bin/bash
@@ -95,17 +98,19 @@ while true; do sleep 1; done
 SCRIPT
 RUN chmod +x /opt/i3mux-test/color-scripts/color-fill.sh
 
-# Create SSH config for ControlMaster
-RUN echo "Host i3mux-remote-ssh" > /root/.ssh/config && \
-    echo "  HostName i3mux-remote-ssh" >> /root/.ssh/config && \
-    echo "  User testuser" >> /root/.ssh/config && \
-    echo "  Port 22" >> /root/.ssh/config && \
-    echo "  StrictHostKeyChecking no" >> /root/.ssh/config && \
-    echo "  UserKnownHostsFile /dev/null" >> /root/.ssh/config && \
-    echo "  ControlMaster auto" >> /root/.ssh/config && \
-    echo "  ControlPath /root/.ssh/sockets/%r@%h:%p" >> /root/.ssh/config && \
-    echo "  ControlPersist 600" >> /root/.ssh/config && \
-    chmod 600 /root/.ssh/config
+# ssh client config for the remote service (ControlMaster for speed)
+RUN printf '%s\n' \
+      'Host i3mux-remote-ssh' \
+      '  HostName i3mux-remote-ssh' \
+      '  User testuser' \
+      '  Port 22' \
+      '  StrictHostKeyChecking no' \
+      '  UserKnownHostsFile /dev/null' \
+      '  ControlMaster auto' \
+      '  ControlPath /root/.ssh/sockets/%r@%h:%p' \
+      '  ControlPersist 600' \
+      > /root/.ssh/config \
+    && chmod 600 /root/.ssh/config
 
 WORKDIR /opt/i3mux-test
 

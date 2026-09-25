@@ -1,20 +1,25 @@
-// Basic infrastructure tests
+//! The containers are wired as the other tests assume.
 
-use super::common::*;
+use super::common::{Result, Session, TestEnvironment};
 
+/// Sway answers, ssh reaches the remote with shpool on its login PATH, and
+/// neither host has i3mux shells yet.
 #[test]
-fn test_basic_infrastructure() -> Result<()> {
-    // This test just verifies the basic infrastructure is working
+fn containers_are_ready_for_local_and_remote_sessions() -> Result<()> {
     let env = TestEnvironment::new()?;
-
-    // Verify we can execute i3 commands
-    env.i3_exec("workspace 1")?;
-
-    // Verify we can check workspace state
-    let empty = env.is_workspace_empty("999")?;
-    assert!(empty);
-
-    println!("✓ Basic infrastructure test passed");
-
+    env.focus_workspace(1)?;
+    for session in [Session::Local, Session::Remote] {
+        let out = env
+            .i3mux()
+            .run(&format!("sessions{}", session.remote_flag()))?;
+        assert!(out.success(), "{out}");
+        assert_eq!(out.stdout, "");
+        assert!(
+            out.stderr
+                .contains(&format!("No sessions on {}", session.host_label())),
+            "{out}"
+        );
+        assert!(env.shells(session)?.is_empty());
+    }
     Ok(())
 }

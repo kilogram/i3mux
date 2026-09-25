@@ -28,7 +28,7 @@ pub struct ExactRegion {
     pub y: u32,
     pub width: u32,
     pub height: u32,
-    pub expected_color: [u8; 3],  // RGB
+    pub expected_color: [u8; 3], // RGB
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +66,7 @@ impl Default for FuzzyBoundaries {
 impl ComparisonSpec {
     /// Load a comparison spec from a TOML file
     pub fn load<P: AsRef<Path>>(name: P) -> Result<Self> {
-        let spec_path = Self::spec_path(name.as_ref())?;
+        let spec_path = Self::spec_path(name.as_ref());
         let contents = fs::read_to_string(&spec_path)
             .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
@@ -77,16 +77,15 @@ impl ComparisonSpec {
     }
 
     /// Get the path to a spec file
-    fn spec_path(name: &Path) -> Result<PathBuf> {
-        let spec_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/integration/golden/specs");
+    fn spec_path(name: &Path) -> PathBuf {
+        let spec_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/integration/golden/specs");
 
         let mut path = spec_dir.join(name);
         if path.extension().is_none() {
             path.set_extension("toml");
         }
-
-        Ok(path)
+        path
     }
 
     /// Create a simple spec for basic layouts
@@ -112,7 +111,7 @@ mod tests {
         let spec = ComparisonSpec::simple("test");
         assert_eq!(spec.fuzzy_boundaries.tolerance_px, 5);
         assert_eq!(spec.fuzzy_boundaries.max_diff_pixels, 2500);
-        assert_eq!(spec.fuzzy_boundaries.max_diff_percentage, 1.0);
+        assert!((spec.fuzzy_boundaries.max_diff_percentage - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -123,15 +122,13 @@ mod tests {
             terminal_count: 2,
             actions: vec!["msg 'split h'".to_string()],
             pre_screenshot: Vec::new(),
-            exact_regions: vec![
-                ExactRegion {
-                    x: 0,
-                    y: 20,
-                    width: 960,
-                    height: 1060,
-                    expected_color: [255, 0, 0],
-                },
-            ],
+            exact_regions: vec![ExactRegion {
+                x: 0,
+                y: 20,
+                width: 960,
+                height: 1060,
+                expected_color: [255, 0, 0],
+            }],
             fuzzy_boundaries: FuzzyBoundaries::default(),
         };
 

@@ -1,252 +1,67 @@
-# i3mux Testing Infrastructure
+# i3mux container tests
 
-Comprehensive containerized testing system for i3mux using Xephyr, Docker/Podman, and screenshot-based verification.
+The integration suite runs i3mux in headless Sway and checks what a user
+sees: windows, marks, shells on each host, and screenshots. `TESTING.md`
+at the repository root describes all test tiers.
 
-## Quick Start
-
-### Prerequisites
-
-- Rust (for running tests)
-- Docker or Podman (for containers)
-- podman-compose or docker-compose
-
-### Running Tests
+## Run
 
 ```bash
-# Run all tests
-cargo test
-
-# Run only integration tests
-cargo test --test integration_tests
-
-# Run tests with output
-cargo test -- --nocapture
-
-# Run specific test
-cargo test test_local_hsplit_2_terminals
-
-# Include ignored tests (SSH/network tests)
-cargo test -- --ignored --nocapture
+just check-int                            # whole suite (builds the musl binary)
+just check-int scrollback -- --nocapture  # one test, with output
+just update-goldens                       # rewrite the golden images
+just clean-containers                     # remove leftover containers
 ```
 
-### Updating Golden Images
+The suite needs podman or docker and the `x86_64-unknown-linux-musl`
+target. With `DOCKER_HOST` pointing at a podman socket it uses podman and
+podman-compose, otherwise docker and `docker compose`. It builds the image
+`i3mux-test-sway:latest` when the image is missing.
 
-When you make intentional changes to layouts or need to regenerate reference images:
+## How a test runs
 
-```bash
-# Regenerate all golden images
-cargo test -- --update-goldens
+1. `TestEnvironment::new()` starts two fresh containers from one image. One
+   runs headless Sway, the other runs sshd as the remote host
+   (`i3mux-remote-ssh`, user `testuser`). Tests never share state.
+2. The test runs `i3mux` inside the Sway container with foot as the
+   terminal. Session-level tests run once for `Session::Local` and once
+   for `Session::Remote`.
+3. It checks Sway (`swaymsg -t get_tree`), the shells on each host
+   (`shpool list --json` on the i3mux socket
+   `~/.local/run/i3mux/shpool.socket`), host files, and screenshots.
+4. Dropping the environment removes both containers.
 
-# Review the updated images in tests/golden/
-ls -la tests/golden/local/
-ls -la tests/golden/remote/
-
-# Commit the approved images
-git add tests/golden/
-git commit -m "Update golden images for ..."
-```
-
-## Architecture
-
-### Container Setup
-
-The testing infrastructure uses 2 containers:
-
-1. **i3mux-test-xephyr** - Runs Xephyr (nested X server) and i3 window manager
-2. **i3mux-remote-ssh** - SSH server simulating a remote host
-
-Both are orchestrated via `docker/docker-compose.yml`.
-
-### Test Flow
-
-1. Test calls `TestEnvironment::new()` - Starts containers if needed (reused across tests)
-2. Test executes i3mux commands via the test environment
-3. Test captures screenshots using scrot
-4. Screenshots are compared with golden images using fuzzy matching (±5px tolerance)
-5. On failure, diff images are saved to `tests/test-output/failures/`
-
-### Directory Structure
+## Layout
 
 ```
 tests/
-├── common/              # Shared test infrastructure
-│   ├── environment.rs   # Main TestEnvironment orchestrator
-│   ├── screenshot.rs    # Image comparison logic
-│   ├── comparison_spec.rs  # TOML spec parsing
-│   ├── diff_image.rs    # Visual diff generation
-│   ├── docker.rs        # Container management
-│   ├── i3mux.rs        # i3mux command wrappers
-│   └── network.rs      # SSH failure injection
-├── docker/             # Container definitions
-│   ├── docker-compose.yml
-│   ├── Dockerfile.xephyr
-│   ├── Dockerfile.remote
-│   ├── i3-test-config
-│   ├── start-xephyr.sh
-│   └── ssh-keys/       # SSH keys for passwordless auth
-├── color-scripts/      # Terminal color fill scripts
-│   └── color-fill.sh
-├── golden/             # Golden reference images
-│   ├── local/          # Local session screenshots
-│   ├── remote/         # Remote session screenshots
-│   └── specs/          # TOML comparison specifications
-├── screenshots/        # Temporary screenshots (gitignored)
-├── test-output/        # Test failure artifacts (gitignored)
-│   └── failures/       # Diff images and reports
-└── integration_tests.rs  # Integration test suite
+  common/            shared infrastructure
+    docker.rs        containers, file setup, exec
+    environment.rs   Sway queries, host shells, second clients, screenshots
+    i3mux.rs         the i3mux CLI and the Local/Remote Session parameter
+    screenshot.rs    golden comparison; diff_image.rs, comparison_spec.rs
+  integration/       the test binary (main.rs lists the modules)
+    golden/sway/     golden images
+    golden/specs/    comparison thresholds and restore-* layout recipes
+  color-scripts/     color-fill.sh and print-lines.sh, copied to both hosts
+  docker/            Dockerfile, compose file, Sway config, msg and
+                     launch_terminal helpers
 ```
 
-## Writing Tests
+## Golden images
 
-### Basic Test Structure
+Local and remote cases share one golden: the shells must look the same.
+Each test's prompt is `$ ` on both hosts so that the random container
+hostname never reaches an image. After `just update-goldens`, open every
+changed image and check it shows the layout the test names. On failure the
+suite writes golden, actual, diff and a report to
+`tests/test-output/failures/`.
 
-```rust
-#[test]
-fn test_my_layout() -> Result<()> {
-    let env = TestEnvironment::new()?;
+## Known bugs pinned by tests
 
-    // Clean workspace
-    env.cleanup_workspace("1")?;
+These tests expect the current wrong behaviour and fail once it is fixed.
+Then turn them into plain tests.
 
-    // Activate i3mux
-    env.i3mux_activate(Session::Local, "1")?;
-
-    // Create layout
-    env.launch_terminal(ColorScript::Red)?;
-    env.i3_exec("split h")?;
-    env.launch_terminal(ColorScript::Green)?;
-
-    // Verify screenshot
-    let screenshot = env.capture_screenshot()?;
-    let spec = ComparisonSpec::load("my-layout")?;
-    env.compare_with_golden("local/my-layout.png", &screenshot, &spec)?;
-
-    Ok(())
-}
-```
-
-### Testing Remote Sessions
-
-```rust
-#[test]
-fn test_remote_session() -> Result<()> {
-    let env = TestEnvironment::new()?;
-
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "2")?;
-
-    // SSH commands will be executed via ControlMaster
-    let _term = env.launch_terminal(ColorScript::Blue)?;
-    env.wait_for_ssh_connection(_term, Duration::from_secs(3))?;
-
-    Ok(())
-}
-```
-
-### Testing Network Failures
-
-```rust
-#[test]
-fn test_with_packet_loss() -> Result<()> {
-    let env = TestEnvironment::new()?;
-
-    // Inject 20% packet loss
-    env.inject_packet_loss(20)?;
-
-    // Test should still work, just slower
-    env.i3mux_activate(Session::Remote("testuser@i3mux-remote-ssh"), "3")?;
-
-    // Clean up
-    env.clear_network_rules()?;
-
-    Ok(())
-}
-```
-
-## Comparison Specs
-
-Comparison specs define how screenshots should be compared. They're TOML files in `tests/golden/specs/`.
-
-### Example Spec
-
-```toml
-name = "Horizontal split - 2 terminals"
-
-# Exact color matching for terminal regions
-[[exact_regions]]
-x = 0
-y = 20
-width = 958
-height = 1058
-expected_color = [170, 0, 0]  # Dark red ANSI background
-
-[[exact_regions]]
-x = 962
-y = 20
-width = 958
-height = 1058
-expected_color = [0, 170, 0]  # Dark green ANSI background
-
-# Fuzzy matching for window borders
-[fuzzy_boundaries]
-tolerance_px = 5              # ±5 pixel tolerance for borders
-max_diff_pixels = 2000        # Max total diff pixels allowed
-max_diff_percentage = 1.5     # Max 1.5% diff allowed
-```
-
-## Troubleshooting
-
-### Containers won't start
-
-```bash
-# Check if containers are running
-podman ps  # or: docker ps
-
-# View container logs
-podman logs i3mux-test-xephyr
-podman logs i3mux-remote-ssh
-
-# Restart containers
-cd tests/docker
-podman-compose down
-podman-compose up -d
-```
-
-### Screenshots don't match
-
-When a test fails with screenshot mismatches:
-
-1. Check `tests/test-output/failures/<test-name>/<timestamp>/`
-2. Review `comparison.png` (side-by-side comparison)
-3. Review `diff.png` (highlighted differences)
-4. Check if the diff is intentional or a bug
-5. If intentional, regenerate goldens: `cargo test -- --update-goldens`
-
-### SSH tests failing
-
-```bash
-# Check SSH connectivity from Xephyr container
-podman exec i3mux-test-xephyr ssh testuser@i3mux-remote-ssh echo ok
-
-# Check SSH keys
-ls -la tests/docker/ssh-keys/
-
-# Regenerate SSH keys if needed
-cd tests/docker/ssh-keys
-rm -f id_rsa id_rsa.pub
-ssh-keygen -t rsa -b 2048 -f id_rsa -N "" -C "i3mux-test-key"
-```
-
-## Performance
-
-- First test run: ~30s (container startup)
-- Subsequent tests: ~2-5s each (containers reused)
-- Full test suite: ~5-10 minutes
-
-## CI/CD
-
-Tests run automatically on GitHub Actions. See `.github/workflows/test.yml`.
-
-CI will fail if:
-- Any test fails
-- Golden images are uncommitted (after running with `--update-goldens`)
-- Container build fails
+- `detach_attach::local_attach_right_after_detach_is_not_refused`
+- `mux::pty_tests::refused_attach_exits_nonzero_so_the_wrapper_keeps_the_window_open`
+  (in `src/`, run by `just check-mux`)

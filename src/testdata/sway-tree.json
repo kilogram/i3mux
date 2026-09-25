@@ -1,0 +1,215 @@
+{
+  "id": 1,
+  "type": "root",
+  "name": "root",
+  "layout": "splith",
+  "orientation": "horizontal",
+  "percent": null,
+  "focused": false,
+  "marks": [],
+  "nodes": [
+    {
+      "id": 2147483647,
+      "type": "output",
+      "name": "__i3",
+      "layout": "output",
+      "orientation": "horizontal",
+      "percent": null,
+      "focused": false,
+      "marks": [],
+      "nodes": [
+        {
+          "id": 2147483646,
+          "type": "workspace",
+          "name": "__i3_scratch",
+          "layout": "splith",
+          "orientation": "horizontal",
+          "percent": null,
+          "focused": false,
+          "marks": [],
+          "nodes": [],
+          "floating_nodes": [
+            {
+              "id": 7,
+              "type": "floating_con",
+              "name": "md.obsidian.Obsidian window",
+              "layout": "none",
+              "orientation": "none",
+              "percent": null,
+              "focused": false,
+              "marks": [
+                "scratch-notes"
+              ],
+              "app_id": "md.obsidian.Obsidian",
+              "nodes": [],
+              "floating_nodes": []
+            }
+          ]
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "id": 3,
+      "type": "output",
+      "name": "eDP-1",
+      "layout": "output",
+      "orientation": "none",
+      "percent": 1.0,
+      "focused": false,
+      "marks": [],
+      "nodes": [
+        {
+          "id": 290,
+          "type": "workspace",
+          "name": "1",
+          "layout": "splith",
+          "orientation": "horizontal",
+          "percent": null,
+          "focused": false,
+          "marks": [],
+          "num": 1,
+          "nodes": [
+            {
+              "id": 289,
+              "type": "con",
+              "name": "Beeper window",
+              "layout": "none",
+              "orientation": "none",
+              "percent": 1.0,
+              "focused": false,
+              "marks": [],
+              "app_id": "Beeper",
+              "nodes": [],
+              "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        },
+        {
+          "id": 264,
+          "type": "workspace",
+          "name": "2",
+          "layout": "splith",
+          "orientation": "horizontal",
+          "percent": null,
+          "focused": false,
+          "marks": [],
+          "num": 2,
+          "nodes": [
+            {
+              "id": 263,
+              "type": "con",
+              "name": "firefox window",
+              "layout": "none",
+              "orientation": "none",
+              "percent": 1.0,
+              "focused": false,
+              "marks": [],
+              "app_id": "firefox",
+              "nodes": [],
+              "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        },
+        {
+          "id": 945,
+          "type": "workspace",
+          "name": "3",
+          "layout": "splith",
+          "orientation": "horizontal",
+          "percent": null,
+          "focused": false,
+          "marks": [],
+          "num": 3,
+          "nodes": [
+            {
+              "id": 977,
+              "type": "con",
+              "name": null,
+              "layout": "tabbed",
+              "orientation": "none",
+              "percent": 1.0,
+              "focused": false,
+              "marks": [],
+              "nodes": [
+                {
+                  "id": 1019,
+                  "type": "con",
+                  "name": "Alacritty window",
+                  "layout": "none",
+                  "orientation": "none",
+                  "percent": 1.0,
+                  "focused": false,
+                  "marks": [],
+                  "app_id": "Alacritty",
+                  "nodes": [],
+                  "floating_nodes": []
+                },
+                {
+                  "id": 1001,
+                  "type": "con",
+                  "name": "Alacritty window",
+                  "layout": "none",
+                  "orientation": "none",
+                  "percent": 1.0,
+                  "focused": false,
+                  "marks": [],
+                  "app_id": "Alacritty",
+                  "nodes": [],
+                  "floating_nodes": []
+                }
+              ],
+              "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        },
+        {
+          "id": 1074,
+          "type": "workspace",
+          "name": "q",
+          "layout": "splith",
+          "orientation": "horizontal",
+          "percent": null,
+          "focused": false,
+          "marks": [],
+          "num": -1,
+          "nodes": [
+            {
+              "id": 1075,
+              "type": "con",
+              "name": "Alacritty window",
+              "layout": "none",
+              "orientation": "none",
+              "percent": 1.0,
+              "focused": false,
+              "marks": [],
+              "app_id": "Alacritty",
+              "nodes": [],
+              "floating_nodes": []
+            }
+          ],
+          "floating_nodes": [
+            {
+              "id": 5,
+              "type": "floating_con",
+              "name": "Alacritty window",
+              "layout": "none",
+              "orientation": "none",
+              "percent": 0.6156879526935265,
+              "focused": true,
+              "marks": [],
+              "app_id": "Alacritty",
+              "nodes": [],
+              "floating_nodes": []
+            }
+          ]
+        }
+      ],
+      "floating_nodes": []
+    }
+  ],
+  "floating_nodes": []
+}

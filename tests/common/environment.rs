@@ -1,851 +1,455 @@
-// Test environment management - orchestrates containers, i3mux, and screenshots
+//! One test's world: fresh containers, the i3mux CLI, Sway queries, the
+//! shells on each host, screenshots and golden images.
 
-use anyhow::{Context, Result};
-use image::RgbaImage;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use super::docker::{ContainerManager, DualContainerManager, TestWmType};
-use super::i3mux::I3muxRunner;
-use super::network::NetworkManipulator;
-use super::screenshot::{compare_screenshots, load_golden_image, save_comparison_failure};
+use anyhow::{bail, Context, Result};
+use image::RgbaImage;
+use serde_json::Value;
+
 use super::comparison_spec::ComparisonSpec;
+use super::docker::Containers;
+use super::i3mux::{I3mux, Session};
+use super::screenshot::{compare_screenshots, load_golden_image, save_comparison_failure};
 
-/// Session type for i3mux
-#[derive(Debug, Clone)]
-pub enum Session {
-    Local,
-    Remote(&'static str),
+/// How long to wait for Sway, shpool or ssh to reach an expected state.
+pub const WAIT: Duration = Duration::from_secs(15);
+
+/// Golden images live in `tests/integration/golden/sway/`.
+const GOLDEN_DIR: &str = "sway";
+
+/// A shell as `shpool list --json` reports it on its host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostShell {
+    pub name: String,
+    pub attached: bool,
+    pub pid: u64,
 }
 
-/// Color for terminal backgrounds (used by network failure tests)
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum ColorScript {
-    Red,
-    Green,
-    Blue,
-    Yellow,
-    Magenta,
-    Cyan,
-}
-
-/// Main test environment managing containers and test operations
+/// Fresh containers for one test. Dropping it removes them.
 pub struct TestEnvironment {
-    container_mgr: ContainerManager,
+    containers: Containers,
     update_goldens: bool,
 }
 
 impl TestEnvironment {
-    /// Create a new test environment
-    /// Creates fresh containers for this test session
-    /// Docker images are cached and reused automatically
     pub fn new() -> Result<Self> {
-        println!("\n=== Creating test environment ===");
-
-        let container_mgr = ContainerManager::new()
-            .context("Failed to create container manager")?;
-
-        println!("=== Waiting for services to be ready ===");
-        container_mgr.wait_for_wm_ready(30)?;
-        container_mgr.wait_for_ssh_ready(30)?;
-        println!("=== Test environment ready ===\n");
-
-        // Check for UPDATE_GOLDENS environment variable
-        let update_goldens = std::env::var("UPDATE_GOLDENS").is_ok();
-        if update_goldens {
-            println!("NOTE: Running in golden update mode - will regenerate golden images");
-        }
-
+        let containers = Containers::start().context("start the test containers")?;
+        let update_goldens = std::env::var_os("UPDATE_GOLDENS").is_some();
         Ok(Self {
-            container_mgr,
+            containers,
             update_goldens,
         })
     }
 
-    /// Get the WM type for this environment
-    pub fn wm_type(&self) -> TestWmType {
-        self.container_mgr.wm_type()
+    #[must_use]
+    pub fn i3mux(&self) -> I3mux<'_> {
+        I3mux::new(&self.containers)
     }
 
-    /// Get reference to i3mux runner
-    fn i3mux(&self) -> I3muxRunner<'_> {
-        I3muxRunner::new(&self.container_mgr)
-    }
+    // ------------------------------------------------------------ sway
 
-    /// Get reference to network manipulator
-    fn network(&self) -> NetworkManipulator<'_> {
-        NetworkManipulator::new(&self.container_mgr)
-    }
-
-    // ==================== i3mux Operations ====================
-
-    /// Activate i3mux for a workspace
-    pub fn i3mux_activate(&self, session: Session, workspace: &str) -> Result<()> {
-        self.i3mux().activate(&session, workspace)
-    }
-
-    /// Detach current session
-    pub fn i3mux_detach(&self, name: &str) -> Result<()> {
-        self.i3mux().detach(name)
-    }
-
-    /// Attach to a session
-    pub fn i3mux_attach(&self, session: Session, name: &str) -> Result<()> {
-        self.i3mux().attach(&session, name, false)
-    }
-
-    /// Launch a terminal with colored background (used by network tests)
-    pub fn launch_terminal(&self, color: ColorScript) -> Result<u64> {
-        self.i3mux().launch_terminal(&color)
-    }
-
-    /// Launch a terminal running a command (WM-agnostic)
-    /// Used for tests that need to spawn non-i3mux terminals
-    pub fn launch_terminal_with_command(&self, command: &str) -> Result<()> {
-        let (terminal_cmd, env_prefix) = match self.container_mgr.wm_type() {
-            TestWmType::I3 => ("xterm -e", "DISPLAY=:99"),
-            TestWmType::Sway => ("foot", "source /tmp/sway-env.sh &&"),
-        };
-
-        let cmd = format!(
-            "{} {} 'exec --no-startup-id {} {}'",
-            env_prefix,
-            match self.container_mgr.wm_type() {
-                TestWmType::I3 => "i3-msg",
-                TestWmType::Sway => "swaymsg",
-            },
-            terminal_cmd,
-            command
-        );
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
+    /// Run one Sway command.
+    pub fn sway(&self, command: &str) -> Result<()> {
+        let output = self.containers.exec_in_sway(&format!(
+            "source /tmp/sway-env.sh && swaymsg -- {}",
+            shell_words::quote(command)
+        ))?;
         if !output.status.success() {
-            anyhow::bail!(
-                "Failed to launch terminal: {}",
-                String::from_utf8_lossy(&output.stderr)
+            bail!(
+                "swaymsg {command:?} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-
         Ok(())
     }
 
-    // ==================== Window Manager Operations ====================
-
-    /// Get the WM-specific message command prefix
-    fn wm_cmd_prefix(&self) -> &'static str {
-        match self.container_mgr.wm_type() {
-            TestWmType::I3 => "DISPLAY=:99 i3-msg",
-            TestWmType::Sway => "source /tmp/sway-env.sh && swaymsg",
-        }
+    /// Focus (and create) workspace `number`.
+    pub fn focus_workspace(&self, number: u32) -> Result<()> {
+        self.sway(&format!("workspace {number}"))
     }
 
-    /// Execute a WM command (i3-msg or swaymsg)
-    pub fn wm_exec(&self, cmd: &str) -> Result<()> {
-        let full_cmd = format!("{} '{}'", self.wm_cmd_prefix(), cmd);
-        let output = self.container_mgr.exec_in_wm(&full_cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "WM command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
+    /// Focus workspace `number`, then `i3mux activate` it for `session`.
+    pub fn activate(&self, session: Session, number: u32) -> Result<()> {
+        self.focus_workspace(number)?;
+        self.i3mux().activate(session)?;
         Ok(())
     }
 
-    /// Execute an i3 command (alias for wm_exec for backward compatibility)
-    pub fn i3_exec(&self, cmd: &str) -> Result<()> {
-        self.wm_exec(cmd)
+    fn tree(&self) -> Result<Value> {
+        let output = self
+            .containers
+            .exec_in_sway("source /tmp/sway-env.sh && swaymsg -t get_tree")?;
+        if !output.status.success() {
+            bail!("swaymsg -t get_tree failed");
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    /// Check if workspace is empty
-    pub fn is_workspace_empty(&self, workspace: &str) -> Result<bool> {
-        let cmd = format!(
-            "{} -t get_tree | grep -q 'workspace \"{}\"' && echo found || echo empty",
-            self.wm_cmd_prefix(),
-            workspace
-        );
-
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-        let result = String::from_utf8_lossy(&output.stdout);
-
-        Ok(result.contains("empty"))
+    /// The windows (views) of workspace `number`, as `(app_id, marks)`.
+    pub fn windows(&self, number: u32) -> Result<Vec<(String, Vec<String>)>> {
+        let tree = self.tree()?;
+        let name = number.to_string();
+        let mut out = Vec::new();
+        if let Some(workspace) = find_node(&tree, &|n| {
+            n["type"] == "workspace" && n["name"].as_str() == Some(name.as_str())
+        }) {
+            collect_views(workspace, &mut out);
+        }
+        Ok(out)
     }
 
-    /// Get list of container IDs in current workspace
-    /// Note: For Sway we use container IDs; for i3 we traditionally used X11 window IDs
-    /// but con_id works for both, so we use container IDs universally now
-    pub fn get_workspace_windows(&self) -> Result<Vec<u64>> {
-        // Get focused workspace number first
-        let ws_cmd = format!(
-            "{} -t get_workspaces | jq -r '.[] | select(.focused==true) | .num'",
-            self.wm_cmd_prefix()
-        );
-        let ws_output = self.container_mgr.exec_in_wm(&ws_cmd)?;
+    /// Wait until workspace `number` has `count` windows. Sway closes
+    /// windows asynchronously, and `detach` and `kill` do not wait for it.
+    pub fn wait_for_window_count(&self, number: u32, count: usize) -> Result<()> {
+        wait_until(&format!("workspace {number} has {count} windows"), || {
+            Ok(self.windows(number)?.len() == count)
+        })
+    }
 
-        let ws_num = String::from_utf8_lossy(&ws_output.stdout)
-            .trim()
-            .parse::<i32>()
-            .context("Failed to get focused workspace number")?;
-
-        // Get container IDs in that workspace
-        // Use 'id' field which is the container ID (works for both i3 and Sway)
-        let tree_cmd = format!(
-            r#"{} -t get_tree | jq -r '.. | select(.type? == "workspace" and .num? == {}) | .. | select(.id? != null and (.app_id? != null or .window_properties? != null)) | .id'"#,
-            self.wm_cmd_prefix(),
-            ws_num
-        );
-        let output = self.container_mgr.exec_in_wm(&tree_cmd)?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let windows: Vec<u64> = stdout
-            .lines()
-            .filter_map(|line| line.trim().parse().ok())
+    /// The i3mux marks on workspace `number`, sorted.
+    pub fn marks(&self, number: u32) -> Result<Vec<String>> {
+        let mut marks: Vec<String> = self
+            .windows(number)?
+            .into_iter()
+            .flat_map(|(_, marks)| marks)
+            .filter(|m| m.starts_with("_i3mux:"))
             .collect();
-
-        Ok(windows)
+        marks.sort();
+        Ok(marks)
     }
 
-    pub fn get_window_info(&self, container_id: u64) -> Result<String> {
+    /// Close the window with `mark` the way a user does.
+    pub fn close_window(&self, mark: &str) -> Result<()> {
+        self.sway(&format!("[con_mark=\"^{mark}$\"] kill"))
+    }
+
+    /// Start a plain (non-i3mux) foot window on the focused workspace.
+    pub fn launch_plain_terminal(&self, number: u32, command: &str) -> Result<()> {
+        let before = self.windows(number)?.len();
+        self.sway(&format!("exec env LANG=C.UTF-8 foot {command}"))?;
+        wait_until("the plain terminal appears", || {
+            Ok(self.windows(number)?.len() > before)
+        })
+    }
+
+    // ------------------------------------------------------------ hosts
+
+    /// The shells of the i3mux shpool daemon on `session`'s host.
+    pub fn shells(&self, session: Session) -> Result<Vec<HostShell>> {
         let cmd = format!(
-            r#"{} -t get_tree | jq -r '.. | select(.id? == {}) | {{name: .name, marks: .marks, app_id: .app_id}}'"#,
-            self.wm_cmd_prefix(),
-            container_id
+            "shpool --socket {}/.local/run/i3mux/shpool.socket list --json",
+            session.home()
         );
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let output = self.exec_on_host(session, &cmd)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            if stderr.contains("could not connect to daemon") {
+                return Ok(Vec::new());
+            }
+            bail!("shpool list failed: {stderr}");
+        }
+        let json: Value = serde_json::from_slice(&output.stdout)?;
+        let mut shells: Vec<HostShell> = json["sessions"]
+            .as_array()
+            .context("shpool list --json has no sessions array")?
+            .iter()
+            .map(|s| HostShell {
+                name: s["name"].as_str().unwrap_or_default().to_owned(),
+                attached: s["status"] != "Disconnected",
+                pid: s["shell_pid"].as_u64().unwrap_or_default(),
+            })
+            .collect();
+        shells.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(shells)
     }
 
-    /// Launch an i3mux terminal and wait for it to appear
-    pub fn launch_i3mux_terminal(&self) -> Result<()> {
-        // Get window count before launch
-        let before = self.get_workspace_windows()?.len();
-
-        // Set up appropriate terminal and env vars based on WM type
-        let (terminal, env_prefix, msg_cmd) = match self.container_mgr.wm_type() {
-            TestWmType::I3 => ("xterm", "DISPLAY=:99", "i3-msg"),
-            TestWmType::Sway => ("foot", "source /tmp/sway-env.sh &&", "swaymsg"),
-        };
-
-        // Launch via WM exec so WM spawns the process
-        let launch_cmd = format!(
-            "{} {} 'exec --no-startup-id TERMINAL={} i3mux terminal 2>>/tmp/i3mux-debug.log'",
-            env_prefix,
-            msg_cmd,
-            terminal
+    /// End shell `name` on `session`'s host, as a reboot would.
+    pub fn kill_host_shell(&self, session: Session, name: &str) -> Result<()> {
+        let cmd = format!(
+            "shpool --socket {}/.local/run/i3mux/shpool.socket kill {name}",
+            session.home()
         );
-        let output = self.container_mgr.exec_in_wm(&launch_cmd)?;
-
+        let output = self.exec_on_host(session, &cmd)?;
         if !output.status.success() {
-            anyhow::bail!(
-                "Failed to launch i3mux terminal: {}",
+            bail!(
+                "shpool kill {name} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-
-        // Wait for window to appear (SSH connections can be slow)
-        for _ in 0..50 {  // Up to 5 seconds
-            std::thread::sleep(Duration::from_millis(100));
-            let after = self.get_workspace_windows()?.len();
-            if after > before {
-                // Window appeared - now wait for i3mux to finish marking
-                // This is critical: i3mux needs time to mark the window
-                std::thread::sleep(Duration::from_millis(2500));
-
-                // Verify marking succeeded
-                let windows = self.get_workspace_windows()?;
-                if let Some(new_window) = windows.get(windows.len() - 1) {
-                    let info = self.get_window_info(*new_window)?;
-                    println!("New window {} info after launch: {}", new_window, info);
-                }
-
-                return Ok(());
-            }
-        }
-
-        anyhow::bail!("i3mux terminal window did not appear within timeout")
-    }
-
-    // ==================== Screenshot Operations ====================
-
-    /// Capture a screenshot of the display (Xephyr for i3, headless for Sway)
-    pub fn capture_screenshot(&self) -> Result<RgbaImage> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis();
-
-        let screenshot_path = format!("/tmp/screenshots/test-{}.png", timestamp);
-
-        // Ensure screenshots directory exists
-        self.container_mgr.exec_in_wm("mkdir -p /tmp/screenshots")?;
-
-        // Capture screenshot using appropriate tool
-        let cmd = match self.container_mgr.wm_type() {
-            TestWmType::I3 => format!("DISPLAY=:99 scrot -o {}", screenshot_path),
-            TestWmType::Sway => format!(
-                "source /tmp/sway-env.sh && grim {}",
-                screenshot_path
-            ),
-        };
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Screenshot capture failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Copy screenshot to host
-        let host_path = format!(
-            "{}/tests/screenshots/temp-{}.png",
-            env!("CARGO_MANIFEST_DIR"),
-            timestamp
-        );
-
-        // Ensure host screenshots directory exists
-        std::fs::create_dir_all(format!("{}/tests/screenshots", env!("CARGO_MANIFEST_DIR")))?;
-
-        self.container_mgr.copy_from_wm(&screenshot_path, &host_path)?;
-
-        // Load and return image
-        let img = image::open(&host_path)
-            .context("Failed to open screenshot")?
-            .to_rgba8();
-
-        // Clean up temporary file
-        let _ = std::fs::remove_file(&host_path);
-
-        Ok(img)
-    }
-
-    /// Get the WM-specific golden image subdirectory
-    fn golden_subdir(&self) -> &'static str {
-        match self.container_mgr.wm_type() {
-            TestWmType::I3 => "i3",
-            TestWmType::Sway => "sway",
-        }
-    }
-
-    /// Compare screenshot with golden image
-    pub fn compare_with_golden(
-        &self,
-        golden_name: &str,
-        actual: &RgbaImage,
-        spec: &ComparisonSpec,
-    ) -> Result<()> {
-        // Use WM-specific golden image path
-        let golden_subpath = format!("{}/{}", self.golden_subdir(), golden_name);
-
-        if self.update_goldens {
-            // Save as golden image in WM-specific subdirectory
-            let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/integration/golden")
-                .join(&golden_subpath);
-
-            if let Some(parent) = golden_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            actual.save(&golden_path)?;
-            println!("  ✓ Updated golden image: {}", golden_subpath);
-            return Ok(());
-        }
-
-        // Normal comparison mode - load from WM-specific subdirectory
-        let golden = load_golden_image(&golden_subpath)?;
-
-        let result = compare_screenshots(&golden, actual, spec)?;
-
-        if !result.passed {
-            let test_name = std::thread::current().name().unwrap_or("unknown").to_string();
-            let failure_dir = save_comparison_failure(&test_name, &golden, actual, &result)?;
-
-            anyhow::bail!(
-                "Screenshot comparison failed!\n\
-                 Diff pixels: {} ({:.2}%)\n\
-                 Artifacts saved to: {}",
-                result.total_diff_pixels,
-                result.diff_percentage,
-                failure_dir.display()
-            );
-        }
-
         Ok(())
     }
 
-    /// Focus the next tab/window in a tabbed container (horizontal cycling)
-    pub fn focus_next_tab(&self) -> Result<()> {
-        self.i3_exec("focus right")
+    /// The shell `name` on `session`'s host, if it is alive.
+    pub fn shell(&self, session: Session, name: &str) -> Result<Option<HostShell>> {
+        Ok(self.shells(session)?.into_iter().find(|s| s.name == name))
     }
 
-    /// Focus the previous tab/window in a tabbed container (horizontal cycling)
-    pub fn focus_prev_tab(&self) -> Result<()> {
-        self.i3_exec("focus left")
+    /// Wait until no shell on `session`'s host has a client. A window closed
+    /// by hand keeps its client for a moment (`i3mux detach` waits for its
+    /// own windows itself).
+    pub fn wait_until_all_disconnected(&self, session: Session) -> Result<()> {
+        wait_until("every shell is disconnected", || {
+            Ok(self.shells(session)?.iter().all(|s| !s.attached))
+        })
     }
 
-    /// Focus the next window in a stacked container (vertical cycling)
-    pub fn focus_next_stack(&self) -> Result<()> {
-        self.i3_exec("focus down")
+    /// The content of `~/{path}` on `session`'s host, if it exists.
+    pub fn host_file(&self, session: Session, path: &str) -> Result<Option<String>> {
+        let full = format!("{}/{path}", session.home());
+        let output =
+            self.exec_on_host(session, &format!("cat -- {}", shell_words::quote(&full)))?;
+        Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
     }
 
-    /// Focus the previous window in a stacked container (vertical cycling)
-    pub fn focus_prev_stack(&self) -> Result<()> {
-        self.i3_exec("focus up")
+    /// Write `content` to `~/{path}` on `session`'s host.
+    pub fn write_host_file(&self, session: Session, path: &str, content: &str) -> Result<()> {
+        let full = format!("{}/{path}", session.home());
+        let cmd = format!(
+            "printf '%s' {} > {}",
+            shell_words::quote(content),
+            shell_words::quote(&full)
+        );
+        let output = self.exec_on_host(session, &cmd)?;
+        if !output.status.success() {
+            bail!("cannot write {full}");
+        }
+        Ok(())
     }
 
-    /// Capture multiple screenshots by cycling through tabs/stacks
-    /// This navigates through all visible containers using focus commands
-    /// and captures a screenshot at each position.
-    ///
-    /// `count` - number of screenshots to take (should match number of tabs/stack items)
-    /// `direction` - "next" to cycle right/down, "prev" to cycle left/up
-    pub fn capture_multi_screenshots(&self, count: usize, direction: &str) -> Result<Vec<RgbaImage>> {
-        let mut screenshots = Vec::with_capacity(count);
+    /// Delete `~/{path}` on `session`'s host.
+    pub fn remove_host_file(&self, session: Session, path: &str) -> Result<()> {
+        let full = format!("{}/{path}", session.home());
+        let output = self.exec_on_host(session, &format!("rm -- {}", shell_words::quote(&full)))?;
+        if !output.status.success() {
+            bail!("cannot remove {full}");
+        }
+        Ok(())
+    }
 
+    /// Attach shell `name` from a second client on its host, in a pty of
+    /// 24x80 (shpool's client exits at once on a 0x0 pty), and wait until
+    /// shpool reports it attached.
+    pub fn attach_second_client(&self, session: Session, name: &str) -> Result<()> {
+        let attach = format!(
+            "stty rows 24 cols 80; exec shpool --socket {}/.local/run/i3mux/shpool.socket attach {name}",
+            session.home()
+        );
+        // script's stdin must stay open: at EOF it hangs up the shell.
+        let cmd = format!(
+            "sleep 100000 | TERM=xterm-256color script -qfc {} /dev/null > /tmp/second-client.log 2>&1",
+            shell_words::quote(&attach)
+        );
+        self.containers
+            .spawn_detached(session == Session::Remote, &cmd)?;
+        wait_until("the second client is attached", || {
+            Ok(self.shell(session, name)?.is_some_and(|s| s.attached))
+        })
+    }
+
+    /// Whether the second client started by [`Self::attach_second_client`]
+    /// still runs.
+    pub fn second_client_running(&self, session: Session) -> Result<bool> {
+        let output = self.exec_on_host(session, "pgrep -f '^script -qfc'")?;
+        Ok(output.status.success())
+    }
+
+    fn exec_on_host(&self, session: Session, cmd: &str) -> Result<std::process::Output> {
+        match session {
+            Session::Local => self.containers.exec_in_sway(cmd),
+            Session::Remote => self.containers.exec_in_remote(cmd),
+        }
+    }
+
+    // ------------------------------------------------------------ waiting
+
+    // ------------------------------------------------------------ spec actions
+
+    /// Run one spec action (`msg ...`, `launch_terminal [COLOR]`) in the
+    /// Sway container. Both scripts are in `tests/docker/scripts`.
+    pub fn exec_action(&self, action: &str) -> Result<()> {
+        let output = self.containers.exec_in_sway(&format!(
+            "source /tmp/sway-env.sh && export TERMINAL=foot LANG=C.UTF-8 && {action}"
+        ))?;
+        if !output.status.success() {
+            bail!(
+                "action {action:?} failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+        Ok(())
+    }
+
+    pub fn exec_actions(&self, actions: &[String]) -> Result<()> {
+        actions.iter().try_for_each(|a| self.exec_action(a))
+    }
+
+    /// `launch_terminal COLOR`: an i3mux terminal filled with one color.
+    pub fn launch_color(&self, color: &str) -> Result<()> {
+        self.exec_action(&format!("launch_terminal {color}"))
+    }
+
+    // ------------------------------------------------------------ screenshots
+
+    fn capture(&self) -> Result<RgbaImage> {
+        let path = "/tmp/screenshots/shot.png";
+        let output = self.containers.exec_in_sway(&format!(
+            "mkdir -p /tmp/screenshots && source /tmp/sway-env.sh && grim {path}"
+        ))?;
+        if !output.status.success() {
+            bail!("grim failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        let dir = tempfile::tempdir()?;
+        let local = dir.path().join("shot.png");
+        self.containers.copy_from_sway(path, &local)?;
+        Ok(image::open(&local)
+            .context("cannot decode the screenshot")?
+            .to_rgba8())
+    }
+
+    /// A screenshot taken once two captures in a row are identical, so
+    /// terminals that are still drawing (ssh, replay) do not race the test.
+    pub fn capture_screenshot(&self) -> Result<RgbaImage> {
+        let deadline = Instant::now() + WAIT;
+        let mut previous = self.capture()?;
+        loop {
+            thread::sleep(Duration::from_millis(400));
+            let current = self.capture()?;
+            if current == previous || Instant::now() > deadline {
+                return Ok(current);
+            }
+            previous = current;
+        }
+    }
+
+    /// Focus each of `count` tabs or stack entries in turn with
+    /// `focus {direction}` and capture each.
+    pub fn capture_each(&self, count: usize, direction: &str) -> Result<Vec<RgbaImage>> {
+        let mut shots = Vec::with_capacity(count);
         for i in 0..count {
-            // Capture current screenshot
-            let screenshot = self.capture_screenshot()?;
-            screenshots.push(screenshot);
-
-            // Navigate to next tab/stack (except for last one)
-            if i < count - 1 {
-                std::thread::sleep(Duration::from_millis(100));
-                if direction == "next" {
-                    self.focus_next_tab()?;
-                } else {
-                    self.focus_prev_tab()?;
-                }
-                std::thread::sleep(Duration::from_millis(300)); // Wait for focus change to render
+            if i > 0 {
+                self.sway(&format!("focus {direction}"))?;
             }
+            shots.push(self.capture_screenshot()?);
         }
-
-        Ok(screenshots)
+        Ok(shots)
     }
 
-    /// Compare multiple screenshots with corresponding golden images
-    /// Golden images are named with suffix like "base-name-1.png", "base-name-2.png", etc.
-    pub fn compare_multi_with_golden(
-        &self,
-        golden_base_name: &str,
-        screenshots: &[RgbaImage],
-        spec: &ComparisonSpec,
-    ) -> Result<()> {
-        for (i, screenshot) in screenshots.iter().enumerate() {
-            let golden_name = format!("{}-{}.png", golden_base_name, i + 1);
-            self.compare_with_golden(&golden_name, screenshot, spec)?;
-        }
-        Ok(())
-    }
-
-    /// Wait for SSH connection to establish
-    pub fn wait_for_ssh_connection(&self, _window_id: u64, timeout: Duration) -> Result<()> {
-        std::thread::sleep(timeout);
-        Ok(())
-    }
-
-    // ==================== Network Manipulation ====================
-
-    /// Inject network latency
-    pub fn inject_latency(&self, ms: u32, jitter_ms: u32) -> Result<()> {
-        self.network().inject_latency(ms, jitter_ms)
-    }
-
-    /// Inject packet loss
-    pub fn inject_packet_loss(&self, percentage: u32) -> Result<()> {
-        self.network().inject_packet_loss(percentage)
-    }
-
-    /// Clear all network manipulation rules
-    pub fn clear_network_rules(&self) -> Result<()> {
-        self.network().clear_all_rules()
-    }
-
-    // ==================== Spec Action Execution ====================
-
-    /// Execute an action from a spec (e.g., "msg 'split h'", "launch_terminal")
-    /// Actions use WM-agnostic scripts: msg, launch_terminal
-    pub fn exec_action(&self, action: &str) -> Result<()> {
-        let env_prefix = match self.container_mgr.wm_type() {
-            TestWmType::I3 => "DISPLAY=:99",
-            TestWmType::Sway => "source /tmp/sway-env.sh &&",
-        };
-
-        let cmd = format!("{} {}", env_prefix, action);
-        let output = self.container_mgr.exec_in_wm(&cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Action '{}' failed:\nstdout: {}\nstderr: {}",
-                action,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Wait for action to take effect
-        if action.contains("launch_terminal") {
-            std::thread::sleep(Duration::from_secs(3));
-        } else {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-
-        Ok(())
-    }
-
-    /// Execute a list of actions from a spec
-    pub fn exec_actions(&self, actions: &[String]) -> Result<()> {
-        for action in actions {
-            self.exec_action(action)?;
-        }
-        Ok(())
-    }
-
-    // ==================== Debug Helpers ====================
-
-    /// Read i3mux debug log from container
-    pub fn read_debug_log(&self) -> Result<String> {
-        let output = self.container_mgr.exec_in_wm("cat /tmp/i3mux-debug.log 2>/dev/null || echo 'No debug log'")?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-
-    // ==================== Cleanup ====================
-
-    /// Clean up workspace (kill all windows, reset state)
-    pub fn cleanup_workspace(&self, workspace: &str) -> Result<()> {
-        // Switch to workspace
-        self.i3_exec(&format!("workspace {}", workspace))?;
-
-        // Kill all windows in workspace
-        let windows = self.get_workspace_windows()?;
-        for _ in windows {
-            let _ = self.i3_exec("kill");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
-        // Clear network rules
-        let _ = self.clear_network_rules();
-
-        Ok(())
-    }
-}
-
-/// Dual test environment for cross-WM testing
-/// Wraps DualContainerManager and provides access to both i3 and Sway environments
-pub struct DualTestEnvironment {
-    container_mgr: Arc<DualContainerManager>,
-    update_goldens: bool,
-}
-
-impl DualTestEnvironment {
-    /// Create a new dual test environment with both i3 and Sway containers
-    pub fn new() -> Result<Self> {
-        println!("\n=== Creating dual WM test environment ===");
-
-        let container_mgr = Arc::new(DualContainerManager::new()
-            .context("Failed to create dual container manager")?);
-
-        println!("=== Waiting for services to be ready ===");
-        container_mgr.wait_for_wm_ready(TestWmType::I3, 30)?;
-        container_mgr.wait_for_wm_ready(TestWmType::Sway, 30)?;
-        container_mgr.wait_for_ssh_ready(30)?;
-        println!("=== Dual WM test environment ready ===\n");
-
-        let update_goldens = std::env::var("UPDATE_GOLDENS").is_ok();
-        if update_goldens {
-            println!("NOTE: Running in golden update mode");
-        }
-
-        Ok(Self {
-            container_mgr,
-            update_goldens,
-        })
-    }
-
-    /// Get a WM-specific environment view for the given WM type
-    pub fn for_wm(&self, wm_type: TestWmType) -> WmEnvironment<'_> {
-        WmEnvironment {
-            container_mgr: &self.container_mgr,
-            wm_type,
-            update_goldens: self.update_goldens,
-        }
-    }
-}
-
-/// WM-specific environment view within a dual environment
-/// This provides the same interface as TestEnvironment but for a specific WM
-pub struct WmEnvironment<'a> {
-    container_mgr: &'a DualContainerManager,
-    wm_type: TestWmType,
-    update_goldens: bool,
-}
-
-impl<'a> WmEnvironment<'a> {
-    /// Get the WM type for this environment
-    pub fn wm_type(&self) -> TestWmType {
-        self.wm_type
-    }
-
-    /// Get the WM-specific message command prefix
-    fn wm_cmd_prefix(&self) -> &'static str {
-        match self.wm_type {
-            TestWmType::I3 => "DISPLAY=:99 i3-msg",
-            TestWmType::Sway => "source /tmp/sway-env.sh && swaymsg",
-        }
-    }
-
-    /// Execute a WM command
-    pub fn wm_exec(&self, cmd: &str) -> Result<()> {
-        let full_cmd = format!("{} '{}'", self.wm_cmd_prefix(), cmd);
-        let output = self.container_mgr.exec_in_wm(self.wm_type, &full_cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "WM command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(())
-    }
-
-    /// Execute an i3/sway command (alias for wm_exec)
-    pub fn i3_exec(&self, cmd: &str) -> Result<()> {
-        self.wm_exec(cmd)
-    }
-
-    /// Get workspace windows
-    pub fn get_workspace_windows(&self) -> Result<Vec<u64>> {
-        let ws_cmd = format!(
-            "{} -t get_workspaces | jq -r '.[] | select(.focused==true) | .num'",
-            self.wm_cmd_prefix()
-        );
-        let ws_output = self.container_mgr.exec_in_wm(self.wm_type, &ws_cmd)?;
-
-        let ws_num = String::from_utf8_lossy(&ws_output.stdout)
-            .trim()
-            .parse::<i32>()
-            .context("Failed to get focused workspace number")?;
-
-        let tree_cmd = format!(
-            r#"{} -t get_tree | jq -r '.. | select(.type? == "workspace" and .num? == {}) | .. | select(.id? != null and (.app_id? != null or .window_properties? != null)) | .id'"#,
-            self.wm_cmd_prefix(),
-            ws_num
-        );
-        let output = self.container_mgr.exec_in_wm(self.wm_type, &tree_cmd)?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let windows: Vec<u64> = stdout
-            .lines()
-            .filter_map(|line| line.trim().parse().ok())
-            .collect();
-
-        Ok(windows)
-    }
-
-    /// Activate i3mux session
-    pub fn i3mux_activate(&self, session: Session, _workspace: &str) -> Result<()> {
-        let (session_arg, env_prefix) = match (&session, self.wm_type) {
-            (Session::Local, TestWmType::I3) => ("".to_string(), "DISPLAY=:99 TERMINAL=xterm"),
-            (Session::Local, TestWmType::Sway) => ("".to_string(), "source /tmp/sway-env.sh && TERMINAL=foot"),
-            (Session::Remote(host), TestWmType::I3) => (format!(" --remote {}", host), "DISPLAY=:99 TERMINAL=xterm"),
-            (Session::Remote(host), TestWmType::Sway) => (format!(" --remote {}", host), "source /tmp/sway-env.sh && TERMINAL=foot"),
-        };
-
-        let cmd = format!(
-            "{} i3mux activate{} 2>>/tmp/i3mux-debug.log",
-            env_prefix, session_arg
-        );
-        let output = self.container_mgr.exec_in_wm(self.wm_type, &cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux activate failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(())
-    }
-
-    /// Detach session
-    pub fn i3mux_detach(&self, name: &str) -> Result<()> {
-        let env_prefix = match self.wm_type {
-            TestWmType::I3 => "DISPLAY=:99",
-            TestWmType::Sway => "source /tmp/sway-env.sh &&",
-        };
-
-        let cmd = format!("{} i3mux detach --session {} 2>>/tmp/i3mux-debug.log", env_prefix, name);
-        let output = self.container_mgr.exec_in_wm(self.wm_type, &cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux detach failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(())
-    }
-
-    /// Attach to session
-    pub fn i3mux_attach(&self, session: Session, name: &str) -> Result<()> {
-        let (session_arg, env_prefix) = match (&session, self.wm_type) {
-            (Session::Local, TestWmType::I3) => ("".to_string(), "DISPLAY=:99 TERMINAL=xterm"),
-            (Session::Local, TestWmType::Sway) => ("".to_string(), "source /tmp/sway-env.sh && TERMINAL=foot"),
-            (Session::Remote(host), TestWmType::I3) => (format!(" --remote {}", host), "DISPLAY=:99 TERMINAL=xterm"),
-            (Session::Remote(host), TestWmType::Sway) => (format!(" --remote {}", host), "source /tmp/sway-env.sh && TERMINAL=foot"),
-        };
-
-        let cmd = format!(
-            "{} i3mux attach{} --session {} 2>>/tmp/i3mux-debug.log",
-            env_prefix, session_arg, name
-        );
-        let output = self.container_mgr.exec_in_wm(self.wm_type, &cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "i3mux attach failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(())
-    }
-
-    /// Execute spec action
-    pub fn exec_action(&self, action: &str) -> Result<()> {
-        let env_prefix = match self.wm_type {
-            TestWmType::I3 => "DISPLAY=:99",
-            TestWmType::Sway => "source /tmp/sway-env.sh &&",
-        };
-
-        let cmd = format!("{} {}", env_prefix, action);
-        let output = self.container_mgr.exec_in_wm(self.wm_type, &cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Action '{}' failed: {}",
-                action,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        if action.contains("launch_terminal") {
-            std::thread::sleep(Duration::from_secs(3));
-        } else {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-
-        Ok(())
-    }
-
-    /// Execute list of spec actions
-    pub fn exec_actions(&self, actions: &[String]) -> Result<()> {
-        for action in actions {
-            self.exec_action(action)?;
-        }
-        Ok(())
-    }
-
-    /// Capture screenshot
-    pub fn capture_screenshot(&self) -> Result<RgbaImage> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis();
-
-        let screenshot_path = format!("/tmp/screenshots/test-{}.png", timestamp);
-        self.container_mgr.exec_in_wm(self.wm_type, "mkdir -p /tmp/screenshots")?;
-
-        let cmd = match self.wm_type {
-            TestWmType::I3 => format!("DISPLAY=:99 scrot -o {}", screenshot_path),
-            TestWmType::Sway => format!("source /tmp/sway-env.sh && grim {}", screenshot_path),
-        };
-        let output = self.container_mgr.exec_in_wm(self.wm_type, &cmd)?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "Screenshot capture failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let host_path = format!(
-            "{}/tests/screenshots/temp-{}.png",
-            env!("CARGO_MANIFEST_DIR"),
-            timestamp
-        );
-        std::fs::create_dir_all(format!("{}/tests/screenshots", env!("CARGO_MANIFEST_DIR")))?;
-
-        self.container_mgr.copy_from_wm(self.wm_type, &screenshot_path, &host_path)?;
-
-        let img = image::open(&host_path)
-            .context("Failed to open screenshot")?
-            .to_rgba8();
-
-        let _ = std::fs::remove_file(&host_path);
-        Ok(img)
-    }
-
-    fn golden_subdir(&self) -> &'static str {
-        match self.wm_type {
-            TestWmType::I3 => "i3",
-            TestWmType::Sway => "sway",
-        }
-    }
-
-    /// Compare with golden image
+    /// Compare `actual` with golden `name`, or replace the golden when
+    /// `UPDATE_GOLDENS` is set.
     pub fn compare_with_golden(
         &self,
-        golden_name: &str,
+        name: &str,
         actual: &RgbaImage,
         spec: &ComparisonSpec,
     ) -> Result<()> {
-        let golden_subpath = format!("{}/{}", self.golden_subdir(), golden_name);
-
+        let subpath = format!("{GOLDEN_DIR}/{name}");
         if self.update_goldens {
-            let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/integration/golden")
-                .join(&golden_subpath);
-
-            if let Some(parent) = golden_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            actual.save(&golden_path)?;
-            println!("  ✓ Updated golden image: {}", golden_subpath);
+                .join(&subpath);
+            actual.save(&path)?;
+            println!("  updated golden {subpath}");
             return Ok(());
         }
-
-        let golden = load_golden_image(&golden_subpath)?;
+        let golden = load_golden_image(&subpath)?;
         let result = compare_screenshots(&golden, actual, spec)?;
-
         if !result.passed {
-            let test_name = std::thread::current().name().unwrap_or("unknown").to_string();
-            let failure_dir = save_comparison_failure(&test_name, &golden, actual, &result)?;
-
-            anyhow::bail!(
-                "Screenshot comparison failed!\n\
-                 Diff pixels: {} ({:.2}%)\n\
-                 Artifacts saved to: {}",
+            let test = thread::current().name().unwrap_or("unknown").to_owned();
+            let dir = save_comparison_failure(&test, &golden, actual, &result)?;
+            bail!(
+                "screenshot differs from golden {subpath}: {} pixels ({:.2}%); artifacts in {}",
                 result.total_diff_pixels,
                 result.diff_percentage,
-                failure_dir.display()
+                dir.display()
             );
         }
-
         Ok(())
     }
 
-    /// Cleanup workspace
-    pub fn cleanup_workspace(&self, workspace: &str) -> Result<()> {
-        self.i3_exec(&format!("workspace {}", workspace))?;
-
-        let windows = self.get_workspace_windows()?;
-        for _ in windows {
-            let _ = self.i3_exec("kill");
-            std::thread::sleep(Duration::from_millis(100));
+    /// Compare shots with goldens `{base}-1.png`, `{base}-2.png`, ...
+    pub fn compare_each_with_golden(
+        &self,
+        base: &str,
+        shots: &[RgbaImage],
+        spec: &ComparisonSpec,
+    ) -> Result<()> {
+        for (i, shot) in shots.iter().enumerate() {
+            self.compare_with_golden(&format!("{base}-{}.png", i + 1), shot, spec)?;
         }
-
         Ok(())
+    }
+}
+
+/// Poll `check` until it holds, for up to [`WAIT`].
+pub fn wait_until(what: &str, mut check: impl FnMut() -> Result<bool>) -> Result<()> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if check()? {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("timed out after {WAIT:?} waiting until {what}");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Compare two screenshots of one run (no golden involved), with the
+/// thresholds of `spec`. Saves the usual artifacts on failure.
+pub fn assert_same_screen(
+    expected: &RgbaImage,
+    actual: &RgbaImage,
+    spec: &ComparisonSpec,
+) -> Result<()> {
+    let result = compare_screenshots(expected, actual, spec)?;
+    if !result.passed {
+        let test = thread::current().name().unwrap_or("unknown").to_owned();
+        let dir = save_comparison_failure(&test, expected, actual, &result)?;
+        bail!(
+            "screen differs from the earlier capture: {} pixels ({:.2}%); artifacts in {}",
+            result.total_diff_pixels,
+            result.diff_percentage,
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn find_node<'t>(node: &'t Value, pred: &dyn Fn(&Value) -> bool) -> Option<&'t Value> {
+    if pred(node) {
+        return Some(node);
+    }
+    ["nodes", "floating_nodes"]
+        .iter()
+        .filter_map(|key| node[*key].as_array())
+        .flatten()
+        .find_map(|child| find_node(child, pred))
+}
+
+fn collect_views(node: &Value, out: &mut Vec<(String, Vec<String>)>) {
+    if let Some(app_id) = node["app_id"].as_str() {
+        let marks = node["marks"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push((app_id.to_owned(), marks));
+    }
+    for key in ["nodes", "floating_nodes"] {
+        for child in node[key].as_array().into_iter().flatten() {
+            collect_views(child, out);
+        }
     }
 }

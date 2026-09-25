@@ -1,328 +1,351 @@
-//! I3mux window identification and management
+//! i3mux windows in the Sway tree.
 //!
-//! This module provides a single source of truth for identifying and managing
-//! i3mux-managed windows. It uses i3 marks as the primary identification mechanism,
-//! which is robust and fully under our control (unlike terminal-dependent approaches).
+//! A window is an i3mux window iff it carries a mark
+//! `_i3mux:{host}:{terminal}` (plan rule 2). The leading `_` hides the mark
+//! in title bars. The same text is the window's `app_id` at launch, so a new
+//! window can be found before it is marked.
 //!
-//! ## Mark Format
-//!
-//! i3mux windows are marked with: `_i3mux:{host}:{socket}`
-//!
-//! - The underscore prefix makes the mark hidden (not shown in title bar)
-//! - `host` is either "local" or the remote host identifier
-//! - `socket` is the abduco socket name (e.g., "ws1-001")
-//!
-//! ## Example
-//!
-//! ```text
-//! _i3mux:local:ws1-001
-//! _i3mux:user@server:ws2-003
-//! ```
+//! Everything here is pure over `swaymsg -t get_tree` JSON: lookups, and the
+//! text of the mark and kill commands. `sway_ops` runs them. This module
+//! never imports `wm` (plan rule 8; `just check-boundaries`).
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use std::fmt;
 
-use crate::wm::WmBackend;
+use serde_json::Value;
 
-/// Prefix for hidden i3 marks (underscore = hidden from title bar)
-pub const MARK_PREFIX: &str = "_i3mux:";
+use crate::types::{Host, SessionName, TerminalName};
 
-/// Maximum attempts when waiting for a window to appear
-pub const WINDOW_WAIT_MAX_ATTEMPTS: u32 = 30;
+/// Prefix of every i3mux mark.
+const MARK_PREFIX: &str = "_i3mux:";
 
-/// Polling interval when waiting for a window (milliseconds)
-pub const WINDOW_WAIT_INTERVAL_MS: u64 = 100;
-
-/// Represents an i3mux-managed window's identity
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct I3muxWindow {
-    /// The i3 window ID
-    pub window_id: u64,
-    /// Host identifier ("local" or remote host like "user@server")
-    pub host: String,
-    /// Abduco socket name (e.g., "ws1-001")
-    pub socket: String,
+/// The identity of an i3mux window: which shell, on which host.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Mark {
+    host: Host,
+    terminal: TerminalName,
 }
 
-impl I3muxWindow {
-    /// Create a new I3muxWindow identity
-    pub fn new(window_id: u64, host: &str, socket: &str) -> Self {
-        Self {
-            window_id,
-            host: host.to_string(),
-            socket: socket.to_string(),
-        }
+impl Mark {
+    #[must_use]
+    pub fn new(host: Host, terminal: TerminalName) -> Self {
+        Self { host, terminal }
     }
 
-    /// Generate the i3 mark string for this window
-    pub fn mark(&self) -> String {
-        Self::mark_from_parts(&self.host, &self.socket)
-    }
-
-    /// Generate a mark/instance string from host and socket components
-    ///
-    /// The instance name and mark use the same format: `_i3mux:{host}:{socket}`
-    pub fn mark_from_parts(host: &str, socket: &str) -> String {
-        format!("{}{}:{}", MARK_PREFIX, host, socket)
-    }
-
-    /// Parse an i3mux identity from a mark string
-    ///
-    /// Returns None if the mark doesn't match the i3mux format
-    pub fn from_mark(mark: &str) -> Option<Self> {
-        if !mark.starts_with(MARK_PREFIX) {
-            return None;
-        }
-
-        let data = mark.trim_start_matches(MARK_PREFIX);
-        let parts: Vec<&str> = data.splitn(2, ':').collect();
-
-        if parts.len() != 2 {
-            return None;
-        }
-
+    /// Parse a mark written by `Display`; `None` for any other mark.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let (label, terminal) = text.strip_prefix(MARK_PREFIX)?.split_once(':')?;
         Some(Self {
-            window_id: 0, // Caller should fill this in
-            host: parts[0].to_string(),
-            socket: parts[1].to_string(),
+            host: Host::from_label(label).ok()?,
+            terminal: terminal.parse().ok()?,
         })
     }
 
-    /// Apply the i3mux mark to a window
-    ///
-    /// This should be called after the window appears to mark it as i3mux-managed.
-    /// Uses con_id selector which works for both i3 and Sway.
-    pub fn apply_mark(&self, backend: &WmBackend) -> Result<()> {
-        let mark = self.mark();
-        let cmd = format!("[con_id=\"{}\"] mark --add {}", self.window_id, mark);
-        backend.run_command(&cmd)?;
-        Ok(())
+    #[must_use]
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    #[must_use]
+    pub fn terminal(&self) -> &TerminalName {
+        &self.terminal
+    }
+
+    /// Whether this window shows a shell of `session` on `host`.
+    #[must_use]
+    pub fn belongs_to(&self, host: &Host, session: &SessionName) -> bool {
+        &self.host == host && self.terminal.session() == session
+    }
+
+    /// The `app_id` a terminal for this mark is launched with.
+    #[must_use]
+    pub fn app_id(&self) -> String {
+        self.to_string()
     }
 }
 
-/// Find a window by its instance name (WM_CLASS instance on X11, app_id on Wayland)
-///
-/// Searches the window manager tree for a window with the specified instance.
-/// Returns the container ID if found.
-pub fn find_window_by_instance(backend: &WmBackend, instance: &str) -> Option<u64> {
-    let tree = backend.get_tree().ok()?;
-    find_window_by_instance_in_tree(&tree, instance)
+impl fmt::Display for Mark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{MARK_PREFIX}{}:{}", self.host, self.terminal)
+    }
 }
 
-fn find_window_by_instance_in_tree(node: &serde_json::Value, target_instance: &str) -> Option<u64> {
-    // Get container ID - works for both i3 and Sway
-    // Sway uses "id" for container ID, i3 uses "id" as well (but also has "window" for X11 window ID)
-    let container_id = node.get("id").and_then(|w| w.as_u64());
-
-    // Check app_id first (Wayland/Sway)
-    if let Some(app_id) = node.get("app_id").and_then(|a| a.as_str()) {
-        if app_id == target_instance {
-            return container_id;
-        }
-    }
-
-    // Fall back to window_properties.instance (X11/i3)
-    if let Some(props) = node.get("window_properties") {
-        if let Some(instance) = props.get("instance").and_then(|i| i.as_str()) {
-            if instance == target_instance {
-                return container_id;
-            }
-        }
-    }
-
-    // Recurse into children
-    if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
-        for child in nodes {
-            if let Some(found) = find_window_by_instance_in_tree(child, target_instance) {
-                return Some(found);
-            }
-        }
-    }
-
-    if let Some(nodes) = node.get("floating_nodes").and_then(|n| n.as_array()) {
-        for child in nodes {
-            if let Some(found) = find_window_by_instance_in_tree(child, target_instance) {
-                return Some(found);
-            }
-        }
-    }
-
-    None
+/// Tiled children, then floating children.
+pub fn children(node: &Value) -> impl Iterator<Item = &Value> {
+    let tiled = node.get("nodes").and_then(Value::as_array);
+    let floating = node.get("floating_nodes").and_then(Value::as_array);
+    tiled.into_iter().chain(floating).flatten()
 }
 
-/// Wait for a window to appear by instance name, then apply i3mux mark
-///
-/// Polls until the window appears or max_attempts is reached.
-/// Returns the container ID on success.
-pub fn wait_for_window_and_mark(
-    backend: &WmBackend,
-    instance: &str,
-    host: &str,
-    socket: &str,
-) -> Result<u64> {
-    for attempt in 0..WINDOW_WAIT_MAX_ATTEMPTS {
-        std::thread::sleep(std::time::Duration::from_millis(WINDOW_WAIT_INTERVAL_MS));
+/// The i3mux mark of `node`, if it has one.
+#[must_use]
+pub fn node_mark(node: &Value) -> Option<Mark> {
+    node.get("marks")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(Mark::parse)
+}
 
-        if let Some(container_id) = find_window_by_instance(backend, instance) {
-            let i3mux_window = I3muxWindow::new(container_id, host, socket);
-            i3mux_window.apply_mark(backend)?;
-            return Ok(container_id);
-        }
+fn node_id(node: &Value) -> Option<u64> {
+    node.get("id").and_then(Value::as_u64)
+}
 
-        // Log progress at intervals
-        if (attempt + 1) % 10 == 0 {
-            eprintln!(
-                "[i3mux] Still waiting for window with instance '{}' ({}/{})",
-                instance, attempt + 1, WINDOW_WAIT_MAX_ATTEMPTS
-            );
-        }
+/// Every node under `node` (inclusive), depth first, tiled before floating.
+fn descendants(node: &Value) -> Vec<&Value> {
+    let mut out = vec![node];
+    for child in children(node) {
+        out.extend(descendants(child));
     }
+    out
+}
 
-    anyhow::bail!(
-        "Failed to find window with instance '{}' after {} attempts",
-        instance,
-        WINDOW_WAIT_MAX_ATTEMPTS
+/// The workspace called `name`. Workspaces are found by name because every
+/// unnumbered workspace has number -1.
+#[must_use]
+pub fn find_workspace<'a>(tree: &'a Value, name: &str) -> Option<&'a Value> {
+    descendants(tree).into_iter().find(|n| {
+        n.get("type").and_then(Value::as_str) == Some("workspace")
+            && n.get("name").and_then(Value::as_str) == Some(name)
+    })
+}
+
+/// Container id and mark of every i3mux window under `node`.
+#[must_use]
+pub fn i3mux_windows_in(node: &Value) -> Vec<(u64, Mark)> {
+    descendants(node)
+        .into_iter()
+        .filter_map(|n| Some((node_id(n)?, node_mark(n)?)))
+        .collect()
+}
+
+/// Terminals of `session` on `host` that have a window anywhere in the tree.
+#[must_use]
+pub fn session_terminals(tree: &Value, host: &Host, session: &SessionName) -> Vec<TerminalName> {
+    i3mux_windows_in(tree)
+        .into_iter()
+        .filter(|(_, mark)| mark.belongs_to(host, session))
+        .map(|(_, mark)| mark.terminal)
+        .collect()
+}
+
+/// The container id of an unmarked window whose `app_id` is `app_id`.
+#[must_use]
+pub fn find_by_app_id(tree: &Value, app_id: &str) -> Option<u64> {
+    descendants(tree)
+        .into_iter()
+        .find(|n| n.get("app_id").and_then(Value::as_str) == Some(app_id) && node_mark(n).is_none())
+        .and_then(node_id)
+}
+
+/// `[con_id=N] mark --add "MARK"`: the command that marks window `con_id`.
+#[must_use]
+pub fn mark_command(con_id: u64, mark: &Mark) -> String {
+    format!("[con_id={con_id}] mark --add \"{mark}\"")
+}
+
+/// `[con_mark="^_i3mux:{host}:{session}-[0-9]+$"] kill`: the one command
+/// that closes every window of a session. Anchored at both ends so session
+/// `ws4` never matches the windows of session `ws4-x`.
+#[must_use]
+pub fn kill_command(host: &Host, session: &SessionName) -> String {
+    format!(
+        "[con_mark=\"^{}{}:{}-[0-9]+$\"] kill",
+        MARK_PREFIX,
+        regex_literal(host.label()),
+        regex_literal(session.as_str())
     )
 }
 
-/// Find all i3mux windows in a specific workspace
-pub fn find_i3mux_windows_in_workspace(workspace_num: i32, backend: &WmBackend) -> Result<Vec<I3muxWindow>> {
-    let tree = backend.get_tree()
-        .context("Failed to get window manager tree")?;
-
-    // Find the workspace node first
-    let ws_node = find_workspace_node(&tree, workspace_num);
-
-    match ws_node {
-        Some(node) => {
-            let mut windows = Vec::new();
-            collect_i3mux_windows(node, &mut windows);
-            Ok(windows)
-        }
-        None => Ok(Vec::new()),
-    }
-}
-
-/// Kill all i3mux windows in a workspace
-pub fn kill_i3mux_windows_in_workspace(backend: &WmBackend, workspace_num: i32) -> Result<()> {
-    let windows = find_i3mux_windows_in_workspace(workspace_num, backend)?;
-
-    for window in windows {
-        // Use con_id selector which works for both i3 and Sway
-        let cmd = format!("[con_id=\"{}\"] kill", window.window_id);
-        let _ = backend.run_command(&cmd); // Ignore errors for individual windows
-    }
-
-    Ok(())
-}
-
-/// Check if a workspace has any i3mux windows
-pub fn workspace_has_i3mux_windows(workspace_num: i32, backend: &WmBackend) -> Result<bool> {
-    let windows = find_i3mux_windows_in_workspace(workspace_num, backend)?;
-    Ok(!windows.is_empty())
-}
-
-// ============ Internal helpers ============
-
-fn collect_i3mux_windows(node: &serde_json::Value, windows: &mut Vec<I3muxWindow>) {
-    // Check if this node has marks
-    // Use "id" for container ID which works for both i3 and Sway
-    if let Some(marks) = node.get("marks").and_then(|m| m.as_array()) {
-        if let Some(container_id) = node.get("id").and_then(|w| w.as_u64()) {
-            for mark in marks {
-                if let Some(mark_str) = mark.as_str() {
-                    if let Some(mut identity) = I3muxWindow::from_mark(mark_str) {
-                        identity.window_id = container_id;
-                        windows.push(identity);
-                        break; // Only count once per window
-                    }
-                }
+/// `text` as a regex that matches only itself. Host and session names hold
+/// only alphanumerics, `-`, `_`, `@` and `.`; `.` becomes `[.]`, which needs
+/// no backslash inside Sway's quoted criteria.
+fn regex_literal(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '@') {
+                c.to_string()
+            } else {
+                format!("[{c}]")
             }
-        }
-    }
-
-    // Recurse into children
-    if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
-        for child in nodes {
-            collect_i3mux_windows(child, windows);
-        }
-    }
-
-    if let Some(nodes) = node.get("floating_nodes").and_then(|n| n.as_array()) {
-        for child in nodes {
-            collect_i3mux_windows(child, windows);
-        }
-    }
+        })
+        .collect()
 }
 
-fn find_workspace_node<'a>(node: &'a serde_json::Value, workspace_num: i32) -> Option<&'a serde_json::Value> {
-    // Check if this is the workspace we're looking for
-    if let Some(node_type) = node.get("type").and_then(|t| t.as_str()) {
-        if node_type == "workspace" {
-            if let Some(num) = node.get("num").and_then(|n| n.as_i64()) {
-                if num == workspace_num as i64 {
-                    return Some(node);
-                }
-            }
-        }
+#[cfg(test)]
+pub mod testing {
+    //! A fixture tree from a real `swaymsg -t get_tree` (trimmed, titles
+    //! anonymized).
+    use serde_json::{json, Value};
+
+    /// Workspaces 1, 2, 3 (a tabbed container of two windows) and `q`
+    /// (number -1; one tiled and one floating window), plus a scratchpad
+    /// window with a non-i3mux mark.
+    pub fn real_tree() -> Value {
+        serde_json::from_str(include_str!("testdata/sway-tree.json")).unwrap()
     }
 
-    // Recurse into children
-    if let Some(nodes) = node.get("nodes").and_then(|n| n.as_array()) {
-        for child in nodes {
-            if let Some(found) = find_workspace_node(child, workspace_num) {
-                return Some(found);
-            }
-        }
+    /// Add `mark` to the node with container id `id`.
+    pub fn add_mark(tree: &mut Value, id: u64, mark: &str) {
+        let node = find_mut(tree, id).unwrap();
+        node["marks"].as_array_mut().unwrap().push(json!(mark));
     }
 
-    None
+    fn find_mut(node: &mut Value, id: u64) -> Option<&mut Value> {
+        if node["id"].as_u64() == Some(id) {
+            return Some(node);
+        }
+        node.as_object_mut()?
+            .iter_mut()
+            .filter(|(key, _)| *key == "nodes" || *key == "floating_nodes")
+            .filter_map(|(_, kids)| kids.as_array_mut())
+            .flat_map(|kids| kids.iter_mut())
+            .find_map(|kid| find_mut(kid, id))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::testing::{add_mark, real_tree};
     use super::*;
+    use crate::types::{strategies, RemoteHost};
+    use proptest::prelude::*;
 
-    #[test]
-    fn test_mark_format() {
-        let window = I3muxWindow::new(12345, "local", "ws1-001");
-        assert_eq!(window.mark(), "_i3mux:local:ws1-001");
+    fn session(name: &str) -> SessionName {
+        SessionName::new(name).unwrap()
+    }
+
+    fn remote(host: &str) -> Host {
+        Host::Ssh(RemoteHost::new(host).unwrap())
+    }
+
+    fn mark(host: &Host, session_name: &str, n: u32) -> Mark {
+        Mark::new(host.clone(), TerminalName::new(&session(session_name), n))
     }
 
     #[test]
-    fn test_mark_format_remote() {
-        let window = I3muxWindow::new(12345, "user@server", "ws2-003");
-        assert_eq!(window.mark(), "_i3mux:user@server:ws2-003");
+    fn mark_format() {
+        assert_eq!(
+            mark(&Host::Local, "ws1", 1).to_string(),
+            "_i3mux:local:ws1-001"
+        );
+        assert_eq!(
+            mark(&remote("user@server.lan"), "ws2", 3).to_string(),
+            "_i3mux:user@server.lan:ws2-003"
+        );
     }
 
     #[test]
-    fn test_from_mark_local() {
-        let identity = I3muxWindow::from_mark("_i3mux:local:ws1-001").unwrap();
-        assert_eq!(identity.host, "local");
-        assert_eq!(identity.socket, "ws1-001");
+    fn mark_parse_rejects_other_marks() {
+        for text in [
+            "random-mark",
+            "i3mux:local:ws1-001",
+            "_i3mux:nocolon",
+            "_i3mux:local:ws1",
+            "_i3mux:local:ws1-1",
+            "_i3mux:-bad:ws1-001",
+            "_i3mux::ws1-001",
+            "_i3mux:local:ws 1-001",
+        ] {
+            assert_eq!(Mark::parse(text), None, "{text}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn mark_round_trips(host in strategies::host(), terminal in strategies::terminal_name()) {
+            // Plan rule 2: the mark is the identity; parse(format(m)) == m.
+            let m = Mark::new(host, terminal);
+            prop_assert_eq!(Mark::parse(&m.to_string()), Some(m.clone()));
+            prop_assert_eq!(Mark::parse(&m.app_id()), Some(m));
+        }
     }
 
     #[test]
-    fn test_from_mark_remote() {
-        let identity = I3muxWindow::from_mark("_i3mux:user@server:ws2-003").unwrap();
-        assert_eq!(identity.host, "user@server");
-        assert_eq!(identity.socket, "ws2-003");
+    fn kill_selector_matches_only_this_session() {
+        let host = remote("user@deep.thought");
+        let command = kill_command(&host, &session("ws4"));
+        let pattern = command
+            .strip_prefix("[con_mark=\"")
+            .and_then(|r| r.strip_suffix("\"] kill"))
+            .unwrap();
+        let re = regex::Regex::new(pattern).unwrap();
+        assert!(re.is_match("_i3mux:user@deep.thought:ws4-001"));
+        assert!(re.is_match("_i3mux:user@deep.thought:ws4-1234"));
+        for other in [
+            "_i3mux:user@deep.thought:ws4-x-001",
+            "_i3mux:user@deep.thought:ws40-001",
+            "_i3mux:user@deepxthought:ws4-001",
+            "_i3mux:local:ws4-001",
+            "_i3mux:user@deep.thought:ws4-001x",
+            "x_i3mux:user@deep.thought:ws4-001",
+        ] {
+            assert!(!re.is_match(other), "{other}");
+        }
     }
 
     #[test]
-    fn test_from_mark_invalid() {
-        assert!(I3muxWindow::from_mark("random-mark").is_none());
-        assert!(I3muxWindow::from_mark("i3mux:local:ws1").is_none()); // Missing underscore
-        assert!(I3muxWindow::from_mark("_i3mux:nocolon").is_none());
+    fn regex_literal_quotes_every_allowed_punctuation() {
+        assert_eq!(regex_literal("a.b-c_d@e"), "a[.]b-c_d@e");
     }
 
     #[test]
-    fn test_mark_starts_with_prefix() {
-        // Valid marks should parse successfully
-        assert!(I3muxWindow::from_mark("_i3mux:local:ws1-001").is_some());
-        assert!(I3muxWindow::from_mark("_i3mux:user@host:ws2-003").is_some());
-        // Invalid marks should not parse
-        assert!(I3muxWindow::from_mark("random-mark").is_none());
-        assert!(I3muxWindow::from_mark("i3mux-terminal").is_none());
+    fn find_workspace_by_name_including_unnumbered() {
+        let tree = real_tree();
+        assert_eq!(find_workspace(&tree, "3").unwrap()["id"], 945);
+        // Workspace "q" has num -1, like every unnumbered workspace.
+        assert_eq!(find_workspace(&tree, "q").unwrap()["num"], -1);
+        assert!(find_workspace(&tree, "4").is_none());
+    }
+
+    #[test]
+    fn real_tree_without_i3mux_marks_has_no_i3mux_windows() {
+        // The scratchpad window's mark "scratch-notes" is not an i3mux mark.
+        assert!(i3mux_windows_in(&real_tree()).is_empty());
+    }
+
+    #[test]
+    fn i3mux_windows_include_nested_and_floating() {
+        let mut tree = real_tree();
+        let a = mark(&Host::Local, "ws3", 1);
+        let b = mark(&Host::Local, "ws3", 2);
+        let c = mark(&Host::Local, "q", 1);
+        add_mark(&mut tree, 1019, &a.to_string());
+        add_mark(&mut tree, 1001, &b.to_string());
+        add_mark(&mut tree, 5, &c.to_string());
+        let ws3 = find_workspace(&tree, "3").unwrap();
+        assert_eq!(i3mux_windows_in(ws3), [(1019, a), (1001, b)]);
+        let q = find_workspace(&tree, "q").unwrap();
+        assert_eq!(i3mux_windows_in(q), [(5, c)]);
+    }
+
+    #[test]
+    fn session_terminals_filters_by_host_and_session() {
+        let mut tree = real_tree();
+        add_mark(&mut tree, 1019, &mark(&Host::Local, "ws3", 1).to_string());
+        add_mark(&mut tree, 1001, &mark(&Host::Local, "ws3-x", 2).to_string());
+        add_mark(&mut tree, 1075, &mark(&remote("h"), "ws3", 3).to_string());
+        add_mark(&mut tree, 5, &mark(&Host::Local, "ws3", 4).to_string());
+        let found = session_terminals(&tree, &Host::Local, &session("ws3"));
+        let numbers: Vec<u32> = found.iter().map(TerminalName::number).collect();
+        assert_eq!(numbers, [1, 4]);
+    }
+
+    #[test]
+    fn find_by_app_id_skips_marked_windows() {
+        let mut tree = real_tree();
+        assert_eq!(find_by_app_id(&tree, "Alacritty"), Some(1019));
+        add_mark(&mut tree, 1019, &mark(&Host::Local, "ws3", 1).to_string());
+        assert_eq!(find_by_app_id(&tree, "Alacritty"), Some(1001));
+        assert_eq!(find_by_app_id(&tree, "nothing"), None);
+    }
+
+    #[test]
+    fn mark_command_text() {
+        let m = mark(&Host::Local, "ws4", 2);
+        assert_eq!(
+            mark_command(7, &m),
+            "[con_id=7] mark --add \"_i3mux:local:ws4-002\""
+        );
     }
 }
