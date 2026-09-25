@@ -43,8 +43,10 @@ i3mux sessions [--remote host]    # what exists, where, and in what state
 i3mux kill --session ws3          # kill the shells and forget the layout
 ```
 
-The default session name is `ws` plus the workspace number. `--session`
-overrides it on `activate`, `attach` and `kill`.
+The default session name is `ws` plus the workspace number, or the
+workspace name itself for a named workspace such as `mail`. A name with
+other characters, such as `1:web`, has no default. `--session` overrides it
+on `activate`, `attach` and `kill`.
 
 ## How it works
 

@@ -448,14 +448,31 @@ fn activate_on_unreachable_host_binds_nothing() {
 }
 
 #[test]
-fn activate_unnumbered_workspace_needs_a_session_name() {
+fn activate_named_workspace_uses_its_name_as_session() {
     let world = World::new(Host::Local);
-    let err = activate(&world.ports(), &Host::Local, &workspace("q", -1), None).unwrap_err();
-    assert!(matches!(command_error(&err), CommandError::NoDefaultSession(ws) if ws == "q"));
+    let (session, _) = activate(&world.ports(), &Host::Local, &workspace("q", -1), None).unwrap();
+    assert_eq!(session, name("q"));
+}
+
+#[test]
+fn activate_numbered_workspace_uses_ws_prefix() {
+    let world = World::new(Host::Local);
+    let (session, _) = activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    assert_eq!(session, name("ws4"));
+}
+
+#[test]
+fn activate_workspace_with_invalid_name_needs_a_session_name() {
+    let world = World::new(Host::Local);
+    let err = activate(&world.ports(), &Host::Local, &workspace("a:b", -1), None).unwrap_err();
+    assert!(
+        matches!(command_error(&err), CommandError::NoDefaultSession { workspace, .. } if workspace == "a:b")
+    );
+    assert!(err.to_string().contains("--session"), "{err:#}");
     let (session, _) = activate(
         &world.ports(),
         &Host::Local,
-        &workspace("q", -1),
+        &workspace("a:b", -1),
         Some(name("notes")),
     )
     .unwrap();

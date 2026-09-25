@@ -37,7 +37,7 @@ use serde_json::Value;
 use session::{SavedSession, SessionError};
 use state::{StateStore, WorkspaceState};
 use sway_ops::Sway;
-use types::{Host, SessionName, TerminalName};
+use types::{Host, InvalidName, SessionName, TerminalName};
 use window::Mark;
 use wm::{Wm, WorkspaceInfo};
 
@@ -151,8 +151,11 @@ struct Ports<'a> {
 enum CommandError {
     #[error("Workspace {0} is not bound to a session; run 'i3mux activate' first")]
     Unbound(String),
-    #[error("Workspace {0} has no number, so it has no default session name; pass --session NAME")]
-    NoDefaultSession(String),
+    #[error("Workspace '{workspace}' cannot be a session name ({reason}); pass --session NAME")]
+    NoDefaultSession {
+        workspace: String,
+        reason: &'static str,
+    },
     #[error("Workspace {workspace} has no windows of session '{session}'; nothing to detach (to end the session, run 'i3mux kill')")]
     NothingToDetach {
         workspace: String,
@@ -424,12 +427,20 @@ struct TerminalRequest {
     force: bool,
 }
 
-/// `wsN` for workspace N.
+/// `wsN` for a numbered workspace, else the workspace name itself.
+/// A name with characters outside `[A-Za-z0-9_-]` (such as `1:web`) has no
+/// default, and the caller must pass `--session`.
 fn default_session(workspace: &WorkspaceInfo) -> Result<SessionName, CommandError> {
-    workspace
-        .number()
-        .map(SessionName::for_workspace)
-        .ok_or_else(|| CommandError::NoDefaultSession(workspace.name().to_owned()))
+    if let Some(number) = workspace.number() {
+        return Ok(SessionName::for_workspace(number));
+    }
+    SessionName::new(workspace.name()).map_err(|err| CommandError::NoDefaultSession {
+        workspace: workspace.name().to_owned(),
+        reason: match err {
+            InvalidName::Session { reason, .. } => reason,
+            InvalidName::Host { .. } | InvalidName::Terminal(_) => "invalid name",
+        },
+    })
 }
 
 /// Bind `workspace` to `session` on `host`, then open its first terminal.

@@ -37,9 +37,11 @@ back later, and the shells, their output, and the layout are still there.
    with its own socket and config, so restore mode is under i3mux control.
 3. No lock files. Double attach is refused by shpool; `--force` maps to
    `shpool attach -f`.
-4. A workspace is bound to a *session* (name + host). Each terminal is a
-   shpool session named `{session}-{NNN}`. Numbering comes from
-   `shpool list` on the host, not from local state.
+4. A workspace is bound to a *session* (name + host). The default session
+   is `wsN` for workspace N, or the workspace name when it is a valid
+   session name. Each terminal is a shpool session named
+   `{session}-{NNN}`. Numbering comes from `shpool list` on the host, not
+   from local state.
 5. Closing a window never kills the shell. `i3mux terminal` reattaches the
    lowest-numbered orphan shell (alive, no window) before creating a new one.
 6. `detach` saves the layout on the host that owns the shells and closes
