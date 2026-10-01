@@ -122,9 +122,15 @@ back later, and the shells, their output, and the layout are still there.
 ## User-facing text
 
 - `i3mux sessions [--remote H]` prints one line per session:
-  `ws4  (deepthought)  3 windows, 1 orphan` /
-  `ws7  (local)  detached, 2 terminals saved`. `scripts/i3mux-rofi` is
-  updated to this format in phase 5.
+  `ws4  (deepthought)  workspace 4, 3 windows, 1 orphan` /
+  `ws7  (local)  detached, 2 terminals saved`. `scripts/i3mux-rofi` reads
+  the first word as the session and the `(host)` as its host.
+- `i3mux sessions --all [--remote H]` lists this machine, every bound host,
+  and H. A host that fails gives a warning and hides only its own sessions.
+- `i3mux status` prints the focused workspace's row without contacting the
+  host, or `Workspace 7: no session` with exit status 3. The rofi menu shows
+  it as its header. In a bound workspace, the menu's detach and kill act on
+  that session. Picking a bound row in list focuses its workspace.
 - `--force` help: "Disconnect any other client attached to these shells".
 - Unbound workspace: "Workspace 4 is not bound to a session; run
   'i3mux activate' first".

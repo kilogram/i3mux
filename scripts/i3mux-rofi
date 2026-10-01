@@ -4,14 +4,19 @@
 # Bind in ~/.config/sway/config:
 #   bindsym $mod+m exec i3mux-rofi
 #
-# Menu: type a hostname (or nothing for local) to activate the focused
-# workspace, or pick Detach / Attach / List / Kill.
+# The menu header shows the focused workspace's session. In a bound
+# workspace, detach and kill act on that session. In an unbound one, type a
+# hostname (or nothing for local) to activate it, or pick attach, list or
+# kill. Actions match without regard to case.
 
 set -euo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/i3mux"
 LAST_REMOTE_FILE="$CONFIG_DIR/last_remote"
 mkdir -p "$CONFIG_DIR"
+
+# `i3mux status` exits with this when the focused workspace is not bound.
+EXIT_UNBOUND=3
 
 last_remote() {
     [ -f "$LAST_REMOTE_FILE" ] && cat "$LAST_REMOTE_FILE" || true
@@ -25,23 +30,26 @@ notify() {
     command -v notify-send >/dev/null 2>&1 && notify-send "i3mux" "$1" || true
 }
 
-# One line per session, prefixed with the host it was listed from:
-#   local|ws4  (local)  2 windows
-#   deepthought|ws3  (deepthought)  detached, 3 terminals saved
+# One row per session on this machine, on every bound host, and on the last
+# remote host, e.g.
+#   ws3  (deepthought)  workspace 3, 1 window
+#   ws4  (local)        detached, 3 terminals saved
+# Warnings about unreachable hosts go to stderr.
 all_sessions() {
-    i3mux sessions 2>/dev/null | sed 's/^/local|/' || true
     local remote
     remote=$(last_remote)
-    if [ -n "$remote" ]; then
-        i3mux sessions --remote "$remote" 2>/dev/null | sed "s/^/$remote|/" || true
+    if [ -n "$remote" ] && i3mux sessions --all --remote "$remote"; then
+        return
     fi
+    # No remembered host, or i3mux rejected it.
+    i3mux sessions --all || true
 }
 
-# Split "host|name  (...)" into HOST and NAME.
-parse_selection() {
-    SEL_HOST=${1%%|*}
-    local rest=${1#*|}
-    SEL_NAME=${rest%% *}
+# Split "name  (host)  ..." into SEL_NAME and SEL_HOST.
+parse_row() {
+    SEL_NAME=${1%% *}
+    local rest=${1#*(}
+    SEL_HOST=${rest%%)*}
 }
 
 host_args() {
@@ -50,28 +58,78 @@ host_args() {
 
 pick_session() {
     local prompt=$1 sessions
-    sessions=$(all_sessions)
+    sessions=$(all_sessions 2>/dev/null)
     [ -z "$sessions" ] && { notify "No sessions"; exit 0; }
     local chosen
-    chosen=$(printf '%s\n' "$sessions" | rofi -dmenu -p "$prompt") || exit 0
+    chosen=$(printf '%s\n' "$sessions" | rofi -dmenu -i -p "$prompt") || exit 0
     [ -z "$chosen" ] && exit 0
-    parse_selection "$chosen"
+    parse_row "$chosen"
 }
 
-menu="Detach
-Attach
-List
-Kill"
-remote=$(last_remote)
-[ -n "$remote" ] && menu="$remote
-$menu"
+confirm_kill() {
+    local confirm
+    confirm=$(printf 'yes\nno\n' | rofi -dmenu -i -p "Kill $SEL_NAME on $SEL_HOST?") || exit 0
+    [ "${confirm,,}" = "yes" ]
+}
 
-selection=$(printf '%s\n' "$menu" | rofi -dmenu -p "i3mux" \
-    -mesg "Enter = local, type a host for remote, or pick an action") || exit 0
+show_list() {
+    local sessions warnings
+    warnings=$(mktemp)
+    sessions=$(all_sessions 2>"$warnings")
+    local mesg="Pick a session bound here to go to its workspace"
+    [ -s "$warnings" ] && mesg="$mesg. $(tr '\n' ' ' < "$warnings")"
+    rm -f "$warnings"
+    [ -z "$sessions" ] && { rofi -e "No sessions. $mesg"; exit 0; }
+    local chosen ws
+    chosen=$(printf '%s\n' "$sessions" | rofi -dmenu -i -p "Sessions" -mesg "$mesg") || exit 0
+    [ -z "$chosen" ] && exit 0
+    if ! ws=$(row_workspace "$chosen"); then
+        parse_row "$chosen"
+        notify "$SEL_NAME is not bound to a workspace here; use attach"
+        exit 0
+    fi
+    # Sway command syntax: quote the name and escape its quotes.
+    swaymsg -q "workspace \"${ws//\"/\\\"}\"" || rofi -e "Cannot go to workspace $ws"
+}
+
+# Print the workspace of a bound row:
+#   ws3  (deepthought)  workspace 3, 1 window, 2 orphans  ->  3
+# Fails for a row that is not bound here.
+row_workspace() {
+    local re='\)  workspace (.+), [0-9]+ windows?(, [0-9]+ orphans?)?$'
+    [[ $1 =~ $re ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+rc=0
+status=$(i3mux status 2>&1) || rc=$?
+case $rc in
+    0) bound=1 ;;
+    "$EXIT_UNBOUND") bound=0 ;;
+    *) rofi -e "i3mux status failed: $status"; exit 1 ;;
+esac
+
+if [ "$bound" = 1 ]; then
+    # list first: Enter on an untouched menu must not detach or kill.
+    menu="list
+detach
+kill"
+    mesg=$status
+else
+    menu="attach
+list
+kill"
+    remote=$(last_remote)
+    [ -n "$remote" ] && menu="$remote
+$menu"
+    mesg="$status. Enter = local, type a host for remote, or pick an action"
+fi
+
+selection=$(printf '%s\n' "$menu" | rofi -dmenu -i -p "i3mux" -mesg "$mesg") || exit 0
 [ -z "$selection" ] && selection="local"
 
-case "$selection" in
-    Attach)
+case "${selection,,}" in
+    attach)
         pick_session "Attach"
         [ "$SEL_HOST" != "local" ] && save_last_remote "$SEL_HOST"
         # shellcheck disable=SC2046
@@ -79,24 +137,29 @@ case "$selection" in
             rofi -e "Attach failed: $error"
         fi
         ;;
-    Detach)
+    detach)
         if error=$(i3mux detach 2>&1); then
             notify "Workspace detached"
         else
             rofi -e "Detach failed: $error"
         fi
         ;;
-    List)
-        sessions=$(all_sessions)
-        [ -z "$sessions" ] && { rofi -e "No sessions"; exit 0; }
-        printf '%s\n' "$sessions" | rofi -dmenu -p "Sessions" -mesg "Read-only" || true
+    list)
+        show_list
         ;;
-    Kill)
-        pick_session "Kill"
-        confirm=$(printf 'Yes\nNo\n' | rofi -dmenu -p "Kill $SEL_NAME on $SEL_HOST?") || exit 0
-        [ "$confirm" = "Yes" ] || exit 0
-        # shellcheck disable=SC2046
-        if error=$(i3mux kill $(host_args "$SEL_HOST") --session "$SEL_NAME" 2>&1); then
+    kill)
+        if [ "$bound" = 1 ]; then
+            # Plain 'i3mux kill' ends the focused workspace's session.
+            parse_row "$status"
+            confirm_kill || exit 0
+            kill_args=()
+        else
+            pick_session "Kill"
+            confirm_kill || exit 0
+            # shellcheck disable=SC2207
+            kill_args=($(host_args "$SEL_HOST") --session "$SEL_NAME")
+        fi
+        if error=$(i3mux kill "${kill_args[@]}" 2>&1); then
             notify "Killed $SEL_NAME"
         else
             rofi -e "Kill failed: $error"
@@ -108,8 +171,11 @@ case "$selection" in
         fi
         ;;
     *)
-        save_last_remote "$selection"
-        if ! error=$(i3mux activate --remote "$selection" 2>&1); then
+        # Remember the host only once it works, so a typo cannot hide the
+        # remembered host's sessions from list, attach and kill.
+        if error=$(i3mux activate --remote "$selection" 2>&1); then
+            save_last_remote "$selection"
+        else
             rofi -e "Activate on $selection failed: $error"
         fi
         ;;

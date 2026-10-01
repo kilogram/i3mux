@@ -37,7 +37,7 @@ use serde_json::Value;
 use session::{SavedSession, SessionError};
 use state::{StateStore, WorkspaceState};
 use sway_ops::Sway;
-use types::{Host, InvalidName, SessionName, TerminalName};
+use types::{Host, InvalidName, RemoteHost, SessionName, TerminalName};
 use window::Mark;
 use wm::{Wm, WorkspaceInfo};
 
@@ -45,6 +45,9 @@ const FORCE_HELP: &str = "Disconnect any other client attached to these shells";
 
 /// Exit status of `attach` when several sessions fit and none was named.
 const EXIT_CHOOSE: u8 = 2;
+
+/// Exit status of `status` when the focused workspace is not bound.
+const EXIT_UNBOUND: u8 = 3;
 
 /// How long `detach` waits for closed windows' shells to lose their clients.
 const DISCONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -55,7 +58,8 @@ const DISCONNECT_POLL: Duration = Duration::from_millis(100);
     name = "i3mux",
     version,
     about = "Persistent terminal sessions for Sway workspaces",
-    after_help = "Exit status: 0 success, 1 error, 2 usage error or (attach) several sessions to choose from."
+    after_help = "Exit status: 0 success, 1 error, 2 usage error or (attach) several sessions to choose from, \
+                  3 (status) the focused workspace is not bound."
 )]
 struct Cli {
     /// Print what i3mux does on stderr
@@ -103,10 +107,15 @@ enum CliCommand {
     },
     /// List the sessions on a host
     Sessions {
-        /// The host to list [default: this machine]
+        /// The host to list [default: this machine]; with --all, one more host to list
         #[arg(short, long)]
         remote: Option<String>,
+        /// List this machine and every host that a workspace is bound to
+        #[arg(short, long)]
+        all: bool,
     },
+    /// Show the session of the focused workspace, without contacting its host
+    Status,
     /// End a session: close its windows, kill its shells, delete its saved layout
     Kill {
         /// The host that runs the shells [default: this machine]
@@ -235,7 +244,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             session,
             force,
         } => cmd_attach(&ports, &wm, remote, session, force),
-        CliCommand::Sessions { remote } => cmd_sessions(&ports, remote),
+        CliCommand::Sessions { remote, all } => cmd_sessions(&ports, remote, all),
+        CliCommand::Status => cmd_status(&ports, &wm),
         CliCommand::Kill { remote, session } => cmd_kill(&ports, &wm, remote, session),
     }
 }
@@ -359,13 +369,35 @@ fn cmd_attach(
     }
 }
 
-fn cmd_sessions(ports: &Ports, remote: Option<String>) -> Result<ExitCode> {
-    let host = Host::from_remote_arg(remote)?;
-    let rows = sessions(ports, &host)?;
+fn cmd_sessions(ports: &Ports, remote: Option<String>, all: bool) -> Result<ExitCode> {
+    let (rows, listed) = if all {
+        let extra = remote.map(RemoteHost::new).transpose()?.map(Host::Ssh);
+        let listing = sessions_all(ports, extra)?;
+        for (host, err) in &listing.failed {
+            eprintln!("i3mux: warning: cannot list the sessions on {host}: {err:#}");
+        }
+        (listing.rows, listing.listed)
+    } else {
+        let host = Host::from_remote_arg(remote)?;
+        (sessions(ports, &host)?, vec![host])
+    };
     if rows.is_empty() {
-        eprintln!("No sessions on {host}");
+        let hosts: Vec<String> = listed.iter().map(ToString::to_string).collect();
+        eprintln!("No sessions on {}", hosts.join(", "));
     }
     for line in format_rows(&rows) {
+        println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_status(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
+    let workspace = wm.focused_workspace()?;
+    let Some(row) = status(ports, workspace.name())? else {
+        println!("Workspace {}: no session", workspace.name());
+        return Ok(ExitCode::from(EXIT_UNBOUND));
+    };
+    for line in format_rows(&[row]) {
         println!("{line}");
     }
     Ok(ExitCode::SUCCESS)
@@ -746,7 +778,11 @@ struct SessionRow {
 #[derive(Debug, PartialEq, Eq)]
 enum RowStatus {
     /// Bound to a workspace on this machine.
-    Bound { windows: usize, orphans: usize },
+    Bound {
+        workspace: String,
+        windows: usize,
+        orphans: usize,
+    },
     /// Not bound here, but a terminal elsewhere shows at least one shell.
     AttachedElsewhere { shells: usize },
     /// Not bound here, no shell attached; a saved layout exists.
@@ -764,10 +800,10 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
     let shells = mux::list(exec.as_ref())?;
     let saved = session::list(exec.as_ref())?;
     let state = ports.store.load()?;
-    let bound: Vec<&SessionName> = state
+    let bound: Vec<(&str, &SessionName)> = state
         .bindings()
         .filter(|(_, b)| b.host() == host)
-        .map(|(_, b)| b.session())
+        .map(|(ws, b)| (ws, b.session()))
         .collect();
     let tree = if bound.is_empty() {
         None
@@ -779,7 +815,7 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
         .iter()
         .map(|s| s.name().session())
         .chain(saved.iter())
-        .chain(bound.iter().copied())
+        .chain(bound.iter().map(|(_, name)| *name))
         .collect();
     let mut rows = Vec::new();
     for name in names {
@@ -787,8 +823,9 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
             .iter()
             .filter(|s| s.name().session() == name)
             .collect();
-        let status = match &tree {
-            Some(tree) if bound.contains(&name) => bound_status(tree, host, name, &alive),
+        let workspace = bound.iter().find(|(_, b)| *b == name).map(|(ws, _)| *ws);
+        let status = match (&tree, workspace) {
+            (Some(tree), Some(workspace)) => bound_status(tree, host, name, workspace, &alive),
             _ if alive.iter().any(|s| s.is_attached()) => RowStatus::AttachedElsewhere {
                 shells: alive.len(),
             },
@@ -807,16 +844,79 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
 }
 
 /// Windows of a session bound here, and its shells without a window.
-fn bound_status(tree: &Value, host: &Host, name: &SessionName, alive: &[&Shell]) -> RowStatus {
+fn bound_status(
+    tree: &Value,
+    host: &Host,
+    name: &SessionName,
+    workspace: &str,
+    alive: &[&Shell],
+) -> RowStatus {
     let marked = window::session_terminals(tree, host, name);
     let orphans = alive
         .iter()
         .filter(|s| !s.is_attached() && !marked.contains(s.name()))
         .count();
     RowStatus::Bound {
+        workspace: workspace.to_owned(),
         windows: marked.len(),
         orphans,
     }
+}
+
+/// What `sessions --all` found.
+#[derive(Debug)]
+struct Listing {
+    rows: Vec<SessionRow>,
+    /// Every host that was asked, in order.
+    listed: Vec<Host>,
+    /// Hosts that failed. Their sessions are missing from `rows`.
+    failed: Vec<(Host, anyhow::Error)>,
+}
+
+/// The sessions of this machine, of every host a workspace is bound to,
+/// and of `extra`. A host that fails is reported in [`Listing::failed`]
+/// and does not hide the other hosts' sessions.
+fn sessions_all(ports: &Ports, extra: Option<Host>) -> Result<Listing> {
+    let state = ports.store.load()?;
+    let mut listed = vec![Host::Local];
+    for host in state.bindings().map(|(_, b)| b.host().clone()).chain(extra) {
+        if !listed.contains(&host) {
+            listed.push(host);
+        }
+    }
+    let mut rows = Vec::new();
+    let mut failed = Vec::new();
+    for host in &listed {
+        match sessions(ports, host) {
+            Ok(host_rows) => rows.extend(host_rows),
+            Err(err) => failed.push((host.clone(), err)),
+        }
+    }
+    Ok(Listing {
+        rows,
+        listed,
+        failed,
+    })
+}
+
+/// The session bound to `workspace` and its window count, from local state
+/// and Sway only, so it answers fast even when the host is slow or down.
+/// Orphans need the host, so they are not counted.
+fn status(ports: &Ports, workspace: &str) -> Result<Option<SessionRow>> {
+    let Some(binding) = ports.store.load()?.get(workspace).cloned() else {
+        return Ok(None);
+    };
+    let tree = ports.sway.get_tree()?;
+    let windows = window::session_terminals(&tree, binding.host(), binding.session()).len();
+    Ok(Some(SessionRow {
+        name: binding.session().clone(),
+        host: binding.host().clone(),
+        status: RowStatus::Bound {
+            workspace: workspace.to_owned(),
+            windows,
+            orphans: 0,
+        },
+    }))
 }
 
 /// The saved layout's size, or [`RowStatus::Unreadable`] if it is corrupt.
@@ -830,8 +930,9 @@ fn saved_status(exec: &dyn HostExec, name: &SessionName) -> Result<RowStatus> {
     }
 }
 
-/// `ws4  (deepthought)  3 windows, 1 orphan`. The first word is the session
-/// name; scripts/i3mux-rofi relies on that.
+/// `ws4  (deepthought)  workspace 4, 3 windows, 1 orphan`. The first word is
+/// the session name and the host is in parentheses; scripts/i3mux-rofi
+/// relies on both.
 fn format_rows(rows: &[SessionRow]) -> Vec<String> {
     let width = rows
         .iter()
@@ -840,22 +941,31 @@ fn format_rows(rows: &[SessionRow]) -> Vec<String> {
         .unwrap_or(0);
     rows.iter()
         .map(|row| {
-            let status = match row.status {
-                RowStatus::Bound { windows, orphans } if orphans > 0 => format!(
-                    "{}, {}",
-                    count(windows, "window", "windows"),
-                    count(orphans, "orphan", "orphans")
+            let status = match &row.status {
+                RowStatus::Bound {
+                    workspace,
+                    windows,
+                    orphans,
+                } if *orphans > 0 => format!(
+                    "workspace {workspace}, {}, {}",
+                    count(*windows, "window", "windows"),
+                    count(*orphans, "orphan", "orphans")
                 ),
-                RowStatus::Bound { windows, .. } => count(windows, "window", "windows"),
+                RowStatus::Bound {
+                    workspace, windows, ..
+                } => format!(
+                    "workspace {workspace}, {}",
+                    count(*windows, "window", "windows")
+                ),
                 RowStatus::AttachedElsewhere { shells } => {
-                    format!("attached elsewhere, {}", count(shells, "shell", "shells"))
+                    format!("attached elsewhere, {}", count(*shells, "shell", "shells"))
                 }
                 RowStatus::Detached { saved } => {
-                    format!("detached, {} saved", count(saved, "terminal", "terminals"))
+                    format!("detached, {} saved", count(*saved, "terminal", "terminals"))
                 }
                 RowStatus::Unreadable => "unreadable saved layout".to_owned(),
                 RowStatus::Running { shells } => {
-                    format!("{}, no saved layout", count(shells, "shell", "shells"))
+                    format!("{}, no saved layout", count(*shells, "shell", "shells"))
                 }
             };
             format!("{:<width$}  ({})  {status}", row.name.as_str(), row.host)

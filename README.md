@@ -40,6 +40,8 @@ i3mux terminal -e htop            # run a command in a fresh persistent shell
 i3mux detach                      # save the layout, close the windows, keep the shells
 i3mux attach --session ws3        # restore the layout and reattach every shell
 i3mux sessions [--remote host]    # what exists, where, and in what state
+i3mux sessions --all              # this machine and every host a workspace is bound to
+i3mux status                      # the focused workspace's session (exit 3 if none)
 i3mux kill --session ws3          # kill the shells and forget the layout
 ```
 

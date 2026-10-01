@@ -806,7 +806,7 @@ fn sessions_lists_bound_detached_and_running() {
         format_rows(&rows),
         [
             "ws10  (local)  1 shell, no saved layout",
-            "ws4   (local)  2 windows, 1 orphan",
+            "ws4   (local)  workspace 4, 2 windows, 1 orphan",
             "ws7   (local)  detached, 2 terminals saved",
         ]
     );
@@ -860,10 +860,12 @@ fn sessions_row_wording() {
     };
     let rows = [
         row(RowStatus::Bound {
+            workspace: "4".into(),
             windows: 3,
             orphans: 1,
         }),
         row(RowStatus::Bound {
+            workspace: "mail".into(),
             windows: 1,
             orphans: 0,
         }),
@@ -872,11 +874,119 @@ fn sessions_row_wording() {
     assert_eq!(
         format_rows(&rows),
         [
-            "ws4  (deepthought)  3 windows, 1 orphan",
-            "ws4  (deepthought)  1 window",
+            "ws4  (deepthought)  workspace 4, 3 windows, 1 orphan",
+            "ws4  (deepthought)  workspace mail, 1 window",
             "ws4  (deepthought)  detached, 1 terminal saved",
         ]
     );
+}
+
+/// A world on a remote host, plus a second fake host for this machine,
+/// so `sessions_all` can ask both.
+fn with_local_host(world: &World) -> (FakeHost, Box<HostFactory>) {
+    let local = FakeHost::new(Host::Local);
+    let (remote, local_for_factory) = (world.host.clone(), local.clone());
+    let hosts: Box<HostFactory> = Box::new(move |h: &Host| -> Box<dyn HostExec> {
+        if h == &Host::Local {
+            Box::new(local_for_factory.clone())
+        } else {
+            assert_eq!(h, remote.host(), "unexpected host {h}");
+            Box::new(remote.clone())
+        }
+    });
+    (local, hosts)
+}
+
+fn deepthought() -> Host {
+    Host::Ssh(RemoteHost::new("deepthought").unwrap())
+}
+
+#[test]
+fn sessions_all_lists_this_machine_and_every_bound_host() {
+    // The bug: the menu listed only this machine and the last host typed,
+    // so a bound remote session vanished when that host was mistyped.
+    let world = World::new(deepthought());
+    world.bind("3", "ws3");
+    world.sway.open_marked("3", &world.mark("ws3-001"));
+    world.host.add_shell("ws3-001", true);
+    let (local, hosts) = with_local_host(&world);
+    local.add_shell("ws5-001", false);
+    let ports = Ports {
+        hosts: hosts.as_ref(),
+        ..world.ports()
+    };
+
+    let listing = sessions_all(&ports, None).unwrap();
+
+    assert_eq!(listing.listed, [Host::Local, deepthought()]);
+    assert!(listing.failed.is_empty());
+    assert_eq!(
+        format_rows(&listing.rows),
+        [
+            "ws5  (local)  1 shell, no saved layout",
+            "ws3  (deepthought)  workspace 3, 1 window",
+        ]
+    );
+}
+
+#[test]
+fn sessions_all_asks_the_extra_host_once() {
+    let world = World::new(deepthought());
+    world.bind("3", "ws3");
+    let (_local, hosts) = with_local_host(&world);
+    let ports = Ports {
+        hosts: hosts.as_ref(),
+        ..world.ports()
+    };
+    let listing = sessions_all(&ports, Some(deepthought())).unwrap();
+    assert_eq!(listing.listed, [Host::Local, deepthought()]);
+}
+
+#[test]
+fn sessions_all_survives_an_unreachable_host() {
+    let world = World::new(deepthought());
+    world.bind("3", "ws3");
+    world.host.state.lock().unwrap().unreachable = true;
+    let (local, hosts) = with_local_host(&world);
+    local.add_shell("ws5-001", false);
+    let ports = Ports {
+        hosts: hosts.as_ref(),
+        ..world.ports()
+    };
+
+    let listing = sessions_all(&ports, None).unwrap();
+
+    assert_eq!(
+        format_rows(&listing.rows),
+        ["ws5  (local)  1 shell, no saved layout"]
+    );
+    assert_eq!(listing.failed.len(), 1);
+    assert_eq!(listing.failed[0].0, deepthought());
+}
+
+// --------------------------------------------------------------- status
+
+#[test]
+fn status_shows_the_focused_session_without_asking_the_host() {
+    let world = World::new(deepthought());
+    world.bind("3", "ws3");
+    world.sway.open_marked("3", &world.mark("ws3-001"));
+    world.sway.open_marked("3", &world.mark("ws3-002"));
+    world.host.state.lock().unwrap().unreachable = true;
+
+    let row = status(&world.ports(), "3").unwrap().unwrap();
+
+    assert_eq!(
+        format_rows(&[row]),
+        ["ws3  (deepthought)  workspace 3, 2 windows"]
+    );
+}
+
+#[test]
+fn status_of_an_unbound_workspace_is_none() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    assert!(status(&world.ports(), "7").unwrap().is_none());
 }
 
 // ------------------------------------------------------------------ cli
