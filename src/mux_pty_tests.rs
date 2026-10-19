@@ -85,6 +85,7 @@ impl Scratch {
             RunnerConfig {
                 local_home: home.path().to_path_buf(),
                 ssh_control_dir: home.path().join("ssh"),
+                masters: std::sync::Arc::new(crate::master::DirectSsh),
             },
         );
         Self {
@@ -174,12 +175,12 @@ impl Scratch {
     }
 
     /// Run what an i3mux window runs: the real wrapper script with the
-    /// attach argv, in a new pty. (Run with `sh`, not exec'd: a freshly
+    /// attach argv, in a new pty. (Run with `bash`, not exec'd: a freshly
     /// written file can be ETXTBSY in a multi-threaded test process.)
     fn attach_in_wrapper(&self, name: &TerminalName) -> PtyClient {
         let wrapper = self.path().join("wrapper.sh");
         std::fs::write(&wrapper, crate::launch::WRAPPER).unwrap();
-        let mut command = Command::new("sh");
+        let mut command = Command::new("bash");
         command
             .arg(&wrapper)
             .arg(format!("i3mux:local:{name}"))

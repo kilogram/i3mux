@@ -37,6 +37,9 @@ session_restore_mode = { lines = 10000 }
 output_spool_lines = 10000
 # Leave the shell prompt unchanged.
 prompt_prefix = ""
+# New shells see the ssh login they started from, as in a fresh ssh login.
+# shpool adds these to its defaults: TERM, DISPLAY, LANG and SSH_AUTH_SOCK.
+forward_env = ["SSH_CONNECTION", "SSH_CLIENT"]
 "#;
 
 /// Shell prologue of every shpool command. `$1` is the config text; the
@@ -848,5 +851,16 @@ esac
             .unwrap()
             .collect();
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    }
+
+    #[test]
+    fn new_shells_see_the_ssh_login_they_started_from() {
+        // Plan-ssh-recovery rule 16. The key is shpool 0.11.5's spelling
+        // (libshpool src/config.rs, `forward_env`).
+        let config: toml::Table = toml::from_str(CONFIG).unwrap();
+        assert_eq!(
+            config["forward_env"],
+            toml::Value::Array(vec!["SSH_CONNECTION".into(), "SSH_CLIENT".into()])
+        );
     }
 }

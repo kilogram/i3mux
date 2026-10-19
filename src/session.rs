@@ -180,6 +180,7 @@ mod tests {
             RunnerConfig {
                 local_home: home.to_path_buf(),
                 ssh_control_dir: home.join("ssh"),
+                masters: std::sync::Arc::new(crate::master::DirectSsh),
             },
         )
     }

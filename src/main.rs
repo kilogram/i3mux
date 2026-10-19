@@ -8,10 +8,16 @@
 //! Every core function that changes bindings, windows or shells holds the
 //! state lock from its first read to its last write, so concurrent i3mux
 //! commands never interleave (plan rule 4).
+//!
+//! Every command, on success and on failure, ends in
+//! [`with_unused_masters_stopped`]: it stops the ssh master of each host the
+//! command touched that no workspace is bound to (plan-ssh-recovery
+//! rule 12). Nothing runs on a host after that stop.
 
 mod host;
 mod launch;
 mod layout;
+mod master;
 mod mux;
 mod session;
 mod state;
@@ -22,16 +28,18 @@ mod wm;
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use host::{HostExec, HostRunner, RunnerConfig};
-use launch::{Launcher, TerminalLauncher};
+use launch::{Launcher, RemoteAttach, TerminalLauncher, WindowCommand};
 use layout::Step;
+use master::{DirectSsh, Link, MasterState, Masters, SystemdMasters, TrackedMasters};
 use mux::{Choice, Shell};
 use serde_json::Value;
 use session::{SavedSession, SessionError};
@@ -114,7 +122,7 @@ enum CliCommand {
         #[arg(short, long)]
         all: bool,
     },
-    /// Show the session of the focused workspace, without contacting its host
+    /// Show the session of the focused workspace and its ssh connection, without contacting its host
     Status,
     /// End a session: close its windows, kill its shells, delete its saved layout
     Kill {
@@ -150,6 +158,8 @@ struct Ports<'a> {
     sway: &'a (dyn Sway + Sync),
     launcher: &'a (dyn Launcher + Sync),
     hosts: &'a HostFactory,
+    /// The ssh masters of remote hosts (plan-ssh-recovery decision 1).
+    masters: &'a (dyn Masters + Sync),
     log: Log,
     /// How long `detach` waits for shells to lose their clients.
     disconnect_wait: Duration,
@@ -205,15 +215,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// Wire the real ports and dispatch.
+/// Wire the real ports, run the command, then stop the masters it left unused.
 fn run(cli: Cli) -> Result<ExitCode> {
     let wm = Wm::connect()?;
     let store = StateStore::from_env()?;
-    let private_dir = private_runtime_dir()?;
+    let runtime_dir = runtime_dir()?;
+    let private_dir = private_runtime_dir(&runtime_dir)?;
     let launcher = TerminalLauncher::install(terminal_program(), &private_dir)?;
+    let inner: Box<dyn Masters + Send + Sync> = if master::systemd_user_manager_runs(&runtime_dir) {
+        let auth_sock = std::env::var("SSH_AUTH_SOCK")
+            .ok()
+            .filter(|s| !s.is_empty());
+        Box::new(SystemdMasters::new(private_dir.clone(), auth_sock))
+    } else {
+        Box::new(DirectSsh)
+    };
+    let masters = Arc::new(TrackedMasters::new(inner));
     let config = RunnerConfig {
         local_home: dirs::home_dir().context("cannot find the home directory; set HOME")?,
         ssh_control_dir: private_dir,
+        masters: Arc::clone(&masters) as Arc<dyn Masters + Send + Sync>,
     };
     let hosts = move |host: &Host| -> Box<dyn HostExec> {
         Box::new(HostRunner::new(host.clone(), config.clone()))
@@ -223,42 +244,101 @@ fn run(cli: Cli) -> Result<ExitCode> {
         sway: &wm,
         launcher: &launcher,
         hosts: &hosts,
+        masters: masters.as_ref(),
         log: Log {
             verbose: cli.verbose,
         },
         disconnect_wait: DISCONNECT_WAIT,
     };
-    match cli.command {
-        CliCommand::Activate { remote, session } => cmd_activate(&ports, &wm, remote, session),
+    with_unused_masters_stopped(&store, &masters, || {
+        dispatch(&ports, &wm, &launcher, cli.command)
+    })
+}
+
+fn dispatch(
+    ports: &Ports,
+    wm: &Wm,
+    launcher: &TerminalLauncher,
+    command: CliCommand,
+) -> Result<ExitCode> {
+    match command {
+        CliCommand::Activate { remote, session } => cmd_activate(ports, wm, remote, session),
         CliCommand::Terminal { exec, new, force } => {
             let request = TerminalRequest {
                 command: exec,
                 new,
                 force,
             };
-            cmd_terminal(&ports, &wm, &launcher, &request)
+            cmd_terminal(ports, wm, launcher, &request)
         }
-        CliCommand::Detach => cmd_detach(&ports, &wm),
+        CliCommand::Detach => cmd_detach(ports, wm),
         CliCommand::Attach {
             remote,
             session,
             force,
-        } => cmd_attach(&ports, &wm, remote, session, force),
-        CliCommand::Sessions { remote, all } => cmd_sessions(&ports, remote, all),
-        CliCommand::Status => cmd_status(&ports, &wm),
-        CliCommand::Kill { remote, session } => cmd_kill(&ports, &wm, remote, session),
+        } => cmd_attach(ports, wm, remote, session, force),
+        CliCommand::Sessions { remote, all } => cmd_sessions(ports, remote, all),
+        CliCommand::Status => cmd_status(ports, wm),
+        CliCommand::Kill { remote, session } => cmd_kill(ports, wm, remote, session),
     }
 }
 
-/// `$XDG_RUNTIME_DIR/i3mux`, created with mode 0700. Holds the terminal
-/// wrapper and the ssh control sockets (plan decision 8: nothing in /tmp).
-fn private_runtime_dir() -> Result<PathBuf> {
+/// Run `command`, then stop the ssh master of each host it touched that no
+/// workspace is bound to (plan-ssh-recovery rule 12), also when it failed.
+/// So a failed `activate` or `attach`, or `sessions --remote`, leaves no
+/// master behind. Hosts the command did not touch keep their masters.
+///
+/// The stop runs after the command's last remote command, and under the
+/// state lock, so no concurrent command binds the host between the check and
+/// the stop. A command that touched no host takes no lock. The command's
+/// error wins over a failed stop, which is then printed as a warning.
+fn with_unused_masters_stopped<T>(
+    store: &StateStore,
+    masters: &TrackedMasters,
+    command: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let result = command();
+    match (result, stop_unused_masters(store, masters)) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(stop_err)) => Err(stop_err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(stop_err)) => {
+            eprintln!("i3mux: warning: {stop_err:#}");
+            Err(err)
+        }
+    }
+}
+
+/// Stop the masters of the touched hosts that no binding uses.
+fn stop_unused_masters(store: &StateStore, masters: &TrackedMasters) -> Result<()> {
+    let touched = masters.touched_hosts();
+    if touched.is_empty() {
+        return Ok(());
+    }
+    let lock = store.lock()?;
+    for remote in touched {
+        let host = Host::Ssh(remote.clone());
+        if lock.state().bindings().all(|(_, b)| b.host() != &host) {
+            masters.stop(&remote)?;
+        }
+    }
+    Ok(())
+}
+
+/// `$XDG_RUNTIME_DIR`.
+fn runtime_dir() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|d| !d.is_empty())
         .context(
             "XDG_RUNTIME_DIR is not set; i3mux keeps its terminal wrapper and ssh sockets there",
         )?;
-    let dir = PathBuf::from(runtime).join("i3mux");
+    Ok(PathBuf::from(runtime))
+}
+
+/// `<runtime_dir>/i3mux`, created with mode 0700. Holds the terminal
+/// wrapper and the ssh control sockets (plan decision 8: nothing in /tmp).
+fn private_runtime_dir(runtime_dir: &Path) -> Result<PathBuf> {
+    let dir = runtime_dir.join("i3mux");
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("cannot restrict {}", dir.display()))?;
@@ -393,11 +473,11 @@ fn cmd_sessions(ports: &Ports, remote: Option<String>, all: bool) -> Result<Exit
 
 fn cmd_status(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
     let workspace = wm.focused_workspace()?;
-    let Some(row) = status(ports, workspace.name())? else {
+    let Some(report) = status(ports, workspace.name())? else {
         println!("Workspace {}: no session", workspace.name());
         return Ok(ExitCode::from(EXIT_UNBOUND));
     };
-    for line in format_rows(&[row]) {
+    for line in format_status(&report) {
         println!("{line}");
     }
     Ok(ExitCode::SUCCESS)
@@ -547,14 +627,41 @@ fn open_window(
     command: Option<&str>,
 ) -> Result<()> {
     let mark = Mark::new(host.host().clone(), terminal.clone());
-    let argv = mux::attach_argv(host, terminal, force, command);
+    let window = window_command(ports, host, terminal, force, command)?;
     ports
         .log
-        .debug(|| format!("opening {mark}: {}", shell_words::join(&argv)));
+        .debug(|| format!("opening {mark}: {}", shell_words::join(window.argv())));
     let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
-    ports.launcher.spawn(&mark.app_id(), &title, &argv)?;
+    ports.launcher.spawn(&mark.app_id(), &title, &window)?;
     sway_ops::wait_for_window_and_mark(ports.sway, &mark)?;
     Ok(())
+}
+
+/// What the window of `terminal` runs. A remote window goes through its
+/// host's ssh master, which this starts first (plan-ssh-recovery rule 1),
+/// and gets the `--force` argv that it reattaches with after a dropped
+/// connection (rule 8).
+fn window_command(
+    ports: &Ports,
+    host: &dyn HostExec,
+    terminal: &TerminalName,
+    force: bool,
+    command: Option<&str>,
+) -> Result<WindowCommand> {
+    let argv = mux::attach_argv(host, terminal, force, command);
+    let Host::Ssh(remote) = host.host() else {
+        return Ok(WindowCommand::Plain(argv));
+    };
+    Ok(match ports.masters.ensure_started(remote)? {
+        Link::Direct => WindowCommand::Plain(argv),
+        Link::Shared(unit) => WindowCommand::Remote(RemoteAttach {
+            argv,
+            reattach: mux::attach_argv(host, terminal, true, command),
+            unit,
+            host: remote.clone(),
+            shell: terminal.clone(),
+        }),
+    })
 }
 
 #[derive(Debug)]
@@ -899,24 +1006,50 @@ fn sessions_all(ports: &Ports, extra: Option<Host>) -> Result<Listing> {
     })
 }
 
-/// The session bound to `workspace` and its window count, from local state
-/// and Sway only, so it answers fast even when the host is slow or down.
-/// Orphans need the host, so they are not counted.
-fn status(ports: &Ports, workspace: &str) -> Result<Option<SessionRow>> {
+/// What `i3mux status` shows.
+#[derive(Debug)]
+struct StatusReport {
+    row: SessionRow,
+    /// The state of a remote host's ssh master; `None` for this machine.
+    connection: Option<MasterState>,
+}
+
+/// The session bound to `workspace`, its window count, and the state of
+/// its host's ssh master, from local state, Sway and systemd only, so it
+/// answers fast even when the host is slow or down (plan-ssh-recovery
+/// rule 13). Orphans need the host, so they are not counted.
+fn status(ports: &Ports, workspace: &str) -> Result<Option<StatusReport>> {
     let Some(binding) = ports.store.load()?.get(workspace).cloned() else {
         return Ok(None);
     };
     let tree = ports.sway.get_tree()?;
     let windows = window::session_terminals(&tree, binding.host(), binding.session()).len();
-    Ok(Some(SessionRow {
-        name: binding.session().clone(),
-        host: binding.host().clone(),
-        status: RowStatus::Bound {
-            workspace: workspace.to_owned(),
-            windows,
-            orphans: 0,
+    let connection = match binding.host() {
+        Host::Local => None,
+        Host::Ssh(remote) => Some(ports.masters.state(remote)?),
+    };
+    Ok(Some(StatusReport {
+        row: SessionRow {
+            name: binding.session().clone(),
+            host: binding.host().clone(),
+            status: RowStatus::Bound {
+                workspace: workspace.to_owned(),
+                windows,
+                orphans: 0,
+            },
         },
+        connection,
     }))
+}
+
+/// The row, then `  connection: ...` for a remote host. The first line is
+/// a `sessions` row; scripts/i3mux-rofi reads its first word and host.
+fn format_status(report: &StatusReport) -> Vec<String> {
+    let mut lines = format_rows(std::slice::from_ref(&report.row));
+    if let Some(connection) = &report.connection {
+        lines.push(format!("  connection: {connection}"));
+    }
+    lines
 }
 
 /// The saved layout's size, or [`RowStatus::Unreadable`] if it is corrupt.

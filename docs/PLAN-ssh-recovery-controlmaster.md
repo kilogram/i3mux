@@ -97,9 +97,8 @@ fresh ssh login.
     hosts that take a shell from each other do not start a loop.
 11. On the landing page, Enter restarts the unit at once, and `q` closes
     the window.
-12. `detach` and `kill` stop the unit when no bound workspace uses the host.
-    `detach` closes the windows before it detaches the shells, as it does
-    today. Logout stops all units.
+12. After each command, i3mux stops the unit of each host that the command
+    used and that no bound workspace uses. Logout stops all units.
 13. `i3mux status` adds the connection state of the focused workspace's
     host.
 14. The local host has no unit and no landing page. Nothing changes for it.

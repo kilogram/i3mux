@@ -11,6 +11,13 @@
 //! - Remote commands run under `bash -l`, so `PATH` is the login `PATH`.
 //! - An ssh transport failure (exit 255) is [`HostError::Unreachable`]; a
 //!   command that ran and failed is [`HostError::Failed`].
+//! - Every remote command first makes sure the host's ssh master runs
+//!   ([`Masters::ensure_started`], plan-ssh-recovery rule 1). One function,
+//!   [`HostRunner::ssh_argv`], builds every ssh client argv, for commands
+//!   and windows alike: a client of the master that never starts a master
+//!   itself, never forwards ports, and fails on a dead link instead of
+//!   hanging (rule 4). A client that the master refuses connects on its own
+//!   (rule 5).
 //! - File paths are relative to the home directory of the host user. The
 //!   file operations are POSIX `sh` scripts that run through [`HostExec::run`],
 //!   so local and remote use the same code.
@@ -24,7 +31,9 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
+use crate::master::{self, MasterError, Masters, LIVENESS_OPTIONS};
 use crate::types::{Host, RemoteHost};
 
 /// Exit status the file scripts use for "no such file" (the literal 44 in
@@ -103,6 +112,8 @@ pub enum HostError {
     NoStartMarker { host: RemoteHost },
     #[error("i3mux bug: tried to run an empty command")]
     EmptyCommand,
+    #[error(transparent)]
+    Master(#[from] MasterError),
 }
 
 fn exit_text(code: Option<i32>) -> String {
@@ -120,7 +131,8 @@ pub trait HostExec {
     ///
     /// # Errors
     /// [`HostError::Unreachable`] if ssh cannot connect, [`HostError::Failed`]
-    /// if the command exits non-zero, [`HostError::Spawn`] if it cannot start.
+    /// if the command exits non-zero, [`HostError::Spawn`] if it cannot start,
+    /// [`HostError::Master`] if the host's ssh master does not start.
     fn run(&self, argv: &[String], stdin: Option<&str>) -> Result<String, HostError>;
 
     /// The argv a local terminal runs to execute `argv` interactively on
@@ -155,16 +167,18 @@ pub trait HostExec {
 }
 
 /// Local settings a [`HostRunner`] needs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunnerConfig {
     /// Home directory of the local user; exported as `HOME` to local commands.
     pub local_home: PathBuf,
     /// Private (0700) directory for ssh control sockets.
     pub ssh_control_dir: PathBuf,
+    /// Starts the ssh master of a remote host before each remote command.
+    pub masters: Arc<dyn Masters + Send + Sync>,
 }
 
 /// Runs commands on a [`Host`] with real processes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostRunner {
     host: Host,
     config: RunnerConfig,
@@ -176,24 +190,27 @@ impl HostRunner {
         Self { host, config }
     }
 
-    /// `ssh ... HOST -- 'bash -lc ...'`. With `tty`, a terminal is
-    /// allocated and `TERM` is set for the remote side. Without it, the
-    /// command prints [`START_MARKER`] before running `argv`.
+    /// `ssh ... HOST -- 'bash -lc ...'`, the argv of every ssh client
+    /// (plan-ssh-recovery rule 4). With `tty`, a terminal is allocated and
+    /// `TERM` is set for the remote side. Without it, the command prints
+    /// [`START_MARKER`] before running `argv`.
+    ///
+    /// The client goes through the master's control socket and never starts
+    /// a master (`ControlMaster=no`). Without a socket, or when the master
+    /// refuses it (sshd `MaxSessions`), ssh connects on its own. Forwards
+    /// belong to the master, so the client clears them: they would collide.
     fn ssh_argv(&self, remote: &RemoteHost, tty: bool, argv: &[String]) -> Vec<String> {
         let script = remote_script(argv, !tty);
-        let control_path = self.config.ssh_control_dir.join("ssh-%r@%h:%p");
+        let control_socket = master::control_socket(&self.config.ssh_control_dir, remote);
         let mut ssh = Vec::new();
         if tty {
             ssh.extend(["env".to_owned(), REMOTE_TERM.to_owned()]);
         }
+        ssh.extend(["ssh".to_owned(), "-S".to_owned()]);
+        ssh.push(control_socket.display().to_string());
+        ssh.extend(["-o", "ControlMaster=no", "-o", "ClearAllForwardings=yes"].map(str::to_owned));
+        ssh.extend(LIVENESS_OPTIONS.map(str::to_owned));
         ssh.extend([
-            "ssh".to_owned(),
-            "-o".to_owned(),
-            format!("ControlPath={}", control_path.display()),
-            "-o".to_owned(),
-            "ControlMaster=auto".to_owned(),
-            "-o".to_owned(),
-            "ControlPersist=10m".to_owned(),
             if tty { "-t" } else { "-T" }.to_owned(),
             remote.as_str().to_owned(),
             "--".to_owned(),
@@ -202,10 +219,15 @@ impl HostRunner {
         ssh
     }
 
+    /// The command that runs `argv` on the host. For a remote host, this
+    /// first starts the host's ssh master unless it runs.
     fn command_for(&self, argv: &[String]) -> Result<Command, HostError> {
         let argv = match &self.host {
             Host::Local => argv.to_vec(),
-            Host::Ssh(remote) => self.ssh_argv(remote, false, argv),
+            Host::Ssh(remote) => {
+                self.config.masters.ensure_started(remote)?;
+                self.ssh_argv(remote, false, argv)
+            }
         };
         let (program, arguments) = argv.split_first().ok_or(HostError::EmptyCommand)?;
         let mut command = Command::new(program);
@@ -362,6 +384,7 @@ fn run_captured(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::DirectSsh;
     use std::path::Path;
 
     fn local(home: &Path) -> HostRunner {
@@ -370,6 +393,7 @@ mod tests {
             RunnerConfig {
                 local_home: home.to_path_buf(),
                 ssh_control_dir: home.join("ssh"),
+                masters: Arc::new(DirectSsh),
             },
         )
     }
@@ -380,6 +404,7 @@ mod tests {
             RunnerConfig {
                 local_home: "/home/me".into(),
                 ssh_control_dir: "/run/user/1000/i3mux".into(),
+                masters: Arc::new(DirectSsh),
             },
         )
     }
@@ -512,16 +537,91 @@ mod tests {
     }
 
     #[test]
-    fn ssh_run_argv_uses_control_socket_and_ends_options() {
+    fn every_ssh_client_shares_the_master_and_never_starts_one() {
+        // Plan-ssh-recovery rule 4, and rule 15: no ControlMaster=auto and no
+        // ControlPersist, so no client ever becomes a master.
+        let runner = remote("user@deepthought");
+        let argv = strings(&["true"]);
+        let host = RemoteHost::new("user@deepthought").unwrap();
+        let mut expected = strings(&[
+            "ssh",
+            "-S",
+            "/run/user/1000/i3mux/user@deepthought.ctl",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ClearAllForwardings=yes",
+        ]);
+        expected.extend(LIVENESS_OPTIONS.map(str::to_owned));
+        let run = runner.ssh_argv(&host, false, &argv);
+        let attach = runner.ssh_argv(&host, true, &argv);
+        assert_eq!(run[..expected.len()], expected);
+        assert_eq!(attach[2..2 + expected.len()], expected);
+        for argv in [&run, &attach] {
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a.contains("ControlPersist") || a == "-M"),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// Masters that refuse to start, and record each host they were asked for.
+    #[derive(Default)]
+    struct RefusingMasters {
+        asked: std::sync::Mutex<Vec<RemoteHost>>,
+    }
+
+    impl Masters for RefusingMasters {
+        fn ensure_started(&self, host: &RemoteHost) -> Result<master::Link, MasterError> {
+            self.asked.lock().unwrap().push(host.clone());
+            Err(MasterError::Systemd {
+                command: "systemd-run".into(),
+                detail: "refused".into(),
+            })
+        }
+        fn stop(&self, _: &RemoteHost) -> Result<(), MasterError> {
+            unreachable!()
+        }
+        fn state(&self, _: &RemoteHost) -> Result<master::MasterState, MasterError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn every_remote_command_starts_the_master_before_ssh() {
+        // Plan-ssh-recovery rule 1. The master refuses, so ssh never runs and
+        // the master's error reaches the caller.
+        let masters = Arc::new(RefusingMasters::default());
+        let runner = HostRunner::new(
+            Host::Ssh(RemoteHost::new("deepthought").unwrap()),
+            RunnerConfig {
+                local_home: "/home/me".into(),
+                ssh_control_dir: "/run/user/1000/i3mux".into(),
+                masters: masters.clone(),
+            },
+        );
+        let err = runner.run(&strings(&["true"]), None).unwrap_err();
+        assert!(matches!(err, HostError::Master(_)), "{err:?}");
+        assert!(runner.read_file("x").is_err());
+        assert_eq!(
+            *masters.asked.lock().unwrap(),
+            [
+                RemoteHost::new("deepthought").unwrap(),
+                RemoteHost::new("deepthought").unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_run_argv_ends_options_before_the_command() {
         let runner = remote("user@deepthought");
         let argv = runner.ssh_argv(
             &RemoteHost::new("user@deepthought").unwrap(),
             false,
             &strings(&["true"]),
         );
-        assert_eq!(argv[0], "ssh");
-        assert!(argv.contains(&"ControlPath=/run/user/1000/i3mux/ssh-%r@%h:%p".to_owned()));
-        assert!(argv.contains(&"ControlMaster=auto".to_owned()));
         assert!(argv.contains(&"-T".to_owned()));
         let host_at = argv.iter().position(|a| a == "user@deepthought").unwrap();
         assert_eq!(argv[host_at + 1], "--");

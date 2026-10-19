@@ -9,6 +9,7 @@ use std::time::Duration;
 use super::*;
 use crate::host::HostError;
 use crate::layout::Layout;
+use crate::master::{MasterError, TrackedMasters, UnitName};
 use crate::sway_ops::testing::FakeSway;
 use crate::types::RemoteHost;
 
@@ -54,18 +55,21 @@ impl HostState {
 }
 
 /// An in-memory host. Understands `shpool list --json` and `shpool kill`
-/// by the argv tail; everything else succeeds silently.
+/// by the argv tail; everything else succeeds silently. Like `HostRunner`,
+/// every operation on a remote host first starts the host's ssh master.
 #[derive(Clone)]
 struct FakeHost {
     host: Host,
     state: Arc<Mutex<HostState>>,
+    masters: Arc<dyn Masters + Send + Sync>,
 }
 
 impl FakeHost {
-    fn new(host: Host) -> Self {
+    fn new(host: Host, masters: Arc<dyn Masters + Send + Sync>) -> Self {
         Self {
             host,
             state: Arc::default(),
+            masters,
         }
     }
 
@@ -94,7 +98,12 @@ impl FakeHost {
         }
     }
 
-    fn check_reachable(&self) -> Result<(), HostError> {
+    /// What every `HostRunner` operation does first: start the master of a
+    /// remote host, then reach the host.
+    fn connect(&self) -> Result<(), HostError> {
+        if let Host::Ssh(remote) = &self.host {
+            self.masters.ensure_started(remote)?;
+        }
         if self.state.lock().unwrap().unreachable {
             return Err(HostError::Unreachable {
                 host: RemoteHost::new("fake").unwrap(),
@@ -111,7 +120,7 @@ impl HostExec for FakeHost {
     }
 
     fn run(&self, argv: &[String], _stdin: Option<&str>) -> Result<String, HostError> {
-        self.check_reachable()?;
+        self.connect()?;
         let mut state = self.state.lock().unwrap();
         if argv.ends_with(&["list".to_owned(), "--json".to_owned()]) {
             state.advance_detaches();
@@ -152,7 +161,7 @@ impl HostExec for FakeHost {
     }
 
     fn write_file_atomic(&self, path: &str, content: &str) -> Result<(), HostError> {
-        self.check_reachable()?;
+        self.connect()?;
         let mut state = self.state.lock().unwrap();
         if state.fail_writes {
             return Err(self.failure("No space left on device"));
@@ -162,12 +171,12 @@ impl HostExec for FakeHost {
     }
 
     fn read_file(&self, path: &str) -> Result<Option<String>, HostError> {
-        self.check_reachable()?;
+        self.connect()?;
         Ok(self.file(path))
     }
 
     fn list_dir(&self, dir: &str) -> Result<Vec<String>, HostError> {
-        self.check_reachable()?;
+        self.connect()?;
         let prefix = format!("{dir}/");
         let state = self.state.lock().unwrap();
         Ok(state
@@ -178,8 +187,107 @@ impl HostExec for FakeHost {
     }
 
     fn remove_file(&self, path: &str) -> Result<bool, HostError> {
-        self.check_reachable()?;
+        self.connect()?;
         Ok(self.state.lock().unwrap().files.remove(path).is_some())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MasterEvent {
+    Ensure(RemoteHost),
+    Stop(RemoteHost),
+}
+
+#[derive(Default)]
+struct MasterLog {
+    events: Vec<MasterEvent>,
+    /// Make `ensure_started` fail.
+    fail_start: bool,
+    /// Report no masters, as on a machine without systemd.
+    direct: bool,
+}
+
+/// Records, in order, each start and stop of a host's master. Every master
+/// is `i3mux-ssh-fake.service`, active with 2 restarts.
+#[derive(Clone, Default)]
+struct FakeMasters {
+    log: Arc<Mutex<MasterLog>>,
+}
+
+impl FakeMasters {
+    fn unit() -> UnitName {
+        UnitName::from_escaped_host("fake").unwrap()
+    }
+
+    fn events(&self) -> Vec<MasterEvent> {
+        self.log.lock().unwrap().events.clone()
+    }
+
+    fn ensured(&self) -> Vec<RemoteHost> {
+        let events = self.events().into_iter();
+        events
+            .filter_map(|e| match e {
+                MasterEvent::Ensure(h) => Some(h),
+                MasterEvent::Stop(_) => None,
+            })
+            .collect()
+    }
+
+    fn stopped(&self) -> Vec<RemoteHost> {
+        let events = self.events().into_iter();
+        events
+            .filter_map(|e| match e {
+                MasterEvent::Stop(h) => Some(h),
+                MasterEvent::Ensure(_) => None,
+            })
+            .collect()
+    }
+
+    /// Whether the master of `host` runs: its last event is a start. A
+    /// remote command after a stop starts it again, so `false` after a stop
+    /// also means that nothing ran on the host after it.
+    fn running(&self, host: &RemoteHost) -> bool {
+        self.events()
+            .iter()
+            .rev()
+            .find(|e| matches!(e, MasterEvent::Ensure(h) | MasterEvent::Stop(h) if h == host))
+            .is_some_and(|e| matches!(e, MasterEvent::Ensure(_)))
+    }
+}
+
+impl Masters for FakeMasters {
+    fn ensure_started(&self, host: &RemoteHost) -> Result<Link, MasterError> {
+        let mut log = self.log.lock().unwrap();
+        log.events.push(MasterEvent::Ensure(host.clone()));
+        if log.fail_start {
+            return Err(MasterError::StartFailed {
+                host: host.clone(),
+                unit: Self::unit(),
+                detail: "ssh: Could not resolve hostname".into(),
+            });
+        }
+        Ok(if log.direct {
+            Link::Direct
+        } else {
+            Link::Shared(Self::unit())
+        })
+    }
+
+    fn stop(&self, host: &RemoteHost) -> Result<(), MasterError> {
+        self.log
+            .lock()
+            .unwrap()
+            .events
+            .push(MasterEvent::Stop(host.clone()));
+        Ok(())
+    }
+
+    fn state(&self, _host: &RemoteHost) -> Result<MasterState, MasterError> {
+        Ok(MasterState::Unit {
+            unit: Self::unit(),
+            active_state: "active".into(),
+            restarts: 2,
+        })
     }
 }
 
@@ -190,17 +298,25 @@ struct FakeLauncher {
     sway: Arc<FakeSway>,
     host: FakeHost,
     workspace: String,
-    launches: Mutex<Vec<Vec<String>>>,
+    launches: Mutex<Vec<WindowCommand>>,
     fail_after: Option<usize>,
 }
 
+impl FakeLauncher {
+    /// The argv of each launch, in order.
+    fn argvs(&self) -> Vec<Vec<String>> {
+        let launches = self.launches.lock().unwrap();
+        launches.iter().map(|c| c.argv().to_vec()).collect()
+    }
+}
+
 impl Launcher for FakeLauncher {
-    fn spawn(&self, app_id: &str, _title: &str, argv: &[String]) -> Result<()> {
+    fn spawn(&self, app_id: &str, _title: &str, command: &WindowCommand) -> Result<()> {
         let mut launches = self.launches.lock().unwrap();
         if self.fail_after.is_some_and(|n| launches.len() >= n) {
             anyhow::bail!("terminal crashed");
         }
-        launches.push(argv.to_vec());
+        launches.push(command.clone());
         let mark = Mark::parse(app_id).unwrap();
         self.host.add_shell(&mark.terminal().to_string(), true);
         self.sway.open(&self.workspace, app_id);
@@ -217,6 +333,9 @@ struct World {
     host: FakeHost,
     launcher: FakeLauncher,
     hosts: Box<HostFactory>,
+    /// The masters' log; `masters` wraps it as `run` does.
+    fakes: FakeMasters,
+    masters: Arc<TrackedMasters>,
 }
 
 impl World {
@@ -224,7 +343,9 @@ impl World {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path().join("state.json"));
         let sway = Arc::new(FakeSway::default());
-        let host = FakeHost::new(host);
+        let fakes = FakeMasters::default();
+        let masters = Arc::new(TrackedMasters::new(Box::new(fakes.clone())));
+        let host = FakeHost::new(host, masters.clone());
         let launcher = FakeLauncher {
             sway: Arc::clone(&sway),
             host: host.clone(),
@@ -244,7 +365,15 @@ impl World {
             host,
             launcher,
             hosts,
+            fakes,
+            masters,
         }
+    }
+
+    /// Run a core function as `run` runs a command: then stop the masters
+    /// that no workspace uses.
+    fn finish<T>(&self, command: impl FnOnce(&Ports) -> Result<T>) -> Result<T> {
+        with_unused_masters_stopped(&self.store, &self.masters, || command(&self.ports()))
     }
 
     fn ports(&self) -> Ports<'_> {
@@ -253,6 +382,7 @@ impl World {
             sway: self.sway.as_ref(),
             launcher: &self.launcher,
             hosts: self.hosts.as_ref(),
+            masters: self.masters.as_ref(),
             log: Log { verbose: false },
             disconnect_wait: Duration::from_millis(300),
         }
@@ -370,7 +500,7 @@ fn terminal_takes_over_a_shell_attached_elsewhere_only_with_force() {
         open_terminal(&world.ports(), "4", &forced).unwrap(),
         Choice::Reattach(t("ws4", 1))
     );
-    let launch = &world.launcher.launches.lock().unwrap()[0];
+    let launch = &world.launcher.argvs()[0];
     assert_eq!(launch[launch.len() - 3..], ["attach", "-f", "ws4-001"]);
 }
 
@@ -388,7 +518,7 @@ fn terminal_with_a_command_always_starts_a_new_shell() {
         open_terminal(&world.ports(), "4", &request).unwrap(),
         Choice::Create(t("ws4", 2))
     );
-    let launch = &world.launcher.launches.lock().unwrap()[0];
+    let launch = &world.launcher.argvs()[0];
     assert_eq!(
         launch[launch.len() - 4..],
         ["attach", "-c", "htop -d 5", "ws4-002"]
@@ -667,7 +797,7 @@ fn attach_refuses_a_shell_attached_elsewhere() {
     assert_eq!(world.sway.window_count(), 0);
 
     attach(&world.ports(), &Host::Local, "4", None, true).unwrap();
-    let launches = world.launcher.launches.lock().unwrap();
+    let launches = world.launcher.argvs();
     assert!(launches.iter().all(|argv| argv.contains(&"-f".to_owned())));
 }
 
@@ -764,7 +894,9 @@ fn kill_on_unreachable_host_leaves_windows_open() {
     world.sway.open_marked("4", &world.mark("ws4-001"));
     world.host.state.lock().unwrap().unreachable = true;
 
-    let err = kill(&world.ports(), &remote, &name("ws4")).unwrap_err();
+    let err = world
+        .finish(|ports| kill(ports, &remote, &name("ws4")))
+        .unwrap_err();
 
     assert!(err.to_string().contains("cannot reach"), "{err:#}");
     assert!(
@@ -774,6 +906,7 @@ fn kill_on_unreachable_host_leaves_windows_open() {
     );
     assert_eq!(world.window_numbers("ws4"), [1]);
     assert!(world.store.load().unwrap().get("4").is_some());
+    assert!(world.fakes.stopped().is_empty(), "ws4 is still bound");
 }
 
 #[test]
@@ -884,7 +1017,7 @@ fn sessions_row_wording() {
 /// A world on a remote host, plus a second fake host for this machine,
 /// so `sessions_all` can ask both.
 fn with_local_host(world: &World) -> (FakeHost, Box<HostFactory>) {
-    let local = FakeHost::new(Host::Local);
+    let local = FakeHost::new(Host::Local, world.masters.clone());
     let (remote, local_for_factory) = (world.host.clone(), local.clone());
     let hosts: Box<HostFactory> = Box::new(move |h: &Host| -> Box<dyn HostExec> {
         if h == &Host::Local {
@@ -964,6 +1097,178 @@ fn sessions_all_survives_an_unreachable_host() {
     assert_eq!(listing.failed[0].0, deepthought());
 }
 
+// ---------------------------------------------------------- ssh masters
+
+fn dt() -> RemoteHost {
+    RemoteHost::new("deepthought").unwrap()
+}
+
+#[test]
+fn remote_window_goes_through_the_hosts_master() {
+    // Plan-ssh-recovery rules 1 and 8: the master runs before the window
+    // opens, and the window knows its unit and how to reattach with --force.
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+
+    world
+        .finish(|ports| open_terminal(ports, "4", &TerminalRequest::default()))
+        .unwrap();
+
+    assert!(world.fakes.running(&dt()), "{:?}", world.fakes.events());
+    let launches = world.launcher.launches.lock().unwrap();
+    let WindowCommand::Remote(remote) = &launches[0] else {
+        panic!("{launches:?}")
+    };
+    assert_eq!(remote.unit, FakeMasters::unit());
+    assert_eq!((&remote.host, &remote.shell), (&dt(), &t("ws4", 1)));
+    assert_eq!(remote.argv[remote.argv.len() - 2..], ["attach", "ws4-001"]);
+    assert_eq!(
+        remote.reattach[remote.reattach.len() - 3..],
+        ["attach", "-f", "ws4-001"]
+    );
+}
+
+#[test]
+fn local_window_has_no_master() {
+    // Plan-ssh-recovery rule 14.
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world
+        .finish(|ports| open_terminal(ports, "4", &TerminalRequest::default()))
+        .unwrap();
+    assert!(world.fakes.events().is_empty());
+    let launches = world.launcher.launches.lock().unwrap();
+    assert!(
+        matches!(launches[0], WindowCommand::Plain(_)),
+        "{launches:?}"
+    );
+}
+
+#[test]
+fn remote_window_without_masters_is_a_plain_window() {
+    // No systemd user manager: each ssh connects on its own, as before.
+    let world = World::new(deepthought());
+    world.fakes.log.lock().unwrap().direct = true;
+    world.bind("4", "ws4");
+    open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    let launches = world.launcher.launches.lock().unwrap();
+    assert!(
+        matches!(launches[0], WindowCommand::Plain(_)),
+        "{launches:?}"
+    );
+}
+
+#[test]
+fn no_window_opens_when_the_master_does_not_start() {
+    // Plan-ssh-recovery rule 6.
+    let world = World::new(deepthought());
+    world.fakes.log.lock().unwrap().fail_start = true;
+    world.bind("4", "ws4");
+
+    let err = open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .ends_with("Log: journalctl --user -u i3mux-ssh-fake.service"),
+        "{err:#}"
+    );
+    assert!(world.launcher.launches.lock().unwrap().is_empty());
+    assert_eq!(world.sway.window_count(), 0);
+}
+
+// Plan-ssh-recovery rule 12: after each command, the masters of the hosts it
+// touched that no workspace uses stop. `running() == false` after a stop also
+// shows that nothing ran on the host after the stop.
+
+#[test]
+fn detach_of_the_last_workspace_on_a_host_stops_its_master() {
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+    world.host.state.lock().unwrap().detach_lag = 2;
+    world
+        .finish(|ports| open_terminal(ports, "4", &TerminalRequest::default()))
+        .unwrap();
+    assert!(world.fakes.running(&dt()));
+
+    world.finish(|ports| detach(ports, "4", 0)).unwrap();
+
+    assert_eq!(world.fakes.stopped(), [dt()]);
+    assert!(!world.fakes.running(&dt()), "{:?}", world.fakes.events());
+}
+
+#[test]
+fn a_master_stays_while_another_workspace_uses_the_host() {
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+    world.bind("5", "ws5");
+    world.host.add_shell("ws4-001", false);
+    open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+
+    world.finish(|ports| detach(ports, "4", 0)).unwrap();
+    world
+        .finish(|ports| kill(ports, &deepthought(), &name("ws4")))
+        .unwrap();
+
+    assert!(world.fakes.stopped().is_empty(), "ws5 is still bound");
+    assert!(world.fakes.running(&dt()));
+}
+
+#[test]
+fn kill_of_the_last_session_on_a_host_stops_its_master() {
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+    world.host.add_shell("ws4-001", true);
+
+    world
+        .finish(|ports| kill(ports, &deepthought(), &name("ws4")))
+        .unwrap();
+
+    assert_eq!(world.fakes.stopped(), [dt()]);
+    assert!(!world.fakes.running(&dt()));
+}
+
+#[test]
+fn failed_attach_leaves_no_master_running() {
+    // The command fails, and its error is still the one the caller sees.
+    let world = World::new(deepthought());
+
+    let err = world
+        .finish(|ports| attach(ports, &deepthought(), "4", Some(name("nope")), false))
+        .unwrap_err();
+
+    assert!(matches!(
+        command_error(&err),
+        CommandError::NoSavedSession { .. }
+    ));
+    assert!(!world.fakes.ensured().is_empty(), "attach asked the host");
+    assert_eq!(world.fakes.stopped(), [dt()]);
+    assert!(!world.fakes.running(&dt()));
+}
+
+#[test]
+fn sessions_of_an_unbound_host_stop_its_master() {
+    let world = World::new(deepthought());
+    world.host.add_shell("ws4-001", false);
+
+    let rows = world
+        .finish(|ports| sessions(ports, &deepthought()))
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(world.fakes.stopped(), [dt()]);
+    assert!(!world.fakes.running(&dt()));
+}
+
+#[test]
+fn only_masters_the_command_touched_are_stopped() {
+    // A local command touches no remote host, so it stops nothing, even
+    // with no workspace bound anywhere.
+    let world = World::new(Host::Local);
+    world.finish(|ports| sessions(ports, &Host::Local)).unwrap();
+    assert!(world.fakes.events().is_empty());
+}
+
 // --------------------------------------------------------------- status
 
 #[test]
@@ -974,11 +1279,30 @@ fn status_shows_the_focused_session_without_asking_the_host() {
     world.sway.open_marked("3", &world.mark("ws3-002"));
     world.host.state.lock().unwrap().unreachable = true;
 
-    let row = status(&world.ports(), "3").unwrap().unwrap();
+    let report = world.finish(|ports| status(ports, "3")).unwrap().unwrap();
 
+    // Plan-ssh-recovery rule 13: the master's state comes from systemd.
     assert_eq!(
-        format_rows(&[row]),
-        ["ws3  (deepthought)  workspace 3, 2 windows"]
+        format_status(&report),
+        [
+            "ws3  (deepthought)  workspace 3, 2 windows",
+            "  connection: active, 2 restarts (i3mux-ssh-fake.service)",
+        ]
+    );
+    assert!(
+        world.fakes.events().is_empty(),
+        "status starts and stops nothing"
+    );
+}
+
+#[test]
+fn status_of_a_local_session_has_no_connection() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    let report = status(&world.ports(), "4").unwrap().unwrap();
+    assert_eq!(
+        format_status(&report),
+        ["ws4  (local)  workspace 4, 0 windows"]
     );
 }
 

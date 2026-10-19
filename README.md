@@ -41,7 +41,7 @@ i3mux detach                      # save the layout, close the windows, keep the
 i3mux attach --session ws3        # restore the layout and reattach every shell
 i3mux sessions [--remote host]    # what exists, where, and in what state
 i3mux sessions --all              # this machine and every host a workspace is bound to
-i3mux status                      # the focused workspace's session (exit 3 if none)
+i3mux status                      # the focused workspace's session and ssh connection (exit 3 if none)
 i3mux kill --session ws3          # kill the shells and forget the layout
 ```
 
@@ -54,9 +54,12 @@ on `activate`, `attach` and `kill`.
 
 ```
  Sway workspace 3  ──bound to──►  session "ws3" on dev-box
-   ├─ window  _i3mux:dev-box:ws3-001  ── ssh dev-box ── shpool attach ws3-001
-   ├─ window  _i3mux:dev-box:ws3-002  ── ssh dev-box ── shpool attach ws3-002
+   ├─ window  _i3mux:dev-box:ws3-001  ── ssh client ── shpool attach ws3-001
+   ├─ window  _i3mux:dev-box:ws3-002  ── ssh client ── shpool attach ws3-002
    └─ Firefox                         (not an i3mux window, ignored)
+
+ systemd --user: i3mux-ssh-dev-box.service ── ssh master ══► dev-box
+   (every ssh client above goes through this one connection)
 
  ~/.config/i3mux/state.json          which workspace is bound to which session
  dev-box:~/.local/state/i3mux/       saved layouts, one JSON file per session,
@@ -80,9 +83,31 @@ Closing a window never kills a shell. Only `exit` in the shell or
 ## Remote hosts
 
 Shells run under the remote user's login shell with the login `PATH`, so
-`shpool` only needs to be on the path there. i3mux uses ssh `ControlMaster`,
-so the second terminal opens in tens of milliseconds. Run
-`loginctl enable-linger` on the remote so shells survive the last logout.
+`shpool` only needs to be on the path there. Run `loginctl enable-linger` on
+the remote so shells survive the last logout.
+
+i3mux keeps one ssh connection per remote host: an ssh master that runs as
+the systemd user unit `i3mux-ssh-HOST`. Every window and every i3mux
+command on that host goes through it, so a new terminal opens in tens of
+milliseconds. When the network drops, the windows stay where they are.
+Each one shows what happened and how systemd retries:
+
+```
+[i3mux] Connection to dev-box lost. Shell ws3-002 is safe on the host.
+[i3mux] ssh: connect to host dev-box port 22: Network is unreachable
+[i3mux] Reconnecting: attempt 3, next try in 8 s.
+[i3mux] Enter: retry now   q: close window
+[i3mux] Log: journalctl --user -u i3mux-ssh-dev-box.service
+```
+
+When the master is back, every window reattaches its shell by itself.
+`i3mux status` shows the state of the connection. After each command, i3mux
+stops the unit of each host that the command used and no workspace is bound
+to. Logout stops them all.
+Without a systemd user manager, each ssh connects on its own and windows do
+not reconnect. See [INSTALL.md](INSTALL.md#remote-hosts) for the ssh setup
+and [docs/PLAN-ssh-recovery-controlmaster.md](docs/PLAN-ssh-recovery-controlmaster.md)
+for the design.
 
 Tailscale ssh does not deliver `SIGWINCH` in command mode, so windows will not
 resize correctly through it. Use OpenSSH; see

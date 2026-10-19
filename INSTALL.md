@@ -5,6 +5,9 @@
 - Sway.
 - A Wayland terminal: `foot` (default), `alacritty` or `kitty`. Set `TERMINAL`
   to pick one.
+- `bash` on the desktop. The terminal wrapper is a bash script.
+- For remote hosts: OpenSSH and a systemd user session. Without systemd,
+  remote hosts still work, but windows do not reconnect after a network drop.
 - `shpool` on every host that runs shells: the desktop for local sessions
   and each remote host.
 - Rust toolchain to build i3mux.
@@ -82,10 +85,46 @@ Reload with `$mod+Shift+c`.
 4. Keep shells alive after you log out. On systemd hosts run
    `loginctl enable-linger $USER` once. Without it some distributions kill
    user processes when the last ssh session ends.
+5. Accept the host key once with a plain `ssh host`. i3mux runs ssh in batch
+   mode, so it never asks.
+6. On hosts that you run, set `MaxSessions 100` in `/etc/ssh/sshd_config`
+   and reload sshd. The default is 10 sessions per connection. Without the
+   change, windows past about 10 open their own ssh connections instead of
+   sharing the master's.
+7. If a remote profile sets `SSH_AUTH_SOCK`, make the line conditional, so
+   that it keeps a forwarded agent:
+   `[ -S "$SSH_AUTH_SOCK" ] || export SSH_AUTH_SOCK=...`.
 
-i3mux opens ssh with `ControlMaster=auto` and a control socket under
-`$XDG_RUNTIME_DIR/i3mux/`, so the second and later terminals reuse the
-first connection.
+### The connection to a remote host
+
+i3mux starts one ssh master per remote host as the transient systemd user
+unit `i3mux-ssh-HOST.service`. For a host such as `me@dev-box`, systemd
+escapes the name; `i3mux status` prints the exact unit. The control socket
+is `$XDG_RUNTIME_DIR/i3mux/HOST.ctl`. Every window and every i3mux command on
+that host is a client of the master. The master keeps your `RemoteForward`
+and `LocalForward` lines, as a plain `ssh host` does. If another connection
+already holds a forwarded port, ssh logs a warning, and the master still
+starts. The clients forward no ports.
+
+When the network drops, systemd restarts the master: 2 s after the first
+failure, and up to 30 s apart later. Each window shows a page with the
+cause and waits. When the master is back, the window reattaches its shell
+with `--force`, because the host may still count the lost client as
+attached. If another client attached to that shell while the connection
+was down, the window takes the shell back from it.
+
+`i3mux status` shows the state of the master. After each command, i3mux
+stops the master of each host that the command used and no workspace is
+bound to. So `i3mux sessions --remote HOST` or a failed `attach` leaves no
+master behind. Logout stops every master.
+
+Shells started by i3mux see `SSH_CONNECTION` and `SSH_CLIENT`, as in a
+fresh ssh login. If `~/.config/i3mux/shpool.toml` on a host is older than
+this feature, add this line to it:
+
+```toml
+forward_env = ["SSH_CONNECTION", "SSH_CLIENT"]
+```
 
 ## Check the install
 
@@ -112,3 +151,12 @@ i3mux sessions
   `journalctl -k` for an OOM kill.
 - Inspect the daemon directly:
   `shpool --socket ~/.local/run/i3mux/shpool.socket list`.
+- "the ssh connection to HOST did not start": read the ssh error in the
+  message, or the full log with
+  `journalctl --user -u i3mux-ssh-HOST.service`. A host key that ssh does not
+  know yet is a common cause: run a plain `ssh HOST` once.
+- A window says "The connection to HOST is up, so the network did not drop":
+  ssh failed for another reason, for example a changed host key. Fix the
+  cause, then press Enter to retry, or `q` to close the window.
+- See the connection state: `i3mux status`, or
+  `systemctl --user status i3mux-ssh-HOST.service`.

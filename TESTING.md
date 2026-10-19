@@ -33,7 +33,10 @@ Pass extra `cargo test` arguments after the recipe:
 3. **Integration.** Two containers from one image. One runs headless Sway
    and i3mux. The other runs sshd as the remote host. Tests cover
    activate, terminal, orphan reattach, detach and attach (local and
-   remote), `--force`, kill, scrollback, and layout goldens.
+   remote), `--force`, kill, scrollback, and layout goldens. The Sway
+   container has no systemd user manager, so its remote sessions use
+   direct ssh. The ssh master unit and the window's landing page are
+   covered by unit tests only, with a fake `systemctl` and `journalctl`.
 
 ## Boundary rule
 
