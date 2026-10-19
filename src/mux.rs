@@ -12,8 +12,15 @@
 //!   directory (mode 0700) and writes the config if it is absent. No caller
 //!   has to prepare a host first, and a user's config edits are never
 //!   overwritten.
-//! - Read-only and destructive commands pass `--no-daemonize`: they never
-//!   start a daemon. Only `attach` starts one.
+//! - i3mux starts the daemon itself, never shpool: every command passes
+//!   `--no-daemonize`. Its output is appended to
+//!   `~/.local/state/i3mux/shpool.log`, which keeps panics and survives a
+//!   restart.
+//! - A dead daemon costs one command: it fails with
+//!   [`MuxError::DaemonRestarted`] after a new daemon has started, so the
+//!   next command works.
+//! - Read-only and destructive commands never start a daemon on a host
+//!   with no socket. Only `attach` does.
 //! - [`list`] reports a host with no daemon as having no shells, and an
 //!   unreachable host as an error (plan rule 11).
 //! - [`choose_terminal`] is pure (plan rule 4).
@@ -33,11 +40,24 @@ prompt_prefix = ""
 "#;
 
 /// Shell prologue of every shpool command. `$1` is the config text; the
-/// remaining arguments go to shpool unparsed.
+/// remaining arguments go to shpool unparsed, after `--no-daemonize`.
+///
+/// `up` succeeds only if a daemon answers. Against a socket file with no
+/// daemon behind it, shpool exits 1 and prints nothing, so a socket file
+/// that does not answer is a dead daemon. The script then starts a new
+/// daemon and exits [`DAEMON_RESTARTED`]. Before `attach` with no socket, it
+/// starts a daemon silently. The new daemon itself removes the dead socket,
+/// only after a connect is refused, so starting one never harms a live
+/// daemon. `flock` stops parallel commands from starting two daemons.
+///
+/// The daemon's stderr is appended to the log: shpool's autostart would
+/// truncate its log and send panics to /dev/null.
 const PRELUDE: &str = r#"set -e
 run_dir="$HOME/.local/run/i3mux"
 config="$HOME/.config/i3mux/shpool.toml"
-mkdir -p "$run_dir" "${config%/*}"
+log="$HOME/.local/state/i3mux/shpool.log"
+socket="$run_dir/shpool.socket"
+mkdir -p "$run_dir" "${config%/*}" "${log%/*}"
 chmod 700 "$run_dir"
 if [ ! -e "$config" ]; then
   tmp="$config.$$.tmp"
@@ -46,10 +66,43 @@ if [ ! -e "$config" ]; then
   rm -f "$tmp"
 fi
 shift
-exec shpool --socket "$run_dir/shpool.socket" --config-file "$config" "$@""#;
+command -v shpool >/dev/null || exit 127
+up() { shpool --socket "$socket" --config-file "$config" --no-daemonize list >/dev/null 2>&1; }
+dead=
+if ! up; then
+  exec 9>"$run_dir/start.lock"
+  flock 9
+  if ! up && { [ -e "$socket" ] || [ "$1" = attach ]; }; then
+    if [ -e "$socket" ]; then dead=1; fi
+    if [ -f "$log" ] && [ "$(wc -c < "$log")" -gt 10485760 ]; then mv -f "$log" "$log.1"; fi
+    printf '%s i3mux: %sstarting a shpool daemon\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${dead:+the daemon at $socket does not answer; }" >> "$log"
+    setsid shpool --socket "$socket" --config-file "$config" daemon \
+      < /dev/null >> "$log" 2>&1 9>&- &
+    tries=0
+    until up; do
+      tries=$((tries + 1))
+      if [ "$tries" -gt 50 ]; then
+        echo "i3mux: the shpool daemon did not start; see $log" >&2
+        exit 1
+      fi
+      sleep 0.1
+    done
+  fi
+  exec 9>&-
+fi
+if [ -n "$dead" ]; then
+  echo "i3mux: the shpool daemon had stopped and its shells are gone; a new one is running. Log: $log" >&2
+  exit 75
+fi
+exec shpool --socket "$socket" --config-file "$config" --no-daemonize "$@""#;
 
 /// What shpool prints when no daemon listens on the socket.
 const NO_DAEMON: &str = "could not connect to daemon";
+
+/// [`PRELUDE`] exits with this after it replaced a dead daemon (the literal
+/// 75 in the script).
+const DAEMON_RESTARTED: i32 = 75;
 
 /// What `shpool kill` and `shpool detach` print for a name that is gone.
 const NOT_FOUND: &str = "not found:";
@@ -65,6 +118,11 @@ const COMMAND_NOT_FOUND: i32 = 127;
 pub enum MuxError {
     #[error("shpool is not installed on {host}, or is not on its login PATH; see INSTALL.md")]
     NotInstalled { host: Host },
+    #[error(
+        "the shpool daemon on {host} had stopped, so its shells are gone. i3mux started \
+         a new daemon: run the command again. Daemon log: ~/.local/state/i3mux/shpool.log on {host}"
+    )]
+    DaemonRestarted { host: Host },
     #[error("cannot read the output of 'shpool list' on {host}: {detail}")]
     BadList { host: Host, detail: String },
     #[error(transparent)]
@@ -104,13 +162,18 @@ fn shpool_argv(shpool_args: &[&str]) -> Vec<String> {
     argv
 }
 
-/// Map "program not found" to [`MuxError::NotInstalled`].
+/// Map "program not found" to [`MuxError::NotInstalled`] and a replaced
+/// daemon to [`MuxError::DaemonRestarted`].
 fn classify(host: &Host, err: HostError) -> MuxError {
     match err {
         HostError::Failed {
             code: Some(COMMAND_NOT_FOUND),
             ..
         } => MuxError::NotInstalled { host: host.clone() },
+        HostError::Failed {
+            code: Some(DAEMON_RESTARTED),
+            ..
+        } => MuxError::DaemonRestarted { host: host.clone() },
         other => MuxError::Host(other),
     }
 }
@@ -123,11 +186,12 @@ fn is_no_daemon(err: &HostError) -> bool {
 /// ignored. A host with no daemon running has no shells.
 ///
 /// # Errors
-/// [`MuxError::NotInstalled`] if shpool is missing, [`MuxError::Host`] if
-/// the host is unreachable or shpool fails, [`MuxError::BadList`] if its
+/// [`MuxError::NotInstalled`] if shpool is missing,
+/// [`MuxError::DaemonRestarted`] if the daemon was dead, [`MuxError::Host`]
+/// if the host is unreachable or shpool fails, [`MuxError::BadList`] if its
 /// output is not the expected JSON.
 pub fn list(host: &dyn HostExec) -> Result<Vec<Shell>, MuxError> {
-    let argv = shpool_argv(&["--no-daemonize", "list", "--json"]);
+    let argv = shpool_argv(&["list", "--json"]);
     match host.run(&argv, None) {
         Ok(stdout) => parse_list(&stdout).map_err(|detail| MuxError::BadList {
             host: host.host().clone(),
@@ -195,7 +259,7 @@ pub fn kill(host: &dyn HostExec, names: &[TerminalName]) -> Result<(), MuxError>
         return Ok(());
     }
     let names: Vec<String> = names.iter().map(ToString::to_string).collect();
-    let mut args = vec!["--no-daemonize", "kill"];
+    let mut args = vec!["kill"];
     args.extend(names.iter().map(String::as_str));
     match host.run(&shpool_argv(&args), None) {
         Ok(_) => Ok(()),
@@ -218,7 +282,7 @@ pub fn detach(host: &dyn HostExec, names: &[TerminalName]) -> Result<(), MuxErro
         return Ok(());
     }
     let names: Vec<String> = names.iter().map(ToString::to_string).collect();
-    let mut args = vec!["--no-daemonize", "detach"];
+    let mut args = vec!["detach"];
     args.extend(names.iter().map(String::as_str));
     match host.run(&shpool_argv(&args), None) {
         Ok(_) => Ok(()),
@@ -320,7 +384,7 @@ mod tests {
     use std::cell::RefCell;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::process::Command;
+    use std::process::{Command, Output};
 
     fn ws4() -> SessionName {
         SessionName::new("ws4").unwrap()
@@ -485,7 +549,7 @@ mod tests {
             ]
         );
         let argv = host.argv.borrow();
-        assert_eq!(argv[argv.len() - 3..], ["--no-daemonize", "list", "--json"]);
+        assert_eq!(argv[argv.len() - 2..], ["list", "--json"]);
     }
 
     #[test]
@@ -517,6 +581,16 @@ mod tests {
     }
 
     #[test]
+    fn replaced_daemon_is_reported_with_the_log_path() {
+        let host = ScriptedHost::new(Err(failed(DAEMON_RESTARTED, "")));
+        let err = list(&host).unwrap_err();
+        assert!(matches!(err, MuxError::DaemonRestarted { .. }));
+        let text = err.to_string();
+        assert!(text.contains("run the command again"), "{text}");
+        assert!(text.contains("~/.local/state/i3mux/shpool.log on deepthought"));
+    }
+
+    #[test]
     fn garbage_list_output_is_an_error() {
         let host = ScriptedHost::new(Ok("NAME\tSTATUS\n".into()));
         assert!(matches!(list(&host), Err(MuxError::BadList { .. })));
@@ -529,10 +603,7 @@ mod tests {
         let host = ScriptedHost::new(Err(failed(1, "not found: ws4-002\n")));
         kill(&host, &[t(1), t(2)]).unwrap();
         let argv = host.argv.borrow();
-        assert_eq!(
-            argv[argv.len() - 4..],
-            ["--no-daemonize", "kill", "ws4-001", "ws4-002"]
-        );
+        assert_eq!(argv[argv.len() - 3..], ["kill", "ws4-001", "ws4-002"]);
     }
 
     #[test]
@@ -540,10 +611,7 @@ mod tests {
         let host = ScriptedHost::new(Ok(String::new()));
         detach(&host, &[t(1), t(2)]).unwrap();
         let argv = host.argv.borrow();
-        assert_eq!(
-            argv[argv.len() - 4..],
-            ["--no-daemonize", "detach", "ws4-001", "ws4-002"]
-        );
+        assert_eq!(argv[argv.len() - 3..], ["detach", "ws4-001", "ws4-002"]);
     }
 
     #[test]
@@ -597,44 +665,148 @@ mod tests {
         assert_eq!(argv[..2], ["sh", "-c"]);
         let script = &argv[2];
         let mkdir = script.find("mkdir -p \"$run_dir\"").unwrap();
-        let exec = script
-            .find("exec shpool --socket \"$run_dir/shpool.socket\"")
-            .unwrap();
+        let exec = script.find("exec shpool --socket \"$socket\"").unwrap();
         assert!(mkdir < exec);
         assert!(script.contains("run_dir=\"$HOME/.local/run/i3mux\""));
         assert!(script.contains("chmod 700 \"$run_dir\""));
     }
 
-    /// Run a prelude argv locally with `HOME` in a temp dir and a fake
-    /// `shpool` on `PATH` that prints its arguments, one per line.
-    fn run_prelude(home: &Path, shpool_args: &[&str]) -> String {
+    /// A fake `shpool` that prints its arguments, one per line. As a daemon
+    /// probe it answers, so the prelude sees a live daemon.
+    const ECHO_SHPOOL: &str = r#"#!/bin/sh
+for a in "$@"; do printf "%s\n" "$a"; done
+"#;
+
+    /// A fake `shpool` with a daemon. `$sock.alive` marks a live daemon; a
+    /// socket file without it is a dead one, which `list` meets with exit 1
+    /// and no output, as shpool 0.11.5 does. `daemon` records each start in
+    /// `~/daemon-starts`.
+    const DAEMON_SHPOOL: &str = r#"#!/bin/sh
+sock=$2
+shift 4
+if [ "$1" = --no-daemonize ]; then shift; fi
+case $1 in
+list)
+  if [ -e "$sock.alive" ]; then echo '{"sessions": []}'; exit 0; fi
+  if [ -e "$sock" ]; then exit 1; fi
+  echo "could not connect to daemon" >&2
+  exit 1 ;;
+daemon)
+  echo started >> "$HOME/daemon-starts"
+  echo "fake daemon output"
+  : > "$sock"
+  : > "$sock.alive" ;;
+*) printf "%s\n" "$@" ;;
+esac
+"#;
+
+    /// Run a prelude argv locally with `HOME` in a temp dir and `fake` as
+    /// `shpool` on `PATH`.
+    fn run_prelude_with(home: &Path, fake: &str, shpool_args: &[&str]) -> Output {
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         // Write the fake from a child process: a write descriptor held by
         // this (multi-threaded) test process could leak into another test's
         // fork and make exec fail with ETXTBSY.
-        let fake = bin.join("shpool");
         let status = Command::new("sh")
             .arg("-c")
-            .arg("printf '%s\\n' '#!/bin/sh' 'for a in \"$@\"; do printf \"%s\\n\" \"$a\"; done' > \"$1\" && chmod 755 \"$1\"")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
             .arg("sh")
-            .arg(&fake)
+            .arg(bin.join("shpool"))
+            .arg(fake)
             .status()
             .unwrap();
         assert!(status.success());
         let argv = shpool_argv(shpool_args);
-        let out = Command::new(&argv[0])
+        Command::new(&argv[0])
             .args(&argv[1..])
             .env("HOME", home)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .output()
-            .unwrap();
+            .unwrap()
+    }
+
+    /// [`run_prelude_with`] the echo fake; the prelude must succeed.
+    fn run_prelude(home: &Path, shpool_args: &[&str]) -> String {
+        let out = run_prelude_with(home, ECHO_SHPOOL, shpool_args);
         assert!(
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn daemon_starts(home: &Path) -> usize {
+        std::fs::read_to_string(home.join("daemon-starts")).map_or(0, |s| s.lines().count())
+    }
+
+    fn daemon_log(home: &Path) -> String {
+        std::fs::read_to_string(home.join(".local/state/i3mux/shpool.log")).unwrap_or_default()
+    }
+
+    #[test]
+    fn dead_daemon_fails_one_command_and_the_next_one_works() {
+        let home = tempfile::tempdir().unwrap();
+        let run_dir = home.path().join(".local/run/i3mux");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("shpool.socket"), "").unwrap();
+
+        let first = run_prelude_with(home.path(), DAEMON_SHPOOL, &["list", "--json"]);
+        assert_eq!(first.status.code(), Some(DAEMON_RESTARTED), "{first:?}");
+        assert!(String::from_utf8_lossy(&first.stderr).contains("had stopped"));
+        assert_eq!(daemon_starts(home.path()), 1);
+        let log = daemon_log(home.path());
+        assert!(
+            log.contains("does not answer; starting a shpool daemon"),
+            "{log}"
+        );
+        assert!(log.contains("fake daemon output"), "{log}");
+
+        let second = run_prelude_with(home.path(), DAEMON_SHPOOL, &["list", "--json"]);
+        assert!(second.status.success(), "{second:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&second.stdout),
+            "{\"sessions\": []}\n"
+        );
+        assert_eq!(daemon_starts(home.path()), 1);
+    }
+
+    #[test]
+    fn list_without_a_socket_starts_no_daemon() {
+        let home = tempfile::tempdir().unwrap();
+        let out = run_prelude_with(home.path(), DAEMON_SHPOOL, &["list", "--json"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains(NO_DAEMON));
+        assert_eq!(daemon_starts(home.path()), 0);
+    }
+
+    #[test]
+    fn attach_without_a_socket_starts_a_daemon_silently() {
+        let home = tempfile::tempdir().unwrap();
+        let out = run_prelude_with(home.path(), DAEMON_SHPOOL, &["attach", "ws4-001"]);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "attach\nws4-001\n");
+        assert_eq!(daemon_starts(home.path()), 1);
+        let log = daemon_log(home.path());
+        assert!(log.contains("i3mux: starting a shpool daemon"), "{log}");
+    }
+
+    #[test]
+    fn a_large_daemon_log_is_rotated_before_a_start() {
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join(".local/state/i3mux/shpool.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, vec![b'x'; 10 * 1024 * 1024 + 1]).unwrap();
+        let out = run_prelude_with(home.path(), DAEMON_SHPOOL, &["attach", "ws4-001"]);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            std::fs::metadata(log.with_extension("log.1"))
+                .unwrap()
+                .len(),
+            10 * 1024 * 1024 + 1
+        );
+        assert!(daemon_log(home.path()).contains("starting a shpool daemon"));
     }
 
     #[test]
@@ -651,6 +823,7 @@ mod tests {
             socket.to_str().unwrap(),
             "--config-file",
             config.to_str().unwrap(),
+            "--no-daemonize",
             "attach",
             "-c",
             "echo 'a b' $HOME",

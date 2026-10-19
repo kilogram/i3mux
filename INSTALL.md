@@ -43,6 +43,11 @@ daemon you run yourself. The i3mux daemon uses the socket
 `session_restore_mode = { lines = 10000 }`, and never overwrites it. Edit it
 if you want a different scrollback size.
 
+i3mux starts the daemon itself and appends its output, panics included, to
+`~/.local/state/i3mux/shpool.log`. Over 10 MB, the log moves to
+`shpool.log.1` at the next start. Starting the daemon needs `setsid` and
+`flock` from util-linux, which every mainstream Linux distribution has.
+
 ## Install i3mux
 
 ```bash
@@ -100,5 +105,10 @@ i3mux sessions
   `i3mux terminal --force` or `i3mux attach --force` to take it over.
 - Shells vanish after you close the ssh connection: enable linger on the
   remote (see above).
+- "the shpool daemon on HOST had stopped": the daemon died, for example
+  after a reboot, an OOM kill or a crash, and its shells died with it.
+  i3mux has already started a new daemon, so run the command again. To find
+  the cause, read `~/.local/state/i3mux/shpool.log` on that host, and
+  `journalctl -k` for an OOM kill.
 - Inspect the daemon directly:
   `shpool --socket ~/.local/run/i3mux/shpool.socket list`.

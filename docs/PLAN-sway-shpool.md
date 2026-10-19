@@ -60,7 +60,9 @@ back later, and the shells, their output, and the layout are still there.
     strings. `RemoteHost` rejects a leading `-`.
 12. The shpool socket lives outside `$XDG_RUNTIME_DIR` so logind cannot
     remove it when the last ssh session ends: `~/.local/run/i3mux/shpool.socket`.
-    INSTALL recommends `loginctl enable-linger` on remotes.
+    INSTALL recommends `loginctl enable-linger` on remotes. A socket file
+    left by a dead daemon (reboot, crash) costs one failed command: i3mux
+    starts a new daemon, then reports that the old shells are gone.
 13. The wrapper takes argv and runs `exec "$@"`. Shell quoting happens
     exactly once, at the ssh boundary, with `shell-words`.
 14. `i3mux terminal --new` skips orphan reattach. `terminal -e CMD` always

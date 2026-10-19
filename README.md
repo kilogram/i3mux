@@ -59,7 +59,8 @@ on `activate`, `attach` and `kill`.
    └─ Firefox                         (not an i3mux window, ignored)
 
  ~/.config/i3mux/state.json          which workspace is bound to which session
- dev-box:~/.local/state/i3mux/       saved layouts, one JSON file per session
+ dev-box:~/.local/state/i3mux/       saved layouts, one JSON file per session,
+                                     and the shpool daemon log
  dev-box:~/.local/run/i3mux/         the i3mux shpool daemon socket
 ```
 

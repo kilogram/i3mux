@@ -6,6 +6,7 @@
 //! switches to the alternate screen, and shpool refuses a second client
 //! unless `--force`, with exit status 0 and at once, which the terminal
 //! wrapper turns into a window that stays open with the `--force` hint.
+//! They also pin the recovery from a daemon that was killed.
 //!
 //! Ignored by default because they need shpool: `just check-mux` runs them.
 //! The binary is `$SHPOOL_BIN`, else `shpool` on `PATH`. A missing binary
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use nix::pty::{openpty, Winsize};
 
-use super::{attach_argv, detach, parse_list, Shell};
+use super::{attach_argv, detach, list, parse_list, MuxError, Shell};
 use crate::host::{HostRunner, RunnerConfig};
 use crate::types::{Host, SessionName, TerminalName};
 
@@ -440,4 +441,37 @@ fn detach_disconnects_several_shells_in_one_call() {
     }
     detach(&scratch.runner, &names).unwrap();
     assert_eq!(scratch.list().len(), 2, "detach must not end the shells");
+}
+
+/// A daemon killed with SIGKILL leaves its socket file behind, and shpool
+/// fails on it with no output. The next i3mux command starts a new daemon
+/// and fails with `DaemonRestarted`, the one after works, and the log keeps
+/// the output of both daemons.
+#[test]
+#[ignore = "needs shpool; run with `just check-mux` (dead daemon recovery)"]
+fn killed_daemon_costs_one_command_and_its_log_survives() {
+    let scratch = Scratch::new();
+    let name = terminal();
+    let mut client = scratch.attach(&name, false, Some(PRINT_200));
+    client.wait_for("DONE-PRINTING");
+
+    let daemon = format!("{} --config-file .* daemon", scratch.socket().display());
+    let status = Command::new("pkill")
+        .args(["-KILL", "-f", &daemon])
+        .status()
+        .unwrap();
+    assert!(status.success(), "no process matched {daemon:?}");
+    client.wait_exit();
+    assert!(
+        scratch.socket().exists(),
+        "SIGKILL must leave the socket file"
+    );
+
+    let err = list(&scratch.runner).unwrap_err();
+    assert!(matches!(err, MuxError::DaemonRestarted { .. }), "{err}");
+    assert_eq!(list(&scratch.runner).unwrap(), []);
+    let log =
+        std::fs::read_to_string(scratch.path().join(".local/state/i3mux/shpool.log")).unwrap();
+    assert_eq!(log.matches("starting a shpool daemon").count(), 2, "{log}");
+    assert!(log.contains("does not answer"), "{log}");
 }
