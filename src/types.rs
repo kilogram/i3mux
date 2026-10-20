@@ -12,6 +12,8 @@
 //! - [`TerminalName`]: always `{session}-{NNN}`. `Display` and `FromStr`
 //!   round-trip, and [`TerminalName::parse`] matches one session exactly
 //!   (plan rule 3).
+//! - [`Token`]: always 32 lowercase hex digits, so never empty and safe as a
+//!   shell argument.
 
 use std::fmt;
 use std::str::FromStr;
@@ -297,6 +299,54 @@ impl From<TerminalName> for String {
     }
 }
 
+/// The token of one take of a session (plan-layout-backup decision 1): 16
+/// random bytes, written as 32 lowercase hex digits. Tokens are compared for
+/// equality only; they carry no order and no time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Token(String);
+
+/// Text that is not a [`Token`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid session token '{0}': expected 32 lowercase hex digits")]
+pub struct InvalidToken(String);
+
+impl Token {
+    const HEX_DIGITS: usize = 32;
+
+    /// Validate `text` as a token.
+    ///
+    /// # Errors
+    /// [`InvalidToken`] unless `text` is exactly 32 digits `0-9a-f`.
+    pub fn parse(text: &str) -> Result<Self, InvalidToken> {
+        let is_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        if text.len() == Self::HEX_DIGITS && text.bytes().all(is_hex) {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(InvalidToken(text.to_owned()))
+        }
+    }
+
+    /// The token as its hex digits.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Token {
+    type Error = InvalidToken;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<Token> for String {
+    fn from(token: Token) -> Self {
+        token.0
+    }
+}
+
 #[cfg(test)]
 pub mod strategies {
     //! proptest strategies for the validated types.
@@ -451,7 +501,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn token_is_exactly_32_lowercase_hex_digits() {
+        let valid = "0123456789abcdef0123456789abcdef";
+        assert_eq!(Token::parse(valid).unwrap().as_str(), valid);
+        for bad in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+            " 123456789abcdef0123456789abcdef",
+        ] {
+            assert!(Token::parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(serde_json::from_str::<Token>("\"\"").is_err());
+    }
+
     proptest! {
+        #[test]
+        fn token_of_any_16_bytes_round_trips(bytes in any::<[u8; 16]>()) {
+            let hex = bytes.iter().fold(String::new(), |mut hex, b| {
+                use std::fmt::Write as _;
+                write!(hex, "{b:02x}").unwrap();
+                hex
+            });
+            let token = Token::parse(&hex).unwrap();
+            let json = serde_json::to_string(&token).unwrap();
+            prop_assert_eq!(json, format!("\"{hex}\""));
+            prop_assert_eq!(serde_json::from_str::<Token>(&format!("\"{hex}\"")).unwrap(), token);
+        }
+
         #[test]
         fn terminal_name_round_trips(name in strategies::terminal_name()) {
             let text = name.to_string();

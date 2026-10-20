@@ -1,5 +1,6 @@
 //! Saved sessions: the layout of a detached session, stored on the host that
-//! runs its shells, at `~/.local/state/i3mux/sessions/{name}.json`.
+//! runs its shells, at `~/.local/state/i3mux/sessions/{name}.json`, and the
+//! session's token, at `~/.local/state/i3mux/sessions/{name}.token`.
 //!
 //! Guarantees:
 //!
@@ -8,13 +9,19 @@
 //!   does every load, so a hand-edited file cannot make `attach` open another
 //!   session's shells.
 //! - A loaded file's `name` field matches its file name.
-//! - [`save`] replaces the file atomically (plan rule 7).
+//! - [`take`] writes a new token to the host and returns it
+//!   (plan-layout-backup rule 1). Nothing here deletes a token file, so a
+//!   token never comes back after `kill`.
+//! - [`save_if_token`] is the only way to write a layout. It writes only if
+//!   the host still has the caller's token, and it compares and writes in one
+//!   host script under `flock` (plan-layout-backup rule 4). It replaces the
+//!   file atomically (plan rule 7).
 
 use serde::{Deserialize, Serialize};
 
 use crate::host::{HostError, HostExec};
 use crate::layout::Layout;
-use crate::types::{Host, SessionName, TerminalName};
+use crate::types::{Host, InvalidToken, SessionName, TerminalName, Token};
 
 /// Directory of saved sessions, relative to the host user's home.
 const SESSIONS_DIR: &str = ".local/state/i3mux/sessions";
@@ -40,6 +47,13 @@ pub enum SessionError {
         session: SessionName,
         #[source]
         source: serde_json::Error,
+    },
+    #[error("{host} returned a bad token for session '{session}': {source}")]
+    BadToken {
+        host: Host,
+        session: SessionName,
+        #[source]
+        source: InvalidToken,
     },
     #[error(transparent)]
     Host(#[from] HostError),
@@ -111,17 +125,59 @@ fn path_of(name: &SessionName) -> String {
     format!("{SESSIONS_DIR}/{name}.json")
 }
 
-/// Write `session` to its file on `host`, replacing any earlier save.
+fn token_path_of(name: &SessionName) -> String {
+    format!("{SESSIONS_DIR}/{name}.token")
+}
+
+/// Take session `name` on `host`: replace its token with a new one and
+/// return it (plan-layout-backup rule 1). A binding that holds an older
+/// token no longer holds the session.
 ///
 /// # Errors
-/// [`SessionError::Host`] if the write fails; the old file is then unchanged.
-pub fn save(host: &dyn HostExec, session: &SavedSession) -> Result<(), SessionError> {
+/// [`SessionError::Host`] if the host fails, and the token is then
+/// unchanged. [`SessionError::BadToken`] if the host printed something that
+/// is not a token.
+pub fn take(host: &dyn HostExec, name: &SessionName) -> Result<Token, SessionError> {
+    let printed = host.take_token(&token_path_of(name))?;
+    Token::parse(&printed).map_err(|source| SessionError::BadToken {
+        host: host.host().clone(),
+        session: name.clone(),
+        source,
+    })
+}
+
+/// What [`save_if_token`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// The host had the caller's token: the layout is saved.
+    Saved,
+    /// A later take changed the host's token: nothing is written.
+    TakenElsewhere,
+}
+
+/// Write `session` to its file on `host`, replacing any earlier save, if the
+/// host's token of the session is `token`. `None` matches a host with no
+/// token file: a binding from before tokens (plan-layout-backup rule 4).
+///
+/// # Errors
+/// [`SessionError::Host`] if the host fails; the old file is then unchanged.
+pub fn save_if_token(
+    host: &dyn HostExec,
+    session: &SavedSession,
+    token: Option<&Token>,
+) -> Result<SaveOutcome, SessionError> {
     let json = serde_json::to_string_pretty(session).map_err(|source| SessionError::Encode {
         session: session.name.clone(),
         source,
     })?;
-    host.write_file_atomic(&path_of(&session.name), &json)?;
-    Ok(())
+    let path = path_of(&session.name);
+    let token_path = token_path_of(&session.name);
+    let written = host.write_file_if_token(&path, &json, &token_path, token)?;
+    Ok(if written {
+        SaveOutcome::Saved
+    } else {
+        SaveOutcome::TakenElsewhere
+    })
 }
 
 /// The saved session `name` on `host`, or `None` if there is none.
@@ -218,8 +274,10 @@ mod tests {
         assert_eq!(list(&host).unwrap(), []);
         assert_eq!(load(&host, &name("ws4")).unwrap(), None);
 
-        save(&host, &saved("ws7")).unwrap();
-        save(&host, &saved("ws4")).unwrap();
+        for session in ["ws7", "ws4"] {
+            let outcome = save_if_token(&host, &saved(session), None).unwrap();
+            assert_eq!(outcome, SaveOutcome::Saved);
+        }
         assert!(home
             .path()
             .join(".local/state/i3mux/sessions/ws4.json")
@@ -230,6 +288,65 @@ mod tests {
         assert!(delete(&host, &name("ws4")).unwrap());
         assert!(!delete(&host, &name("ws4")).unwrap());
         assert_eq!(list(&host).unwrap(), [name("ws7")]);
+    }
+
+    #[test]
+    fn take_writes_a_new_token_each_time() {
+        // Plan-layout-backup rule 1.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let first = take(&host, &name("ws4")).unwrap();
+        let second = take(&host, &name("ws4")).unwrap();
+        assert_ne!(first, second);
+        let file = home.path().join(SESSIONS_DIR).join("ws4.token");
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            format!("{}\n", second.as_str())
+        );
+        assert_eq!(
+            list(&host).unwrap(),
+            [],
+            "a token alone is no saved session"
+        );
+    }
+
+    #[test]
+    fn save_if_token_saves_only_while_the_host_has_the_token() {
+        // Plan-layout-backup rule 4.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let mine = take(&host, &name("ws4")).unwrap();
+        assert_eq!(
+            save_if_token(&host, &saved("ws4"), None).unwrap(),
+            SaveOutcome::TakenElsewhere,
+            "a binding without a token does not hold a taken session"
+        );
+        assert_eq!(load(&host, &name("ws4")).unwrap(), None);
+        assert_eq!(
+            save_if_token(&host, &saved("ws4"), Some(&mine)).unwrap(),
+            SaveOutcome::Saved
+        );
+
+        take(&host, &name("ws4")).unwrap();
+        let mut newer = saved("ws4");
+        newer.saved_at_unix += 1;
+        assert_eq!(
+            save_if_token(&host, &newer, Some(&mine)).unwrap(),
+            SaveOutcome::TakenElsewhere
+        );
+        assert_eq!(load(&host, &name("ws4")).unwrap(), Some(saved("ws4")));
+    }
+
+    #[test]
+    fn tokens_are_per_session() {
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let ws4 = take(&host, &name("ws4")).unwrap();
+        take(&host, &name("ws7")).unwrap();
+        assert_eq!(
+            save_if_token(&host, &saved("ws4"), Some(&ws4)).unwrap(),
+            SaveOutcome::Saved
+        );
     }
 
     #[test]

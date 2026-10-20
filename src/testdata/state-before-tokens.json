@@ -1,0 +1,16 @@
+{
+  "workspaces": {
+    "3": {
+      "host": "deepthought",
+      "session": "ws3"
+    },
+    "4": {
+      "host": "local",
+      "session": "ws4"
+    },
+    "mail": {
+      "host": "user@mail.example",
+      "session": "mail"
+    }
+  }
+}

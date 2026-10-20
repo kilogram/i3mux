@@ -11,7 +11,7 @@ use crate::host::HostError;
 use crate::layout::Layout;
 use crate::master::{MasterError, TrackedMasters, UnitName};
 use crate::sway_ops::testing::FakeSway;
-use crate::types::RemoteHost;
+use crate::types::{RemoteHost, Token};
 
 // ------------------------------------------------------------------ fakes
 
@@ -31,6 +31,8 @@ struct HostState {
     stuck_clients: bool,
     /// Every `shpool detach` call, by its names.
     detach_calls: Vec<Vec<String>>,
+    /// Takes so far; the next token is made from this count.
+    takes: u64,
 }
 
 impl HostState {
@@ -57,6 +59,9 @@ impl HostState {
 /// An in-memory host. Understands `shpool list --json` and `shpool kill`
 /// by the argv tail; everything else succeeds silently. Like `HostRunner`,
 /// every operation on a remote host first starts the host's ssh master.
+/// Token files are files like any other; each take writes a new token, and
+/// the mutex makes takes and checked writes exclude each other, as `flock`
+/// does on a real host.
 #[derive(Clone)]
 struct FakeHost {
     host: Host,
@@ -160,16 +165,6 @@ impl HostExec for FakeHost {
         argv.to_vec()
     }
 
-    fn write_file_atomic(&self, path: &str, content: &str) -> Result<(), HostError> {
-        self.connect()?;
-        let mut state = self.state.lock().unwrap();
-        if state.fail_writes {
-            return Err(self.failure("No space left on device"));
-        }
-        state.files.insert(path.to_owned(), content.to_owned());
-        Ok(())
-    }
-
     fn read_file(&self, path: &str) -> Result<Option<String>, HostError> {
         self.connect()?;
         Ok(self.file(path))
@@ -189,6 +184,40 @@ impl HostExec for FakeHost {
     fn remove_file(&self, path: &str) -> Result<bool, HostError> {
         self.connect()?;
         Ok(self.state.lock().unwrap().files.remove(path).is_some())
+    }
+
+    fn take_token(&self, token_path: &str) -> Result<String, HostError> {
+        self.connect()?;
+        let mut state = self.state.lock().unwrap();
+        if state.fail_writes {
+            return Err(self.failure("No space left on device"));
+        }
+        state.takes += 1;
+        let token = format!("{:032x}", state.takes);
+        state
+            .files
+            .insert(token_path.to_owned(), format!("{token}\n"));
+        Ok(token)
+    }
+
+    fn write_file_if_token(
+        &self,
+        path: &str,
+        content: &str,
+        token_path: &str,
+        token: Option<&Token>,
+    ) -> Result<bool, HostError> {
+        self.connect()?;
+        let mut state = self.state.lock().unwrap();
+        let found = state.files.get(token_path).map(|t| t.trim_end());
+        if found != token.map(Token::as_str) {
+            return Ok(false);
+        }
+        if state.fail_writes {
+            return Err(self.failure("No space left on device"));
+        }
+        state.files.insert(path.to_owned(), content.to_owned());
+        Ok(true)
     }
 }
 
@@ -388,11 +417,35 @@ impl World {
         }
     }
 
+    /// Bind `workspace` as a `state.json` from before tokens has it: no
+    /// token, and no take on the host.
     fn bind(&self, workspace: &str, session: &str) {
-        let binding = WorkspaceState::new(self.host.host().clone(), name(session));
+        let binding = WorkspaceState::without_token(self.host.host().clone(), name(session));
         self.store
             .with_lock(|s| Ok(s.bind(workspace, binding)?))
             .unwrap();
+    }
+
+    /// The token of `workspace`'s binding.
+    fn bound_token(&self, workspace: &str) -> Option<Token> {
+        let state = self.store.load().unwrap();
+        state.get(workspace).and_then(|b| b.token().cloned())
+    }
+
+    /// The token file of `session` on the host.
+    fn host_token(&self, session: &str) -> Option<String> {
+        let path = format!(".local/state/i3mux/sessions/{session}.token");
+        self.host.file(&path).map(|t| t.trim_end().to_owned())
+    }
+
+    /// How many takes the host has seen.
+    fn takes(&self) -> u64 {
+        self.host.state.lock().unwrap().takes
+    }
+
+    /// Another machine takes `session`, as its `attach` would.
+    fn take_elsewhere(&self, session: &str) -> Token {
+        session::take(&self.host, &name(session)).unwrap()
     }
 
     fn mark(&self, terminal: &str) -> Mark {
@@ -424,7 +477,11 @@ impl World {
             percent: None,
         };
         let saved = SavedSession::new(name(session), self.host.host().clone(), layout, 0).unwrap();
-        session::save(&self.host, &saved).unwrap();
+        // Written straight to the host, whatever its token: a layout that
+        // some machine saved earlier.
+        let path = format!(".local/state/i3mux/sessions/{session}.json");
+        let json = serde_json::to_string_pretty(&saved).unwrap();
+        self.host.state.lock().unwrap().files.insert(path, json);
     }
 }
 
@@ -564,6 +621,43 @@ fn activate_binds_and_opens_the_first_terminal() {
         &name("ws4")
     );
     assert_eq!(world.window_numbers("ws4"), [1]);
+}
+
+#[test]
+fn activate_takes_the_session_and_binds_its_token() {
+    // Plan-layout-backup rule 1.
+    let world = World::new(Host::Local);
+    activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    let first = world.bound_token("4").unwrap();
+    assert_eq!(world.host_token("ws4").as_deref(), Some(first.as_str()));
+
+    // Again in the same workspace: a new take, and the binding follows it.
+    activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    let second = world.bound_token("4").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(world.host_token("ws4").as_deref(), Some(second.as_str()));
+}
+
+#[test]
+fn refused_activate_never_takes() {
+    // A refused activate must not take the session from the workspace that
+    // holds it (plan-layout-backup rule 2).
+    let world = World::new(Host::Local);
+    activate(
+        &world.ports(),
+        &Host::Local,
+        &workspace("5", 5),
+        Some(name("ws4")),
+    )
+    .unwrap();
+    let token = world.bound_token("5").unwrap();
+
+    let err = activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap_err();
+
+    assert!(err.to_string().contains("already bound"), "{err:#}");
+    assert_eq!(world.takes(), 1);
+    assert_eq!(world.host_token("ws4").as_deref(), Some(token.as_str()));
+    assert_eq!(world.bound_token("5"), Some(token));
 }
 
 #[test]
@@ -740,7 +834,177 @@ fn detach_reports_clients_that_never_let_go() {
     assert!(world.store.load().unwrap().get("4").is_none());
 }
 
+#[test]
+fn detach_with_the_hosts_token_saves_the_layout() {
+    // Plan-layout-backup rule 4.
+    let world = World::new(Host::Local);
+    activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    let token = world.bound_token("4").unwrap();
+    assert_eq!(world.host_token("ws4").as_deref(), Some(token.as_str()));
+
+    let detached = detach(&world.ports(), "4", 0).unwrap();
+
+    assert_eq!(detached.save, SaveOutcome::Saved);
+    let saved = session::load(&world.host, &name("ws4")).unwrap().unwrap();
+    assert_eq!(saved.layout().terminals(), [&t("ws4", 1), &t("ws4", 2)]);
+    assert_eq!(
+        world.host.state.lock().unwrap().detach_calls,
+        [["ws4-001", "ws4-002"]]
+    );
+    assert_eq!(
+        world.host_token("ws4").as_deref(),
+        Some(token.as_str()),
+        "detach never takes"
+    );
+}
+
+#[test]
+fn detach_after_another_take_closes_and_unbinds_without_saving() {
+    // Plan-layout-backup rule 5: the host layout and the shells' clients
+    // belong to the machine that took the session.
+    let world = World::new(Host::Local);
+    activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    world.save_layout("ws4", &[7]);
+    let theirs = world.take_elsewhere("ws4");
+    let their_layout = world.host.file(SAVED_WS4);
+
+    let detached = detach(&world.ports(), "4", 0).unwrap();
+
+    assert_eq!(detached.save, SaveOutcome::TakenElsewhere);
+    assert_eq!(detached.terminals, 2);
+    assert_eq!(world.host.file(SAVED_WS4), their_layout, "layout untouched");
+    assert!(
+        world.host.state.lock().unwrap().detach_calls.is_empty(),
+        "no shpool detach"
+    );
+    assert_eq!(world.window_numbers("ws4"), Vec::<u32>::new());
+    assert!(world.store.load().unwrap().get("4").is_none());
+    assert_eq!(world.host_token("ws4").as_deref(), Some(theirs.as_str()));
+    assert!(
+        format_detached(&detached).contains("another machine took it since"),
+        "{}",
+        format_detached(&detached)
+    );
+}
+
+#[test]
+fn detach_of_a_binding_from_before_tokens_needs_a_host_without_one() {
+    // Plan-layout-backup rule 4: no token matches no token file only.
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+    world.take_elsewhere("ws4");
+
+    let detached = detach(&world.ports(), "4", 0).unwrap();
+
+    assert_eq!(detached.save, SaveOutcome::TakenElsewhere);
+    assert_eq!(world.host.file(SAVED_WS4), None);
+    assert!(world.store.load().unwrap().get("4").is_none());
+}
+
+#[test]
+fn detach_on_an_unreachable_host_changes_nothing() {
+    let remote = deepthought();
+    let world = World::new(remote);
+    world.bind("4", "ws4");
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+    world.host.state.lock().unwrap().unreachable = true;
+
+    let err = detach(&world.ports(), "4", 0).unwrap_err();
+
+    assert!(err.to_string().contains("cannot reach"), "{err:#}");
+    assert_eq!(world.window_numbers("ws4"), [1]);
+    assert!(world.store.load().unwrap().get("4").is_some());
+}
+
+#[test]
+fn detach_message_says_whether_the_layout_was_saved() {
+    let detached = |save| Detached {
+        session: name("ws4"),
+        host: deepthought(),
+        terminals: 2,
+        save,
+    };
+    assert_eq!(
+        format_detached(&detached(SaveOutcome::Saved)),
+        "✓ Detached session 'ws4': layout of 2 terminals saved on deepthought"
+    );
+    assert_eq!(
+        format_detached(&detached(SaveOutcome::TakenElsewhere)),
+        "✓ Closed session 'ws4' here: another machine took it since, \
+         so the layout of these 2 terminals was not saved on deepthought"
+    );
+}
+
 // --------------------------------------------------------------- attach
+
+#[test]
+fn attach_takes_the_session_and_binds_its_token() {
+    // Plan-layout-backup rule 1.
+    let world = World::new(Host::Local);
+    world.save_layout("ws4", &[1]);
+    let before = world.take_elsewhere("ws4");
+
+    attach(&world.ports(), &Host::Local, "4", None, false).unwrap();
+
+    let token = world.bound_token("4").unwrap();
+    assert_ne!(token, before);
+    assert_eq!(world.host_token("ws4").as_deref(), Some(token.as_str()));
+}
+
+#[test]
+fn refused_attach_never_takes() {
+    // Plan-layout-backup rule 2: every refusal comes before the take.
+    type Setup = fn(&World);
+    let refusals: [(&str, Option<&str>, Setup); 6] = [
+        ("attached elsewhere", None, |w| {
+            w.host.add_shell("ws4-001", true);
+        }),
+        ("workspace has terminals", None, |w| {
+            w.sway.open_marked("4", &w.mark("other-001"));
+        }),
+        ("session bound elsewhere", Some("ws4"), |w| {
+            w.bind("9", "ws4");
+        }),
+        ("workspace taken", Some("ws4"), |w| w.bind("4", "ws7")),
+        ("no such saved session", Some("nope"), |_| {}),
+        ("several to choose from", None, |w| {
+            w.save_layout("ws7", &[1]);
+        }),
+    ];
+    for (refusal, session, setup) in refusals {
+        let world = World::new(Host::Local);
+        world.save_layout("ws4", &[1]);
+        let token = world.take_elsewhere("ws4");
+        setup(&world);
+        let before = world.store.load().unwrap();
+
+        let outcome = attach(&world.ports(), &Host::Local, "4", session.map(name), false);
+
+        assert!(
+            !matches!(outcome, Ok(AttachOutcome::Attached(_))),
+            "{refusal}: {outcome:?}"
+        );
+        assert_eq!(world.takes(), 1, "{refusal}");
+        assert_eq!(world.host_token("ws4").as_deref(), Some(token.as_str()));
+        assert_eq!(world.store.load().unwrap(), before, "{refusal}");
+    }
+}
+
+#[test]
+fn attach_whose_take_fails_binds_nothing() {
+    let world = World::new(Host::Local);
+    world.save_layout("ws4", &[1]);
+    world.host.state.lock().unwrap().fail_writes = true;
+
+    let err = attach(&world.ports(), &Host::Local, "4", None, false).unwrap_err();
+
+    assert!(err.to_string().contains("No space left"), "{err:#}");
+    assert!(world.store.load().unwrap().get("4").is_none());
+    assert_eq!(world.sway.window_count(), 0);
+}
 
 #[test]
 fn attach_restores_layout_and_binds() {
@@ -887,6 +1151,52 @@ fn kill_ends_windows_shells_layout_and_binding() {
 }
 
 #[test]
+fn kill_takes_the_session() {
+    // Plan-layout-backup rule 1: a binding of the killed session on another
+    // machine no longer holds it, so its detach cannot save the layout again.
+    let world = World::new(Host::Local);
+    world.save_layout("ws4", &[1]);
+    let other_machine = world.take_elsewhere("ws4");
+
+    kill(&world.ports(), &Host::Local, &name("ws4")).unwrap();
+
+    let after = world.host_token("ws4").unwrap();
+    assert_ne!(after, other_machine.as_str());
+    let saved = SavedSession::new(
+        name("ws4"),
+        Host::Local,
+        Layout::Terminal {
+            terminal: t("ws4", 1),
+            percent: None,
+        },
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        session::save_if_token(&world.host, &saved, Some(&other_machine)).unwrap(),
+        SaveOutcome::TakenElsewhere
+    );
+    assert_eq!(world.host.file(SAVED_WS4), None);
+}
+
+#[test]
+fn kill_whose_take_fails_leaves_everything() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.save_layout("ws4", &[1]);
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+    world.host.add_shell("ws4-001", true);
+    world.host.state.lock().unwrap().fail_writes = true;
+
+    assert!(kill(&world.ports(), &Host::Local, &name("ws4")).is_err());
+
+    assert_eq!(world.window_numbers("ws4"), [1]);
+    assert_eq!(world.host.shells().len(), 1);
+    assert!(world.host.file(SAVED_WS4).is_some());
+    assert!(world.store.load().unwrap().get("4").is_some());
+}
+
+#[test]
 fn kill_on_unreachable_host_leaves_windows_open() {
     let remote = Host::Ssh(RemoteHost::new("deepthought").unwrap());
     let world = World::new(remote.clone());
@@ -907,6 +1217,7 @@ fn kill_on_unreachable_host_leaves_windows_open() {
     assert_eq!(world.window_numbers("ws4"), [1]);
     assert!(world.store.load().unwrap().get("4").is_some());
     assert!(world.fakes.stopped().is_empty(), "ws4 is still bound");
+    assert_eq!(world.takes(), 0);
 }
 
 #[test]

@@ -427,9 +427,6 @@ mod tests {
             out.extend_from_slice(argv);
             out
         }
-        fn write_file_atomic(&self, _: &str, _: &str) -> Result<(), HostError> {
-            unreachable!()
-        }
         fn read_file(&self, _: &str) -> Result<Option<String>, HostError> {
             unreachable!()
         }
@@ -437,6 +434,18 @@ mod tests {
             unreachable!()
         }
         fn remove_file(&self, _: &str) -> Result<bool, HostError> {
+            unreachable!()
+        }
+        fn take_token(&self, _: &str) -> Result<String, HostError> {
+            unreachable!()
+        }
+        fn write_file_if_token(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<&crate::types::Token>,
+        ) -> Result<bool, HostError> {
             unreachable!()
         }
     }

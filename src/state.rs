@@ -17,6 +17,12 @@
 //!    exclusive `flock` from load to drop, across processes and threads.
 //!    Commands hold it for their whole run, so concurrent `terminal`,
 //!    `attach`, `detach` and `kill` never interleave (plan rule 4).
+//! 5. **Old files load unchanged** (plan-layout-backup rule 19): fields added
+//!    to a binding have serde defaults, and a binding without them saves
+//!    back to the same JSON.
+//! 6. **Every new binding has a token** (plan-layout-backup decision 2):
+//!    [`WorkspaceState::new`] needs one. Only a binding loaded from a file
+//!    written before tokens has none.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -26,19 +32,41 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Host, SessionName};
+use crate::types::{Host, SessionName, Token};
 
 /// What a workspace is bound to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     host: Host,
     session: SessionName,
+    /// The token of the take that made this binding. `None` only in a
+    /// binding from before tokens; it holds the session while the host has
+    /// no token file (plan-layout-backup rule 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<Token>,
 }
 
 impl WorkspaceState {
+    /// A binding to `session` on `host`, made by the take that returned
+    /// `token`.
     #[must_use]
-    pub fn new(host: Host, session: SessionName) -> Self {
-        Self { host, session }
+    pub fn new(host: Host, session: SessionName, token: Token) -> Self {
+        Self {
+            host,
+            session,
+            token: Some(token),
+        }
+    }
+
+    /// A binding as a file from before tokens has it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn without_token(host: Host, session: SessionName) -> Self {
+        Self {
+            host,
+            session,
+            token: None,
+        }
     }
 
     #[must_use]
@@ -49,6 +77,12 @@ impl WorkspaceState {
     #[must_use]
     pub fn session(&self) -> &SessionName {
         &self.session
+    }
+
+    /// The token this binding took, if it has one.
+    #[must_use]
+    pub fn token(&self) -> Option<&Token> {
+        self.token.as_ref()
     }
 }
 
@@ -79,35 +113,51 @@ pub struct LocalState {
 }
 
 impl LocalState {
-    /// Bind workspace `ws` to `binding`. Binding a workspace again to the
-    /// same session is a no-op.
+    /// Whether `ws` may bind to (`host`, `session`) under guarantee 1. The
+    /// same check as [`LocalState::bind`], so that a caller can refuse before
+    /// it takes the session on its host (plan-layout-backup rule 2).
+    ///
+    /// # Errors
+    /// As [`LocalState::bind`].
+    pub fn check_bind(
+        &self,
+        ws: &str,
+        host: &Host,
+        session: &SessionName,
+    ) -> Result<(), BindError> {
+        if let Some(other) = self.workspace_of(host, session) {
+            if other != ws {
+                return Err(BindError::SessionBoundElsewhere {
+                    host: host.clone(),
+                    session: session.clone(),
+                    workspace: other.to_owned(),
+                });
+            }
+        }
+        match self.workspaces.get(ws) {
+            Some(current) if &current.host != host || &current.session != session => {
+                Err(BindError::WorkspaceTaken {
+                    workspace: ws.to_owned(),
+                    host: current.host.clone(),
+                    session: current.session.clone(),
+                })
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+
+    /// Bind workspace `ws` to `binding`. If `ws` is already bound to the
+    /// same host and session, `binding` replaces that binding, so the token
+    /// of the latest take wins.
     ///
     /// # Errors
     /// [`BindError::SessionBoundElsewhere`] if another workspace has this
     /// (host, session); [`BindError::WorkspaceTaken`] if `ws` is bound to a
     /// different session.
     pub fn bind(&mut self, ws: &str, binding: WorkspaceState) -> Result<(), BindError> {
-        if let Some(other) = self.workspace_of(&binding.host, &binding.session) {
-            if other != ws {
-                return Err(BindError::SessionBoundElsewhere {
-                    host: binding.host,
-                    session: binding.session,
-                    workspace: other.to_owned(),
-                });
-            }
-        }
-        match self.workspaces.get(ws) {
-            Some(current) if current == &binding => Ok(()),
-            Some(current) => Err(BindError::WorkspaceTaken {
-                workspace: ws.to_owned(),
-                host: current.host.clone(),
-                session: current.session.clone(),
-            }),
-            None => {
-                self.workspaces.insert(ws.to_owned(), binding);
-                Ok(())
-            }
-        }
+        self.check_bind(ws, &binding.host, &binding.session)?;
+        self.workspaces.insert(ws.to_owned(), binding);
+        Ok(())
     }
 
     /// Remove the binding of `ws`, returning it.
@@ -352,7 +402,15 @@ mod tests {
     }
 
     fn binding(host: Host, session: &str) -> WorkspaceState {
-        WorkspaceState::new(host, SessionName::new(session).unwrap())
+        WorkspaceState::without_token(host, SessionName::new(session).unwrap())
+    }
+
+    fn token(digit: char) -> Token {
+        Token::parse(&digit.to_string().repeat(32)).unwrap()
+    }
+
+    fn taken(host: Host, session: &str, digit: char) -> WorkspaceState {
+        WorkspaceState::new(host, SessionName::new(session).unwrap(), token(digit))
     }
 
     fn sample_state(ws: &str) -> LocalState {
@@ -399,6 +457,39 @@ mod tests {
     }
 
     #[test]
+    fn rebinding_the_same_session_replaces_its_token() {
+        // Plan-layout-backup decision 2 and rule 21: the binding records
+        // the token of its latest take.
+        let mut state = LocalState::default();
+        state.bind("4", binding(remote(), "ws4")).unwrap();
+        state.bind("4", taken(remote(), "ws4", 'a')).unwrap();
+        state.bind("4", taken(remote(), "ws4", 'b')).unwrap();
+        assert_eq!(state.get("4").unwrap().token(), Some(&token('b')));
+        assert_eq!(state.bindings().count(), 1);
+    }
+
+    #[test]
+    fn check_bind_refuses_what_bind_refuses() {
+        let mut state = LocalState::default();
+        state.bind("4", taken(remote(), "ws4", 'a')).unwrap();
+        let ws4 = SessionName::new("ws4").unwrap();
+        let other = SessionName::new("other").unwrap();
+        for (ws, session) in [("5", &ws4), ("4", &other)] {
+            let checked = state.check_bind(ws, &remote(), session).unwrap_err();
+            let bound = state
+                .clone()
+                .bind(
+                    ws,
+                    WorkspaceState::new(remote(), session.clone(), token('b')),
+                )
+                .unwrap_err();
+            assert_eq!(checked, bound);
+        }
+        state.check_bind("4", &remote(), &ws4).unwrap();
+        state.check_bind("5", &remote(), &other).unwrap();
+    }
+
+    #[test]
     fn unbind_and_unbind_session() {
         let mut state = sample_state("3");
         state.bind("q", binding(Host::Local, "notes")).unwrap();
@@ -431,6 +522,54 @@ mod tests {
             json,
             serde_json::json!({"workspaces": {"4": {"host": "user@host", "session": "mysession"}}})
         );
+    }
+
+    #[test]
+    fn binding_with_a_token_saves_it() {
+        let mut state = LocalState::default();
+        state.bind("4", taken(remote(), "ws4", 'c')).unwrap();
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"workspaces": {"4": {
+                "host": "user@host", "session": "ws4", "token": "c".repeat(32)}}})
+        );
+        assert_eq!(serde_json::from_value::<LocalState>(json).unwrap(), state);
+    }
+
+    #[test]
+    fn state_from_before_tokens_loads_and_saves_unchanged() {
+        // Plan-layout-backup rule 19. The fixture is the format of i3mux
+        // before tokens.
+        let fixture = include_str!("testdata/state-before-tokens.json");
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        fs::write(&store.path, fixture).unwrap();
+
+        let lock = store.lock().unwrap();
+        let state = lock.state().clone();
+        drop(lock);
+
+        assert!(!store.path.with_extension("json.corrupt").exists());
+        let bound: Vec<(&str, &str, &str)> = state
+            .bindings()
+            .map(|(ws, b)| (ws, b.host().label(), b.session().as_str()))
+            .collect();
+        assert_eq!(
+            bound,
+            [
+                ("3", "deepthought", "ws3"),
+                ("4", "local", "ws4"),
+                ("mail", "user@mail.example", "mail"),
+            ]
+        );
+        assert!(state.bindings().all(|(_, b)| b.token().is_none()));
+
+        store.save(&state).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        let original: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        assert_eq!(saved, original);
     }
 
     #[test]

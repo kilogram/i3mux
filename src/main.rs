@@ -9,6 +9,12 @@
 //! state lock from its first read to its last write, so concurrent i3mux
 //! commands never interleave (plan rule 4).
 //!
+//! `activate`, `attach` and `kill` take their session on its host: they
+//! write a new token there (plan-layout-backup rule 1). A command takes only
+//! after all its refusals, under the state lock, so a refused command never
+//! takes a session from the machine that holds it (rule 2). `detach` saves
+//! only while the host still has its binding's token (rules 4 and 5).
+//!
 //! Every command, on success and on failure, ends in
 //! [`with_unused_masters_stopped`]: it stops the ssh master of each host the
 //! command touched that no workspace is bound to (plan-ssh-recovery
@@ -42,8 +48,8 @@ use layout::Step;
 use master::{DirectSsh, Link, MasterState, Masters, SystemdMasters, TrackedMasters};
 use mux::{Choice, Shell};
 use serde_json::Value;
-use session::{SavedSession, SessionError};
-use state::{StateStore, WorkspaceState};
+use session::{SaveOutcome, SavedSession, SessionError};
+use state::{LocalState, StateStore, WorkspaceState};
 use sway_ops::Sway;
 use types::{Host, InvalidName, RemoteHost, SessionName, TerminalName};
 use window::Mark;
@@ -402,13 +408,24 @@ fn cmd_terminal(
 fn cmd_detach(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
     let workspace = wm.focused_workspace()?;
     let detached = detach(ports, workspace.name(), now_unix())?;
-    println!(
-        "✓ Detached session '{}': layout of {} saved on {}",
-        detached.session,
-        count(detached.terminals, "terminal", "terminals"),
-        detached.host
-    );
+    println!("{}", format_detached(&detached));
     Ok(ExitCode::SUCCESS)
+}
+
+/// What `detach` prints. A session that another machine took since is
+/// closed here without a save (plan-layout-backup rule 5), and says so.
+fn format_detached(detached: &Detached) -> String {
+    let terminals = count(detached.terminals, "terminal", "terminals");
+    let (session, host) = (&detached.session, &detached.host);
+    match detached.save {
+        SaveOutcome::Saved => {
+            format!("✓ Detached session '{session}': layout of {terminals} saved on {host}")
+        }
+        SaveOutcome::TakenElsewhere => format!(
+            "✓ Closed session '{session}' here: another machine took it since, \
+             so the layout of these {terminals} was not saved on {host}"
+        ),
+    }
 }
 
 fn cmd_attach(
@@ -556,7 +573,8 @@ fn default_session(workspace: &WorkspaceInfo) -> Result<SessionName, CommandErro
 }
 
 /// Bind `workspace` to `session` on `host`, then open its first terminal.
-/// The host is checked (reachable, shpool installed) before anything is bound.
+/// The host is checked (reachable, shpool installed) before anything is
+/// bound, and the session is taken on it (plan-layout-backup rule 1).
 fn activate(
     ports: &Ports,
     host: &Host,
@@ -567,13 +585,34 @@ fn activate(
         Some(session) => session,
         None => default_session(workspace)?,
     };
-    mux::list((ports.hosts)(host).as_ref())?;
-    let binding = WorkspaceState::new(host.clone(), session.clone());
+    let exec = (ports.hosts)(host);
+    mux::list(exec.as_ref())?;
     ports
         .store
-        .with_lock(|state| Ok(state.bind(workspace.name(), binding)?))?;
+        .with_lock(|state| take_and_bind(state, exec.as_ref(), workspace.name(), &session))?;
     let choice = open_terminal(ports, workspace.name(), &TerminalRequest::default())?;
     Ok((session, choice))
+}
+
+/// Refuse a bind that guarantee 1 of `state` forbids, else take `session`
+/// on its host and bind `workspace` to it with the new token. The caller
+/// holds the state lock and commits (plan-layout-backup rule 2).
+///
+/// If the take fails, `state` is unchanged. If the commit fails after the
+/// take, no binding holds the new token, and the next take replaces it.
+fn take_and_bind(
+    state: &mut LocalState,
+    exec: &dyn HostExec,
+    workspace: &str,
+    session: &SessionName,
+) -> Result<()> {
+    state.check_bind(workspace, exec.host(), session)?;
+    let token = session::take(exec, session)?;
+    state.bind(
+        workspace,
+        WorkspaceState::new(exec.host().clone(), session.clone(), token),
+    )?;
+    Ok(())
 }
 
 /// Open one window of the session bound to `workspace` (plan rule 4).
@@ -668,7 +707,11 @@ fn window_command(
 struct Detached {
     session: SessionName,
     host: Host,
+    /// Terminals in the captured layout.
     terminals: usize,
+    /// Whether the host still had the binding's token, so the layout was
+    /// saved (plan-layout-backup rules 4 and 5).
+    save: SaveOutcome,
 }
 
 /// Save the layout of `workspace` on the session's host, close its windows,
@@ -676,7 +719,13 @@ struct Detached {
 ///
 /// Plan rule 5: at least one i3mux window is required. Plan rule 7: the
 /// layout is written before any window closes, so a failed write leaves
-/// every window open.
+/// every window open and the workspace bound.
+///
+/// The write happens only while the host has the binding's token
+/// (plan-layout-backup rule 4). If another take changed it, the windows
+/// still close and the workspace is unbound, but the host layout and the
+/// shells' clients are not touched: they belong to the machine that took
+/// the session (rule 5).
 ///
 /// Sway closes windows asynchronously, so their shpool clients can outlive
 /// the kill; an `attach` right after would then see the shells as attached
@@ -702,16 +751,25 @@ fn detach(ports: &Ports, workspace: &str, saved_at_unix: u64) -> Result<Detached
         })?;
     let saved = SavedSession::new(name.clone(), host.clone(), layout, saved_at_unix)?;
     let exec = (ports.hosts)(host);
-    session::save(exec.as_ref(), &saved)?;
+    let save = session::save_if_token(exec.as_ref(), &saved, binding.token())?;
     let closed = sway_ops::kill_all(ports.sway, host, name)?;
-    mux::detach(exec.as_ref(), &closed)?;
-    lock.state_mut().unbind(workspace);
-    lock.commit()?;
-    wait_until_disconnected(exec.as_ref(), name, &closed, ports.disconnect_wait)?;
+    match save {
+        SaveOutcome::Saved => {
+            mux::detach(exec.as_ref(), &closed)?;
+            lock.state_mut().unbind(workspace);
+            lock.commit()?;
+            wait_until_disconnected(exec.as_ref(), name, &closed, ports.disconnect_wait)?;
+        }
+        SaveOutcome::TakenElsewhere => {
+            lock.state_mut().unbind(workspace);
+            lock.commit()?;
+        }
+    }
     Ok(Detached {
         session: name.clone(),
         host: host.clone(),
         terminals: saved.layout().terminals().len(),
+        save,
     })
 }
 
@@ -762,9 +820,11 @@ struct Attached {
 /// Restore a saved session of `host` into `workspace`.
 ///
 /// Refuses a shell attached elsewhere unless `force` (plan rule 10), and a
-/// workspace that already has i3mux windows (plan rule 6). The workspace is
-/// bound before any window opens, so an interrupted attach leaves a bound
-/// workspace that `detach` or `kill` can clean up.
+/// workspace that already has i3mux windows (plan rule 6). After the last
+/// refusal, under the state lock, it takes the session on the host
+/// (plan-layout-backup rules 1 and 2). The workspace is bound before any
+/// window opens, so an interrupted attach leaves a bound workspace that
+/// `detach` or `kill` can clean up.
 fn attach(
     ports: &Ports,
     host: &Host,
@@ -805,8 +865,7 @@ fn attach(
     {
         return Err(CommandError::WorkspaceHasTerminals(workspace.to_owned()).into());
     }
-    lock.state_mut()
-        .bind(workspace, WorkspaceState::new(host.clone(), name.clone()))?;
+    take_and_bind(lock.state_mut(), exec.as_ref(), workspace, &name)?;
     lock.commit()?;
     for step in layout::restore_plan(saved.layout()) {
         match step {
@@ -848,13 +907,19 @@ struct Killed {
 }
 
 /// End `session` on `host`, in this order: check that the host answers,
-/// close the windows (before the shells, so no wrapper shows an error),
-/// kill the shells, delete the saved layout, remove the binding. An
-/// unreachable host therefore leaves every window open.
+/// take the session, close the windows (before the shells, so no wrapper
+/// shows an error), kill the shells, delete the saved layout, remove the
+/// binding. An unreachable host therefore leaves every window open.
+///
+/// The take (plan-layout-backup rule 1) makes every other machine's binding
+/// of the session stale, so their `detach` cannot save the layout of a
+/// killed session again. A kill of an unknown session also takes, and its
+/// token file stays: nothing deletes a token file.
 fn kill(ports: &Ports, host: &Host, name: &SessionName) -> Result<Killed> {
     let exec = (ports.hosts)(host);
     let mut lock = ports.store.lock()?;
     mux::list(exec.as_ref())?;
+    session::take(exec.as_ref(), name)?;
     let windows = sway_ops::kill_all(ports.sway, host, name)?.len();
     let shells = mux::kill_session(exec.as_ref(), name)?.len();
     let layout_deleted = session::delete(exec.as_ref(), name)?;

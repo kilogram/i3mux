@@ -21,9 +21,15 @@
 //! - File paths are relative to the home directory of the host user. The
 //!   file operations are POSIX `sh` scripts that run through [`HostExec::run`],
 //!   so local and remote use the same code.
-//! - [`HostExec::write_file_atomic`] writes a temp file in the target
-//!   directory and renames it: readers see the old or the new file, never
-//!   a partial one. The file is not fsynced (no portable `sh` way).
+//! - Every write is atomic: it writes a temp file in the target directory
+//!   and renames it, so readers see the old or the new file, never a
+//!   partial one. Files are not fsynced (no portable `sh` way).
+//! - Token files (plan-layout-backup rules 1 and 4): [`HostExec::take_token`]
+//!   and [`HostExec::write_file_if_token`] each run as one script under an
+//!   exclusive `flock` on `.lock` in the token file's directory. So a take
+//!   never lands between a checked write's compare and its write. No
+//!   operation deletes a token file, and no operation writes a file without
+//!   checking a token.
 //! - Output of the remote login profile never reaches the caller: a remote
 //!   command prints [`START_MARKER`] after the profile has run, and
 //!   [`HostExec::run`] drops everything up to and including it.
@@ -34,11 +40,15 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use crate::master::{self, MasterError, Masters, LIVENESS_OPTIONS};
-use crate::types::{Host, RemoteHost};
+use crate::types::{Host, RemoteHost, Token};
 
 /// Exit status the file scripts use for "no such file" (the literal 44 in
 /// `READ_SCRIPT` and `REMOVE_SCRIPT`).
 const MISSING: i32 = 44;
+
+/// Exit status of `CHECKED_WRITE_SCRIPT` when the token file does not hold
+/// the expected token (the literal 45 in the script).
+const OTHER_TOKEN: i32 = 45;
 
 /// ssh exits with 255 when the connection itself fails.
 const SSH_TRANSPORT_FAILURE: i32 = 255;
@@ -61,15 +71,6 @@ const REMOTE_PATH_PREFIX: &str = r#"PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PAT
 /// for local terminals such as foot.
 const REMOTE_TERM: &str = "TERM=xterm-256color";
 
-const WRITE_SCRIPT: &str = r#"set -e
-f="$HOME/$1"
-d="${f%/*}"
-mkdir -p "$d"
-t=$(mktemp "$d/.${f##*/}.XXXXXX")
-trap 'rm -f "$t"' EXIT
-cat > "$t"
-mv -f "$t" "$f""#;
-
 const READ_SCRIPT: &str = r#"f="$HOME/$1"
 [ -e "$f" ] || exit 44
 exec cat -- "$f""#;
@@ -84,6 +85,47 @@ done"#;
 const REMOVE_SCRIPT: &str = r#"f="$HOME/$1"
 [ -e "$f" ] || exit 44
 exec rm -f -- "$f""#;
+
+/// `$1` is the token file. Under the lock, replace it with 16 bytes from
+/// `/dev/urandom` as hex, then print them.
+const TAKE_SCRIPT: &str = r#"set -e
+f="$HOME/$1"
+d="${f%/*}"
+mkdir -p "$d"
+exec 9>"$d/.lock"
+flock 9
+new=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+if [ "${#new}" -ne 32 ]; then
+  echo "i3mux: cannot read 16 random bytes from /dev/urandom" >&2
+  exit 1
+fi
+t=$(mktemp "$d/.${f##*/}.XXXXXX")
+trap 'rm -f "$t"' EXIT
+printf '%s\n' "$new" > "$t"
+mv -f "$t" "$f"
+printf '%s' "$new""#;
+
+/// `$1` is the file to write, `$2` the token file, `$3` the expected token
+/// or empty for "no token file". Under the lock, compare, then write stdin
+/// to `$1` atomically, or exit 45 and write nothing. A mismatch still reads
+/// all of stdin, so the writer never sees a broken pipe.
+const CHECKED_WRITE_SCRIPT: &str = r#"set -e
+f="$HOME/$1"
+tok="$HOME/$2"
+d="${f%/*}"
+mkdir -p "$d" "${tok%/*}"
+exec 9>"${tok%/*}/.lock"
+flock 9
+found=
+if [ -e "$tok" ]; then found=$(cat -- "$tok"); fi
+if [ "$found" != "$3" ]; then
+  cat > /dev/null
+  exit 45
+fi
+t=$(mktemp "$d/.${f##*/}.XXXXXX")
+trap 'rm -f "$t"' EXIT
+cat > "$t"
+mv -f "$t" "$f""#;
 
 /// A command could not run on a host, or ran and failed.
 #[derive(Debug, thiserror::Error)]
@@ -139,13 +181,6 @@ pub trait HostExec {
     /// this host.
     fn attach_argv(&self, argv: &[String]) -> Vec<String>;
 
-    /// Replace the file at `home_rel` with `content` atomically, creating
-    /// parent directories.
-    ///
-    /// # Errors
-    /// Any [`HostError`]; the previous file is then unchanged.
-    fn write_file_atomic(&self, home_rel: &str, content: &str) -> Result<(), HostError>;
-
     /// The content of the file at `home_rel`, or `None` if it does not exist.
     ///
     /// # Errors
@@ -164,6 +199,30 @@ pub trait HostExec {
     /// # Errors
     /// Any [`HostError`].
     fn remove_file(&self, home_rel: &str) -> Result<bool, HostError>;
+
+    /// Replace the token file at `token_rel` with a new token: 16 random
+    /// bytes as 32 lowercase hex digits. Returns what it wrote, unvalidated.
+    /// Runs under the lock of the token's directory.
+    ///
+    /// # Errors
+    /// Any [`HostError`]; the token file is then unchanged.
+    fn take_token(&self, token_rel: &str) -> Result<String, HostError>;
+
+    /// Replace the file at `home_rel` with `content` atomically, creating
+    /// parent directories, but only if the token file at `token_rel` holds
+    /// `token`, or does not exist when `token` is `None`. The compare and the
+    /// write run under the lock of the token's directory. Returns whether it
+    /// wrote.
+    ///
+    /// # Errors
+    /// Any [`HostError`]; the file is then unchanged.
+    fn write_file_if_token(
+        &self,
+        home_rel: &str,
+        content: &str,
+        token_rel: &str,
+        token: Option<&Token>,
+    ) -> Result<bool, HostError>;
 }
 
 /// Local settings a [`HostRunner`] needs.
@@ -241,18 +300,21 @@ impl HostRunner {
     fn run_script(
         &self,
         script: &str,
-        arg: &str,
+        args: &[&str],
         stdin: Option<&str>,
     ) -> Result<String, HostError> {
-        self.run(&script_argv(script, arg), stdin)
+        self.run(&script_argv(script, args), stdin)
     }
 }
 
-/// `sh -c SCRIPT i3mux ARG`: `ARG` reaches the script as `$1`, never parsed.
-fn script_argv(script: &str, arg: &str) -> Vec<String> {
-    ["sh", "-c", script, "i3mux", arg]
-        .map(str::to_owned)
-        .to_vec()
+/// `sh -c SCRIPT i3mux ARGS...`: the arguments reach the script as `$1`,
+/// `$2`, ..., never parsed.
+fn script_argv(script: &str, args: &[&str]) -> Vec<String> {
+    ["sh", "-c", script, "i3mux"]
+        .iter()
+        .chain(args)
+        .map(|a| (*a).to_owned())
+        .collect()
 }
 
 /// The `bash -lc` script of a remote command: extend `PATH`, print
@@ -334,22 +396,41 @@ impl HostExec for HostRunner {
         }
     }
 
-    fn write_file_atomic(&self, home_rel: &str, content: &str) -> Result<(), HostError> {
-        self.run_script(WRITE_SCRIPT, home_rel, Some(content))
-            .map(drop)
-    }
-
     fn read_file(&self, home_rel: &str) -> Result<Option<String>, HostError> {
-        missing_as_none(self.run_script(READ_SCRIPT, home_rel, None))
+        missing_as_none(self.run_script(READ_SCRIPT, &[home_rel], None))
     }
 
     fn list_dir(&self, home_rel: &str) -> Result<Vec<String>, HostError> {
-        let out = self.run_script(LIST_SCRIPT, home_rel, None)?;
+        let out = self.run_script(LIST_SCRIPT, &[home_rel], None)?;
         Ok(out.lines().map(str::to_owned).collect())
     }
 
     fn remove_file(&self, home_rel: &str) -> Result<bool, HostError> {
-        missing_as_none(self.run_script(REMOVE_SCRIPT, home_rel, None)).map(|r| r.is_some())
+        missing_as_none(self.run_script(REMOVE_SCRIPT, &[home_rel], None)).map(|r| r.is_some())
+    }
+
+    fn take_token(&self, token_rel: &str) -> Result<String, HostError> {
+        self.run_script(TAKE_SCRIPT, &[token_rel], None)
+    }
+
+    fn write_file_if_token(
+        &self,
+        home_rel: &str,
+        content: &str,
+        token_rel: &str,
+        token: Option<&Token>,
+    ) -> Result<bool, HostError> {
+        // A token is never empty, so "" can stand for "no token file".
+        let expected = token.map_or("", Token::as_str);
+        let args = [home_rel, token_rel, expected];
+        match self.run_script(CHECKED_WRITE_SCRIPT, &args, Some(content)) {
+            Ok(_) => Ok(true),
+            Err(HostError::Failed {
+                code: Some(OTHER_TOKEN),
+                ..
+            }) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -700,22 +781,29 @@ mod tests {
         );
 
         let content = "{\"a\": \"it's $HOME\"}\n";
-        host.write_file_atomic(rel, content).unwrap();
+        write_with_no_token(&host, rel, content);
         assert_eq!(
             std::fs::read_to_string(home.path().join(rel)).unwrap(),
             content
         );
         assert_eq!(host.read_file(rel).unwrap().as_deref(), Some(content));
 
-        host.write_file_atomic(".local/state/i3mux/sessions/ws5.json", "x")
-            .unwrap();
+        write_with_no_token(&host, ".local/state/i3mux/sessions/ws5.json", "x");
         let mut names = host.list_dir(".local/state/i3mux/sessions").unwrap();
         names.sort();
-        assert_eq!(names, ["ws4.json", "ws5.json"]);
+        assert_eq!(names, ["ws4.json", "ws5.json"], "the lock file is hidden");
 
         assert!(host.remove_file(rel).unwrap());
         assert!(!host.remove_file(rel).unwrap());
         assert_eq!(host.read_file(rel).unwrap(), None);
+    }
+
+    /// Write `content` to `rel`, guarded by a token file that does not exist.
+    fn write_with_no_token(host: &HostRunner, rel: &str, content: &str) {
+        let token_rel = format!("{rel}.token");
+        assert!(host
+            .write_file_if_token(rel, content, &token_rel, None)
+            .unwrap());
     }
 
     #[test]
@@ -723,21 +811,167 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let host = local(home.path());
-        host.write_file_atomic("state/a.json", "old").unwrap();
-        let dir = home.path().join("state");
+        let token = Token::parse(&host.take_token(TOKEN_REL).unwrap()).unwrap();
+        host.write_file_if_token(LAYOUT_REL, "old", TOKEN_REL, Some(&token))
+            .unwrap();
+        let dir = home.path().join(".local/state/i3mux/sessions");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let result = host.write_file_atomic("state/a.json", "new");
+        let result = host.write_file_if_token(LAYOUT_REL, "new", TOKEN_REL, Some(&token));
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             matches!(result, Err(HostError::Failed { .. })),
             "{result:?}"
         );
+        assert_eq!(host.read_file(LAYOUT_REL).unwrap().as_deref(), Some("old"));
         assert_eq!(
-            host.read_file("state/a.json").unwrap().as_deref(),
-            Some("old")
+            file_names(&dir),
+            [".lock", "ws4.json", "ws4.token"],
+            "temp file left behind"
         );
-        assert_eq!(host.list_dir("state").unwrap(), ["a.json"]);
-        let hidden: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-        assert_eq!(hidden.len(), 1, "temp file left behind: {hidden:?}");
+    }
+
+    const TOKEN_REL: &str = ".local/state/i3mux/sessions/ws4.token";
+    const LAYOUT_REL: &str = ".local/state/i3mux/sessions/ws4.json";
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn take_writes_a_new_random_token_each_time() {
+        // Plan-layout-backup rule 1.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let first = Token::parse(&host.take_token(TOKEN_REL).unwrap()).unwrap();
+        let second = Token::parse(&host.take_token(TOKEN_REL).unwrap()).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            host.read_file(TOKEN_REL).unwrap(),
+            Some(format!("{}\n", second.as_str()))
+        );
+        let dir = home.path().join(".local/state/i3mux/sessions");
+        assert_eq!(
+            file_names(&dir),
+            [".lock", "ws4.token"],
+            "no temp file left"
+        );
+    }
+
+    #[test]
+    fn take_survives_the_remote_quoting() {
+        // The script has quotes and a `\n` for `tr`; both pass through
+        // the login shell and `bash -lc` as on a remote host.
+        let home = tempfile::tempdir().unwrap();
+        let argv = script_argv(TAKE_SCRIPT, &[TOKEN_REL]);
+        let printed = run_like_sshd(&remote_run_command(&argv), home.path());
+        let token = Token::parse(after_start_marker(&printed).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(TOKEN_REL)).unwrap(),
+            format!("{}\n", token.as_str())
+        );
+    }
+
+    #[test]
+    fn checked_write_with_no_token_on_either_side_writes() {
+        // Plan-layout-backup rule 4: bindings from before tokens still detach.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        assert!(host
+            .write_file_if_token(LAYOUT_REL, "layout", TOKEN_REL, None)
+            .unwrap());
+        assert_eq!(
+            host.read_file(LAYOUT_REL).unwrap().as_deref(),
+            Some("layout")
+        );
+        assert_eq!(
+            host.read_file(TOKEN_REL).unwrap(),
+            None,
+            "a write never takes"
+        );
+    }
+
+    #[test]
+    fn checked_write_writes_only_on_the_expected_token() {
+        // Plan-layout-backup rule 4.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let mine = Token::parse(&host.take_token(TOKEN_REL).unwrap()).unwrap();
+        assert!(host
+            .write_file_if_token(LAYOUT_REL, "mine", TOKEN_REL, Some(&mine))
+            .unwrap());
+
+        let theirs = Token::parse(&host.take_token(TOKEN_REL).unwrap()).unwrap();
+        for stale in [Some(&mine), None] {
+            assert!(!host
+                .write_file_if_token(LAYOUT_REL, "stale", TOKEN_REL, stale)
+                .unwrap());
+        }
+        assert_eq!(host.read_file(LAYOUT_REL).unwrap().as_deref(), Some("mine"));
+
+        assert!(host
+            .write_file_if_token(LAYOUT_REL, "theirs", TOKEN_REL, Some(&theirs))
+            .unwrap());
+        assert_eq!(
+            host.read_file(LAYOUT_REL).unwrap().as_deref(),
+            Some("theirs")
+        );
+    }
+
+    #[test]
+    fn checked_write_with_a_token_needs_the_token_file() {
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let token = Token::parse("0123456789abcdef0123456789abcdef").unwrap();
+        assert!(!host
+            .write_file_if_token(LAYOUT_REL, "layout", TOKEN_REL, Some(&token))
+            .unwrap());
+        assert_eq!(host.read_file(LAYOUT_REL).unwrap(), None);
+    }
+
+    #[test]
+    fn checked_write_mismatch_reads_all_of_a_large_layout() {
+        // Larger than a pipe buffer: a script that exits without reading
+        // stdin would fail the write with a broken pipe.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        host.take_token(TOKEN_REL).unwrap();
+        let large = "x".repeat(1 << 20);
+        let result = host.write_file_if_token(LAYOUT_REL, &large, TOKEN_REL, None);
+        assert!(matches!(result, Ok(false)), "{result:?}");
+    }
+
+    #[test]
+    fn take_and_checked_write_wait_for_the_lock() {
+        // Plan-layout-backup rules 1 and 4: both run under `flock`, so
+        // neither can land inside the other.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let token = Token::parse(&host.take_token(TOKEN_REL).unwrap()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(home.path().join(".local/state/i3mux/sessions/.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let (take_host, write_host) = (host.clone(), host.clone());
+        let take_done = done.clone();
+        std::thread::spawn(move || take_done.send(take_host.take_token(TOKEN_REL).is_ok()));
+        std::thread::spawn(move || {
+            let wrote = write_host.write_file_if_token(LAYOUT_REL, "x", TOKEN_REL, Some(&token));
+            done.send(wrote.is_ok())
+        });
+        let wait = std::time::Duration::from_millis(300);
+        assert!(finished.recv_timeout(wait).is_err(), "ran without the lock");
+
+        drop(lock);
+        let wait = std::time::Duration::from_secs(10);
+        assert!(finished.recv_timeout(wait).unwrap());
+        assert!(finished.recv_timeout(wait).unwrap());
     }
 }
