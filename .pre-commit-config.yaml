@@ -1,0 +1,12 @@
+# Fast per-file checks only (supporting-tooling skill). Claude's Stop hook
+# runs these on the files it edited, in a scratch worktree with no target/;
+# clippy and tests stay in `just check`.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        types: [rust]
+        pass_filenames: false
