@@ -18,7 +18,7 @@
 //! - Nothing here contacts a host (rule 10).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -51,11 +51,17 @@ impl BackupStore {
         Self { dir }
     }
 
-    /// `$XDG_STATE_HOME/i3mux/backups`, by default `~/.local/state/i3mux/backups`.
+    /// `$I3MUX_BACKUP_DIR` if set, else `$XDG_STATE_HOME/i3mux/backups`, by
+    /// default `~/.local/state/i3mux/backups`. The watcher's unit gets
+    /// `I3MUX_BACKUP_DIR`, so it writes where the i3mux that started it
+    /// reads, whatever environment the user manager has.
     ///
     /// # Errors
     /// If no state directory can be found.
     pub fn from_env() -> Result<Self> {
+        if let Some(dir) = std::env::var_os("I3MUX_BACKUP_DIR").filter(|d| !d.is_empty()) {
+            return Ok(Self::new(PathBuf::from(dir)));
+        }
         let dir = dirs::state_dir()
             .context("cannot find the state directory; set XDG_STATE_HOME or HOME")?
             .join("i3mux")
@@ -63,21 +69,23 @@ impl BackupStore {
         Ok(Self::new(dir))
     }
 
+    /// The directory of the backups.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn path_of(&self, host: &Host, session: &SessionName) -> PathBuf {
         self.dir.join(host.label()).join(format!("{session}.json"))
     }
 
     /// Replace the backup of `binding` with `layout`, under the binding's
-    /// token. The caller holds the state lock.
-    ///
-    /// The watcher (plan-layout-backup phase 3) is the only writer; until
-    /// it exists, only tests call this, and the phase 3 change removes the
-    /// `cfg(test)`.
+    /// token. The layout watcher is the only writer, and holds the state
+    /// lock (rule 6).
     ///
     /// # Errors
     /// If `layout` fails [`session::check_layout`], or the file cannot be
     /// written; the old backup is then unchanged.
-    #[cfg(test)]
     pub fn write(&self, binding: &WorkspaceState, layout: &Layout) -> Result<()> {
         session::check_layout(binding.session(), layout)?;
         let file = BackupFile {

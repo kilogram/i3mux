@@ -256,6 +256,12 @@ impl StateStore {
         Ok(Self::new(path))
     }
 
+    /// Where `state.json` is.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Read the state without locking, for read-only commands.
     ///
     /// A missing or empty file is the empty state. An unparseable file is

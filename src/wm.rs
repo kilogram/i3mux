@@ -1,7 +1,7 @@
 //! Sway IPC through `swaymsg`. The only module that runs Sway commands.
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -97,6 +97,31 @@ impl Wm {
             boot_id.trim(),
             self.socket.to_string_lossy(),
         ))
+    }
+
+    /// Sway's IPC socket.
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Subscribe to Sway's events: `swaymsg -r -m -t subscribe EVENTS`, where
+    /// `events_json` is a JSON array of event types, such as
+    /// `["window"]`. The child prints the reply to the subscription, then
+    /// one JSON value per event on its stdout, until Sway closes its socket.
+    /// Only the layout watcher subscribes.
+    ///
+    /// # Errors
+    /// [`WmError::Spawn`] if `swaymsg` cannot start.
+    pub fn subscribe(&self, events_json: &str) -> Result<Child, WmError> {
+        Command::new("swaymsg")
+            .arg("-s")
+            .arg(&self.socket)
+            .args(["-r", "-m", "-t", "subscribe", "--", events_json])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(WmError::Spawn)
     }
 
     /// Run `swaymsg -s SOCKET <args>` and return stdout.

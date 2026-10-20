@@ -18,7 +18,9 @@
 //!
 //! A binding whose windows went away with an earlier Sway is resumable:
 //! `attach` and `terminal` bring its windows back from this machine's
-//! backup, without a take (rules 3 and 11-15).
+//! backup, without a take (rules 3 and 11-15). The layout watcher keeps
+//! those backups: every command that makes this Sway the owner of a binding
+//! starts it (rule 17).
 //!
 //! Every command, on success and on failure, ends in
 //! [`with_unused_masters_stopped`]: it stops the ssh master of each host the
@@ -35,6 +37,8 @@ mod session;
 mod state;
 mod sway_ops;
 mod types;
+mod watch;
+mod watch_unit;
 mod window;
 mod wm;
 
@@ -59,6 +63,7 @@ use session::{SavedSession, SessionError, TokenMatch};
 use state::{LocalState, StateLock, StateStore, WorkspaceState};
 use sway_ops::Sway;
 use types::{Host, InvalidName, RemoteHost, SessionName, SwayInstance, TerminalName};
+use watch_unit::{NoWatcher, SystemdWatcher, Watcher};
 use window::Mark;
 use wm::{Wm, WorkspaceInfo};
 
@@ -146,6 +151,9 @@ enum CliCommand {
         #[arg(short, long)]
         session: Option<String>,
     },
+    /// Keep backups of this Sway's workspace layouts; i3mux runs it as a user unit
+    #[command(hide = true)]
+    Watch,
 }
 
 /// Debug output on stderr, enabled by `-v`.
@@ -182,6 +190,8 @@ struct Ports<'a> {
     /// The Sway this command runs in: the owner of the bindings whose
     /// windows it holds (plan-layout-backup decision 2).
     current_sway: &'a SwayInstance,
+    /// Starts the layout watcher of `current_sway` (rule 17).
+    watcher: &'a (dyn Watcher + Sync),
 }
 
 /// A command refused to act. The messages are the plan's user-facing text.
@@ -252,6 +262,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Box::new(DirectSsh)
     };
     let masters = Arc::new(TrackedMasters::new(inner));
+    let log = Log {
+        verbose: cli.verbose,
+    };
+    let watcher: Box<dyn Watcher + Sync> = if master::systemd_user_manager_runs(&runtime_dir) {
+        let exe = std::env::current_exe().context("cannot find the i3mux program")?;
+        let argv = watch_unit::unit_argv(&exe, wm.socket(), store.path(), backups.dir());
+        Box::new(SystemdWatcher::new(argv))
+    } else {
+        log.debug(|| "no systemd user manager: no layout watcher, so no backups".to_owned());
+        Box::new(NoWatcher)
+    };
     let config = RunnerConfig {
         local_home: dirs::home_dir().context("cannot find the home directory; set HOME")?,
         local_runtime_dir: Some(runtime_dir.clone()),
@@ -267,12 +288,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
         launcher: &launcher,
         hosts: &hosts,
         masters: masters.as_ref(),
-        log: Log {
-            verbose: cli.verbose,
-        },
+        log,
         disconnect_wait: DISCONNECT_WAIT,
         backups: &backups,
         current_sway: &current_sway,
+        watcher: watcher.as_ref(),
     };
     with_unused_masters_stopped(&store, &masters, &current_sway, || {
         dispatch(&ports, &wm, &launcher, cli.command)
@@ -304,6 +324,7 @@ fn dispatch(
         CliCommand::Sessions { remote, all } => cmd_sessions(ports, remote, all),
         CliCommand::Status => cmd_status(ports, wm),
         CliCommand::Kill { remote, session } => cmd_kill(ports, wm, remote, session),
+        CliCommand::Watch => cmd_watch(ports, wm),
     }
 }
 
@@ -603,6 +624,33 @@ fn cmd_kill(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `i3mux watch`, which the unit of [`start_watcher`] runs: keep the
+/// backups of this Sway's bindings until Sway exits (plan-layout-backup
+/// rules 6-8, 10 and 17). Exit 0 on Sway's shutdown, or when Sway closes its
+/// socket; any other end is an error, and systemd restarts the watcher.
+fn cmd_watch(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
+    let mut swaymsg = wm.subscribe(watch::SWAY_EVENTS)?;
+    let output = swaymsg
+        .stdout
+        .take()
+        .context("swaymsg started without its output")?;
+    let mut events = watch::SwaymsgEvents::read(output);
+    let stop = watch::watch(&mut events, || {
+        watch::back_up(ports.store, ports.sway, ports.backups, ports.current_sway)
+    });
+    if !matches!(stop, Ok(watch::Stop::Closed)) {
+        if let Err(err) = swaymsg.kill() {
+            ports.log.debug(|| format!("cannot stop swaymsg: {err}"));
+        }
+    }
+    let status = swaymsg.wait().context("cannot wait for swaymsg")?;
+    match stop? {
+        watch::Stop::Shutdown => {}
+        watch::Stop::Closed => watch::check_closed(events.subscribed(), status)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn describe_choice(choice: &Choice) -> String {
     match choice {
         Choice::Reattach(name) => format!("reattached shell {name}"),
@@ -667,6 +715,7 @@ fn activate(
             ports.current_sway,
         )
     })?;
+    start_watcher(ports);
     let choice = open_terminal(ports, workspace.name(), &TerminalRequest::default())?;
     Ok((session, choice))
 }
@@ -690,6 +739,15 @@ fn take_and_bind(
     let binding = WorkspaceState::new(exec.host().clone(), session.clone(), token, owner.clone());
     state.bind(workspace, binding)?;
     Ok(())
+}
+
+/// Start the layout watcher of this Sway, once a binding that it owns is
+/// committed (plan-layout-backup rule 17). A failure only warns: the
+/// windows matter more than their backup.
+fn start_watcher(ports: &Ports) {
+    if let Err(err) = ports.watcher.ensure_running() {
+        eprintln!("i3mux: warning: {err:#}; the layouts of this Sway are not backed up");
+    }
 }
 
 /// Open one window of the session bound to `workspace` (plan rule 4).
@@ -735,9 +793,12 @@ fn open_terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> R
         request.command.as_deref(),
     )?;
     if !binding.is_owned_by(ports.current_sway) {
+        // After an interrupted resume this claims a partial layout, which
+        // the watcher then backs up over the full one: accepted.
         let owned = binding.with_owner(ports.current_sway.clone());
         lock.state_mut().bind(workspace, owned)?;
         lock.commit()?;
+        start_watcher(ports);
     }
     Ok(choice)
 }
@@ -880,6 +941,7 @@ fn restore_backup(
     let owned = binding.clone().with_owner(ports.current_sway.clone());
     lock.state_mut().bind(workspace, owned)?;
     lock.commit()?;
+    start_watcher(ports);
     Ok(Attached {
         session: binding.session().clone(),
         host: binding.host().clone(),
@@ -999,12 +1061,12 @@ fn detach(ports: &Ports, workspace: &str, saved_at_unix: u64) -> Result<Detached
         .ok_or_else(|| CommandError::Unbound(workspace.to_owned()))?;
     let (host, name) = (binding.host(), binding.session());
     let tree = ports.sway.get_tree()?;
-    let layout = window::find_workspace(&tree, workspace)
-        .and_then(|ws| layout::capture(ws, host, name))
-        .ok_or_else(|| CommandError::NothingToDetach {
+    let layout = layout::capture_workspace(&tree, workspace, host, name).ok_or_else(|| {
+        CommandError::NothingToDetach {
             workspace: workspace.to_owned(),
             session: name.clone(),
-        })?;
+        }
+    })?;
     let saved = SavedSession::new(name.clone(), host.clone(), layout, saved_at_unix)?;
     let exec = (ports.hosts)(host);
     let token = session::save_if_token(exec.as_ref(), &saved, binding.token())?;
@@ -1186,6 +1248,7 @@ fn attach_saved(
         ports.current_sway,
     )?;
     lock.commit()?;
+    start_watcher(ports);
     open_layout(ports, exec, saved.layout(), force)?;
     Ok(Attached {
         session: saved.name().clone(),

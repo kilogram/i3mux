@@ -104,7 +104,8 @@ Resume:
 
 Other:
 
-17. The watcher runs as the transient user unit `i3mux-watch-<sway pid>`.
+17. The watcher runs as the transient user unit `i3mux-watch-<id>`, where id
+    hashes `$SWAYSOCK`.
     i3mux starts it when it binds a workspace. It gets `SWAYSOCK` and the
     state path with `--setenv`. It uses `Restart=on-failure` and exits 0
     when Sway closes its socket.
@@ -123,6 +124,14 @@ Other:
    11-16, 18-19).
 3. The watcher and its unit (rules 6-8, 10, 17, 20).
 4. `sessions` text, README and INSTALL.
+5. Design-review fixes: `terminal -e` after a restore, clear lost-session
+   messages and remedies, bare `attach` resumes, a resumable state in
+   `sessions`, `status` and rofi.
+
+Follow-ups after phase 5:
+
+- `notify-send` for lost-session notices from `terminal` run by a key.
+- Stop the watcher unit when no binding of its Sway remains.
 
 ## Rejected
 

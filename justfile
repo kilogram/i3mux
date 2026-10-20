@@ -29,6 +29,13 @@ check-boundaries:
         echo "fix: pass sway JSON in from the caller instead." >&2
         exit 1
     fi
+    # Plan-layout-backup rule 10: the layout watcher never contacts a host.
+    if offenders=$(grep -nE '\b(crate|super)::(\{[^}]*\b)?(host|mux|master|session)\b' src/watch.rs); then
+        echo "$offenders" | sed 's/^/boundary violation: /' >&2
+        echo "rule: src/watch.rs must not import crate::host, mux, master or session (docs/PLAN-layout-backup.md, rule 10)." >&2
+        echo "fix: keep host contact out of the watcher; it reads Sway and local files only." >&2
+        exit 1
+    fi
 
 # Container integration suite; args go to `cargo test`
 check-int *args: images

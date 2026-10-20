@@ -27,6 +27,9 @@
 //! - On a machine with no systemd user manager, [`DirectSsh`] stands in for
 //!   [`SystemdMasters`]: there is no master, each client connects on its own,
 //!   and windows do not recover.
+//! - [`start_transient_unit`] is the one way i3mux starts a transient user
+//!   unit; the layout watcher's unit uses it too (plan-layout-backup
+//!   rule 17).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -300,18 +303,17 @@ impl Masters for SystemdMasters {
         if is_active.status.success() {
             return Ok(Link::Shared(unit));
         }
-        let argv = self.start_argv(&unit, host);
-        let out = output(&argv[0], &argv[1..])?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if out.status.success() || already_exists(&stderr) {
-            return Ok(Link::Shared(unit));
+        match start_transient_unit(&self.start_argv(&unit, host))? {
+            UnitStart::Running => Ok(Link::Shared(unit)),
+            UnitStart::Refused { stderr } => {
+                let detail = Self::last_ssh_line(&unit).unwrap_or(stderr);
+                Err(MasterError::StartFailed {
+                    host: host.clone(),
+                    unit,
+                    detail,
+                })
+            }
         }
-        let detail = Self::last_ssh_line(&unit).unwrap_or_else(|| stderr.trim().to_owned());
-        Err(MasterError::StartFailed {
-            host: host.clone(),
-            unit,
-            detail,
-        })
     }
 
     fn stop(&self, host: &RemoteHost) -> Result<(), MasterError> {
@@ -414,6 +416,38 @@ impl Masters for TrackedMasters {
 fn unit_of(host: &RemoteHost) -> Result<UnitName, MasterError> {
     let out = checked_output("systemd-escape", &["--", host.as_str()])?;
     UnitName::from_escaped_host(String::from_utf8_lossy(&out.stdout).trim_end())
+}
+
+/// What [`start_transient_unit`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitStart {
+    /// The unit runs: it started now, or it existed already.
+    Running,
+    /// `systemd-run` refused, with this error.
+    Refused { stderr: String },
+}
+
+/// Run `argv`, a `systemd-run` command line that names its unit. A unit
+/// that exists already counts as running: another i3mux started it first,
+/// or it waits to restart. So callers in several processes may race
+/// (rule 1).
+///
+/// # Errors
+/// [`MasterError::Spawn`] if the program cannot start, and
+/// [`MasterError::Systemd`] if `argv` is empty.
+pub fn start_transient_unit(argv: &[String]) -> Result<UnitStart, MasterError> {
+    let (program, arguments) = argv.split_first().ok_or_else(|| MasterError::Systemd {
+        command: "systemd-run".to_owned(),
+        detail: "i3mux bug: empty command line".to_owned(),
+    })?;
+    let out = output(program, arguments)?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() || already_exists(&stderr) {
+        return Ok(UnitStart::Running);
+    }
+    Ok(UnitStart::Refused {
+        stderr: stderr.trim().to_owned(),
+    })
 }
 
 /// Whether `systemd-run` failed only because the unit exists: another i3mux
@@ -564,6 +598,25 @@ mod tests {
         assert!(!already_exists(
             "Job for i3mux-ssh-x.service failed because the control process exited with error code."
         ));
+    }
+
+    #[test]
+    fn start_transient_unit_counts_an_existing_unit_as_running() {
+        // Stand-ins for systemd-run: plain shells, no systemd involved.
+        let sh = |script: &str| ["sh", "-c", script].map(str::to_owned).to_vec();
+        assert_eq!(
+            start_transient_unit(&sh("exit 0")).unwrap(),
+            UnitStart::Running
+        );
+        let exists = sh("echo 'Unit i3mux-x.service already exists.' >&2; exit 1");
+        assert_eq!(start_transient_unit(&exists).unwrap(), UnitStart::Running);
+        assert_eq!(
+            start_transient_unit(&sh("echo ' refused ' >&2; exit 1")).unwrap(),
+            UnitStart::Refused {
+                stderr: "refused".to_owned()
+            }
+        );
+        assert!(start_transient_unit(&[]).is_err());
     }
 
     #[test]

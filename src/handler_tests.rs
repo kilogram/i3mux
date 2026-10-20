@@ -350,6 +350,29 @@ impl Masters for FakeMasters {
     }
 }
 
+/// Counts the starts of the layout watcher; can be told to fail them.
+#[derive(Default)]
+struct FakeWatcher {
+    starts: Mutex<usize>,
+    fail: bool,
+}
+
+impl FakeWatcher {
+    fn starts(&self) -> usize {
+        *self.starts.lock().unwrap()
+    }
+}
+
+impl Watcher for FakeWatcher {
+    fn ensure_running(&self) -> Result<()> {
+        *self.starts.lock().unwrap() += 1;
+        if self.fail {
+            anyhow::bail!("systemd did not start the layout watcher: no");
+        }
+        Ok(())
+    }
+}
+
 /// Opens a window on the fake Sway (on `workspace`) and, like `shpool
 /// attach`, creates or attaches the shell on the fake host. Can be told to
 /// fail after some launches.
@@ -398,6 +421,7 @@ struct World {
     backups: BackupStore,
     /// The Sway the commands run in.
     current_sway: SwayInstance,
+    watcher: FakeWatcher,
 }
 
 impl World {
@@ -432,6 +456,7 @@ impl World {
             masters,
             backups,
             current_sway: SwayInstance::new("boot-2", "/run/user/1000/sway-ipc.1000.200.sock"),
+            watcher: FakeWatcher::default(),
         }
     }
 
@@ -454,6 +479,7 @@ impl World {
             disconnect_wait: Duration::from_millis(300),
             backups: &self.backups,
             current_sway: &self.current_sway,
+            watcher: &self.watcher,
         }
     }
 
@@ -1620,6 +1646,65 @@ fn terminal_in_a_binding_of_this_sway_opens_one_window() {
 
     assert!(matches!(outcome, TerminalOutcome::Opened(_)), "{outcome:?}");
     assert_eq!(world.window_numbers("ws4"), [1, 2]);
+}
+
+// ------------------------------------------------------------- watcher
+// Plan-layout-backup rule 17: whatever makes this Sway the owner of a
+// binding starts its layout watcher.
+
+#[test]
+fn activate_and_attach_start_the_watcher() {
+    let world = World::new(Host::Local);
+    activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    assert_eq!(world.watcher.starts(), 1);
+
+    let world = World::new(Host::Local);
+    world.save_layout("ws4", &[1]);
+    attach(&world.ports(), &Host::Local, "4", None, false).unwrap();
+    assert_eq!(world.watcher.starts(), 1);
+}
+
+#[test]
+fn a_resume_starts_the_watcher_once_its_windows_are_back() {
+    let world = World::new(Host::Local);
+    world.crashed("4", "ws4", Some(&[1, 2]));
+    terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    assert_eq!(world.watcher.starts(), 1);
+
+    let mut world = World::new(Host::Local);
+    world.launcher.fail_after = Some(1);
+    world.crashed("4", "ws4", Some(&[1, 2]));
+    assert!(terminal(&world.ports(), "4", &TerminalRequest::default()).is_err());
+    assert_eq!(world.watcher.starts(), 0, "no owner, so no watcher");
+}
+
+#[test]
+fn claiming_a_binding_starts_the_watcher_and_using_it_does_not() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+    open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    assert_eq!(world.watcher.starts(), 1);
+    open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    assert_eq!(world.watcher.starts(), 1);
+}
+
+#[test]
+fn a_refused_attach_starts_no_watcher() {
+    let world = World::new(Host::Local);
+    world.save_layout("ws4", &[1]);
+    world.host.add_shell("ws4-001", true);
+    assert!(attach(&world.ports(), &Host::Local, "4", None, false).is_err());
+    assert_eq!(world.watcher.starts(), 0);
+}
+
+#[test]
+fn a_watcher_that_does_not_start_does_not_fail_the_command() {
+    let mut world = World::new(Host::Local);
+    world.watcher.fail = true;
+    activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    assert_eq!(world.window_numbers("ws4"), [1]);
+    assert!(world.binding("4").is_some());
 }
 
 // ----------------------------------------------------------------- kill

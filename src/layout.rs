@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::types::{Host, SessionName, TerminalName};
-use crate::window::{children, node_mark};
+use crate::window::{children, find_workspace, node_mark};
 
 /// A tree of containers whose leaves are i3mux terminals.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +86,19 @@ pub fn capture(workspace: &Value, host: &Host, session: &SessionName) -> Option<
         Some("stacked") => Layout::Stacked { children },
         _ => Layout::VSplit { children, percent },
     })
+}
+
+/// The layout of the windows of `session` on `host` in the workspace named
+/// `workspace` of `tree`, or `None` if it has none. `detach` and the layout
+/// watcher both capture with this.
+#[must_use]
+pub fn capture_workspace(
+    tree: &Value,
+    workspace: &str,
+    host: &Host,
+    session: &SessionName,
+) -> Option<Layout> {
+    find_workspace(tree, workspace).and_then(|ws| capture(ws, host, session))
 }
 
 /// One step of rebuilding a layout.
