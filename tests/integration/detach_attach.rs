@@ -57,7 +57,7 @@ fn attach_brings_back_the_shells_that_detach_left(#[case] session: Session) -> R
     );
     assert_eq!(
         env.i3mux().sessions(session)?,
-        [format!("{NAME}  ({host})  2 windows")]
+        [format!("{NAME}  ({host})  workspace {WS}, 2 windows")]
     );
     Ok(())
 }
@@ -152,7 +152,7 @@ fn attach_refuses_a_workspace_with_i3mux_windows(#[case] session: Session) -> Re
         env.i3mux().sessions(session)?,
         [
             format!("ws1  ({host})  detached, 1 terminal saved"),
-            format!("ws2  ({host})  1 window"),
+            format!("ws2  ({host})  workspace 2, 1 window"),
         ]
     );
     Ok(())

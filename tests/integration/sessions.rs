@@ -19,14 +19,14 @@ fn sessions_describes_each_state(#[case] session: Session) -> Result<()> {
     let line = |status: &str| vec![format!("{NAME}  ({host})  {status}")];
     env.activate(session, WS)?;
     env.i3mux().terminal("")?;
-    assert_eq!(env.i3mux().sessions(session)?, line("2 windows"));
+    assert_eq!(env.i3mux().sessions(session)?, line("workspace 4, 2 windows"));
 
     env.close_window(&session.mark(NAME, 2))?;
     let closed = terminal(NAME, 2);
     wait_until("the closed window's shell is disconnected", || {
         Ok(env.shell(session, &closed)?.is_some_and(|s| !s.attached))
     })?;
-    assert_eq!(env.i3mux().sessions(session)?, line("1 window, 1 orphan"));
+    assert_eq!(env.i3mux().sessions(session)?, line("workspace 4, 1 window, 1 orphan"));
 
     env.i3mux().terminal("")?;
     // Right after detach: detach waits until the closed windows' shells
