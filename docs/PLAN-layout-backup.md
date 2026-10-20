@@ -123,10 +123,9 @@ Other:
 2. Owner, backup files and resume in `attach` and `terminal` (rules 9,
    11-16, 18-19).
 3. The watcher and its unit (rules 6-8, 10, 17, 20).
-4. `sessions` text, README and INSTALL.
-5. Design-review fixes: `terminal -e` after a restore, clear lost-session
-   messages and remedies, bare `attach` resumes, a resumable state in
-   `sessions`, `status` and rofi.
+4. Design-review fixes: `terminal -e` after a restore, clear lost-session
+   messages and remedies, bare `attach` resumes.
+5. A resumable state in `sessions`, `status` and rofi. README and INSTALL.
 
 Follow-ups after phase 5:
 

@@ -923,7 +923,7 @@ fn attach_right_after_detach_is_not_refused() {
     open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
 
     detach(&world.ports(), "4", 0).unwrap();
-    let outcome = attach(&world.ports(), &Host::Local, "4", None, false).unwrap();
+    let outcome = attach(&world.ports(), None, "4", None, false).unwrap();
 
     assert!(matches!(outcome, AttachOutcome::Attached(_)), "{outcome:?}");
     assert_eq!(world.window_numbers("ws4"), [1, 2]);
@@ -997,10 +997,11 @@ fn detach_after_another_take_closes_and_unbinds_without_saving() {
     assert_eq!(world.window_numbers("ws4"), Vec::<u32>::new());
     assert!(world.store.load().unwrap().get("4").is_none());
     assert_eq!(world.host_token("ws4").as_deref(), Some(theirs.as_str()));
+    let report = report_detached(&detached);
+    assert!(report.results.is_empty(), "{report:?}");
     assert!(
-        format_detached(&detached).contains("another machine took it since"),
-        "{}",
-        format_detached(&detached)
+        report.notices[0].contains("another machine took it"),
+        "{report:?}"
     );
 }
 
@@ -1036,6 +1037,8 @@ fn detach_on_an_unreachable_host_changes_nothing() {
 
 #[test]
 fn detach_message_says_whether_the_layout_was_saved() {
+    // Design review S2: a closed but unsaved session is a notice on
+    // stderr, without a check mark.
     let detached = |token| Detached {
         session: name("ws4"),
         host: deepthought(),
@@ -1043,18 +1046,31 @@ fn detach_message_says_whether_the_layout_was_saved() {
         token,
     };
     assert_eq!(
-        format_detached(&detached(TokenMatch::Same)),
-        "✓ Detached session 'ws4': layout of 2 terminals saved on deepthought"
+        report_detached(&detached(TokenMatch::Same)),
+        Report {
+            notices: vec![],
+            results: vec![
+                "✓ Detached session 'ws4': layout of 2 terminals saved on deepthought".into()
+            ],
+        }
     );
     assert_eq!(
-        format_detached(&detached(TokenMatch::TakenElsewhere)),
-        "✓ Closed session 'ws4' here: another machine took it since, \
-         so the layout of these 2 terminals was not saved on deepthought"
+        report_detached(&detached(TokenMatch::TakenElsewhere)),
+        Report {
+            notices: vec![
+                "Closed session 'ws4' here. Not saved: another machine took it, \
+                           so deepthought keeps that machine's layout."
+                    .into()
+            ],
+            results: vec![],
+        }
     );
     assert_eq!(
-        format_detached(&detached(TokenMatch::Ended)),
-        "✓ Closed session 'ws4' here: it ended on deepthought, \
-         so the layout of these 2 terminals was not saved"
+        report_detached(&detached(TokenMatch::Ended)),
+        Report {
+            notices: vec!["Closed session 'ws4' here. Not saved: ws4 ended on deepthought.".into()],
+            results: vec![],
+        }
     );
 }
 
@@ -1108,7 +1124,7 @@ fn attach_takes_the_session_and_binds_its_token() {
     world.save_layout("ws4", &[1]);
     let before = world.take_elsewhere("ws4");
 
-    attach(&world.ports(), &Host::Local, "4", None, false).unwrap();
+    attach(&world.ports(), None, "4", None, false).unwrap();
 
     let token = world.bound_token("4").unwrap();
     assert_ne!(token, before);
@@ -1142,7 +1158,7 @@ fn refused_attach_never_takes() {
         setup(&world);
         let before = world.store.load().unwrap();
 
-        let outcome = attach(&world.ports(), &Host::Local, "4", session.map(name), false);
+        let outcome = attach(&world.ports(), None, "4", session.map(name), false);
 
         assert!(
             !matches!(outcome, Ok(AttachOutcome::Attached(_))),
@@ -1160,7 +1176,7 @@ fn attach_whose_take_fails_binds_nothing() {
     world.save_layout("ws4", &[1]);
     world.host.state.lock().unwrap().fail_writes = true;
 
-    let err = attach(&world.ports(), &Host::Local, "4", None, false).unwrap_err();
+    let err = attach(&world.ports(), None, "4", None, false).unwrap_err();
 
     assert!(err.to_string().contains("No space left"), "{err:#}");
     assert!(world.store.load().unwrap().get("4").is_none());
@@ -1174,7 +1190,7 @@ fn attach_restores_layout_and_binds() {
     world.host.add_shell("ws4-001", false);
     world.host.add_shell("ws4-002", false);
 
-    let outcome = attach(&world.ports(), &Host::Local, "4", None, false).unwrap();
+    let outcome = attach(&world.ports(), None, "4", None, false).unwrap();
 
     let AttachOutcome::Attached(attached) = outcome else {
         panic!("{outcome:?}")
@@ -1197,7 +1213,7 @@ fn attach_reports_shells_recreated_after_host_loss() {
     let world = World::new(Host::Local);
     world.save_layout("ws4", &[1, 2, 3]);
     world.host.add_shell("ws4-001", false);
-    let outcome = attach(&world.ports(), &Host::Local, "4", Some(name("ws4")), false).unwrap();
+    let outcome = attach(&world.ports(), None, "4", Some(name("ws4")), false).unwrap();
     let AttachOutcome::Attached(attached) = outcome else {
         panic!("{outcome:?}")
     };
@@ -1212,7 +1228,7 @@ fn attach_refuses_a_shell_attached_elsewhere() {
     world.host.add_shell("ws4-001", false);
     world.host.add_shell("ws4-002", true);
 
-    let err = attach(&world.ports(), &Host::Local, "4", None, false).unwrap_err();
+    let err = attach(&world.ports(), None, "4", None, false).unwrap_err();
 
     assert_eq!(
         err.to_string(),
@@ -1221,7 +1237,7 @@ fn attach_refuses_a_shell_attached_elsewhere() {
     assert!(world.store.load().unwrap().get("4").is_none());
     assert_eq!(world.sway.window_count(), 0);
 
-    attach(&world.ports(), &Host::Local, "4", None, true).unwrap();
+    attach(&world.ports(), None, "4", None, true).unwrap();
     let launches = world.launcher.argvs();
     assert!(launches.iter().all(|argv| argv.contains(&"-f".to_owned())));
 }
@@ -1232,7 +1248,7 @@ fn attach_refuses_a_workspace_with_i3mux_windows() {
     let world = World::new(Host::Local);
     world.save_layout("ws4", &[1]);
     world.sway.open_marked("4", &world.mark("other-001"));
-    let err = attach(&world.ports(), &Host::Local, "4", None, false).unwrap_err();
+    let err = attach(&world.ports(), None, "4", None, false).unwrap_err();
     assert!(matches!(command_error(&err), CommandError::WorkspaceHasTerminals(ws) if ws == "4"));
     assert!(world.store.load().unwrap().get("4").is_none());
 }
@@ -1243,7 +1259,7 @@ fn interrupted_attach_leaves_the_workspace_bound() {
     let mut world = World::new(Host::Local);
     world.launcher.fail_after = Some(1);
     world.save_layout("ws4", &[1, 2]);
-    assert!(attach(&world.ports(), &Host::Local, "4", None, false).is_err());
+    assert!(attach(&world.ports(), None, "4", None, false).is_err());
     assert_eq!(
         world.store.load().unwrap().get("4").unwrap().session(),
         &name("ws4")
@@ -1258,7 +1274,7 @@ fn attach_asks_to_choose_among_several_sessions() {
     world.save_layout("ws7", &[1]);
     world.save_layout("ws9", &[1]);
     world.bind("9", "ws9");
-    let outcome = attach(&world.ports(), &Host::Local, "4", None, false).unwrap();
+    let outcome = attach(&world.ports(), None, "4", None, false).unwrap();
     let AttachOutcome::Choose(candidates) = outcome else {
         panic!("{outcome:?}")
     };
@@ -1272,12 +1288,12 @@ fn attach_asks_to_choose_among_several_sessions() {
 #[test]
 fn attach_unknown_session_is_an_error() {
     let world = World::new(Host::Local);
-    let err = attach(&world.ports(), &Host::Local, "4", Some(name("nope")), false).unwrap_err();
+    let err = attach(&world.ports(), None, "4", Some(name("nope")), false).unwrap_err();
     assert!(matches!(
         command_error(&err),
         CommandError::NoSavedSession { .. }
     ));
-    let err = attach(&world.ports(), &Host::Local, "4", None, false).unwrap_err();
+    let err = attach(&world.ports(), None, "4", None, false).unwrap_err();
     assert!(matches!(
         command_error(&err),
         CommandError::NoSavedSessions(_)
@@ -1299,7 +1315,7 @@ fn terminal_resumes_a_crashed_binding_from_its_backup() {
 
     let outcome = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
 
-    let TerminalOutcome::Restored(attached) = outcome else {
+    let TerminalOutcome::Restored { attached, .. } = outcome else {
         panic!("{outcome:?}")
     };
     assert_eq!(attached.source, LayoutSource::Backup);
@@ -1320,11 +1336,15 @@ fn terminal_resumes_a_crashed_binding_from_its_backup() {
     assert_eq!(world.takes(), 1, "a resume never takes (rule 3)");
     assert_eq!(world.backup(&now), Some(hsplit("ws4", &[1, 2])));
     assert_eq!(
-        format_attached(&attached, "4"),
-        [
-            "✓ Resumed session 'ws4' on local in workspace 4 (2 terminals)",
-            "  recreated 1 of 2 shells: the host had lost them, for example after a reboot"
-        ]
+        report_attached(&attached, "4", None),
+        Report {
+            notices: vec![],
+            results: vec![
+                "✓ Resumed session 'ws4' from backup on local in workspace 4 (2 terminals)".into(),
+                "  recreated 1 of 2 shells: the host had lost them, for example after a reboot"
+                    .into(),
+            ],
+        }
     );
 }
 
@@ -1334,7 +1354,7 @@ fn attach_resumes_a_crashed_binding_that_it_names_or_leaves_open() {
     for requested in [None, Some(name("ws4"))] {
         let world = World::new(Host::Local);
         world.crashed("4", "ws4", Some(&[1]));
-        let outcome = attach(&world.ports(), &Host::Local, "4", requested, false).unwrap();
+        let outcome = attach(&world.ports(), None, "4", requested, false).unwrap();
         let AttachOutcome::Attached(attached) = outcome else {
             panic!("{outcome:?}")
         };
@@ -1349,7 +1369,7 @@ fn attach_naming_another_session_does_not_resume() {
     let binding = world.crashed("4", "ws4", Some(&[1]));
     world.save_layout("ws7", &[1]);
 
-    let err = attach(&world.ports(), &Host::Local, "4", Some(name("ws7")), false).unwrap_err();
+    let err = attach(&world.ports(), None, "4", Some(name("ws7")), false).unwrap_err();
 
     assert!(
         err.to_string().contains("is bound to session 'ws4'"),
@@ -1382,7 +1402,7 @@ fn resume_after_another_take_uses_the_host_layout() {
 
     let outcome = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
 
-    let TerminalOutcome::Restored(attached) = outcome else {
+    let TerminalOutcome::Restored { attached, .. } = outcome else {
         panic!("{outcome:?}")
     };
     assert_eq!(
@@ -1403,8 +1423,19 @@ fn resume_after_another_take_uses_the_host_layout() {
     );
     assert!(now.is_owned_by(&world.current_sway));
     assert_eq!(
-        format_attached(&attached, "4")[0],
-        "ws4 was taken by another machine since; using the layout saved there."
+        report_attached(&attached, "4", None),
+        Report {
+            notices: vec![
+                "ws4 was taken by another machine after your windows closed. \
+                           Restoring the layout last saved on local."
+                    .into()
+            ],
+            results: vec![
+                "✓ Attached session 'ws4' from local to workspace 4 (1 terminal)".into(),
+                "  recreated 1 of 1 shells: the host had lost them, for example after a reboot"
+                    .into()
+            ],
+        }
     );
 }
 
@@ -1420,14 +1451,55 @@ fn resume_after_another_take_does_not_force_their_shells() {
 
     let err = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap_err();
 
-    let message = format!("{err:#}");
+    // Design review S1: the workspace is unbound now, so the message ends
+    // with the command that takes the session.
     assert!(
-        message.contains("taken by another machine since"),
-        "{message}"
+        matches!(
+            command_error(&err),
+            CommandError::LostNotRestored {
+                lost: Lost::TakenElsewhere,
+                ..
+            }
+        ),
+        "{err:#}"
     );
-    assert!(message.contains("use --force"), "{message}");
+    assert_eq!(
+        format!("{err:#}"),
+        "ws4 was taken by another machine after your windows closed. Restoring the layout \
+         last saved on local failed: Session 'ws4-001' is already attached from another \
+         terminal or host; use --force to take over. Workspace 4 is no longer bound. \
+         To take it, run 'i3mux attach --session ws4 --force'."
+    );
     assert_eq!(world.binding("4"), None, "the binding is dropped first");
     assert!(!world.has_backup_file("ws4"));
+}
+
+#[test]
+fn a_failed_restore_of_a_remote_session_names_its_host() {
+    // Design review S1, with --remote in the remedy.
+    let world = World::new(deepthought());
+    world.crashed("4", "ws4", Some(&[1]));
+    world.save_layout("ws4", &[1]);
+    world.host.state.lock().unwrap().tokens.clear();
+    world.host.add_shell("ws4-001", true);
+
+    let err = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap_err();
+
+    let message = format!("{err:#}");
+    assert!(
+        message.starts_with(
+            "ws4 ended on deepthought (the host restarted, or the session was killed). \
+             Restoring the layout last saved on deepthought failed: "
+        ),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(
+            "Workspace 4 is no longer bound. To take it, run \
+             'i3mux attach --remote deepthought --session ws4 --force'."
+        ),
+        "{message}"
+    );
 }
 
 #[test]
@@ -1440,13 +1512,19 @@ fn resume_after_the_session_ended_uses_the_host_layout() {
 
     let outcome = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
 
-    let TerminalOutcome::Restored(attached) = outcome else {
+    let TerminalOutcome::Restored { attached, .. } = outcome else {
         panic!("{outcome:?}")
     };
     assert_eq!(attached.source, LayoutSource::HostAfterLoss(Lost::Ended));
     assert_eq!(world.window_numbers("ws4"), [3]);
     assert!(!world.has_backup_file("ws4"));
-    assert_eq!(format_attached(&attached, "4")[0], "ws4 ended on local.");
+    assert_eq!(
+        report_attached(&attached, "4", None).notices,
+        [
+            "ws4 ended on local (the host restarted, or the session was killed). \
+          Restoring the layout last saved on local."
+        ]
+    );
     assert!(
         world.host_token("ws4").is_some(),
         "attach from the host layout takes"
@@ -1461,13 +1539,39 @@ fn resume_of_an_ended_session_without_a_host_layout_says_so() {
 
     let err = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap_err();
 
-    let message = format!("{err:#}");
-    assert!(
-        message.starts_with("ws4 ended on local. Workspace 4 is no longer bound"),
-        "{message}"
+    // Design review S2.
+    assert_eq!(
+        format!("{err:#}"),
+        "ws4 ended on local (the host restarted, or the session was killed) and has no saved \
+         layout. Workspace 4 is unbound. Start a new session with 'i3mux activate'."
     );
-    assert!(message.contains("No saved session 'ws4'"), "{message}");
     assert_eq!(world.binding("4"), None);
+}
+
+#[test]
+fn lost_sessions_without_a_host_layout_say_how_to_go_on() {
+    // Design review S2, for a remote host.
+    let lost = |lost| {
+        CommandError::LostWithoutLayout {
+            session: name("ws4"),
+            host: deepthought(),
+            workspace: "4".into(),
+            lost,
+        }
+        .to_string()
+    };
+    assert_eq!(
+        lost(Lost::Ended),
+        "ws4 ended on deepthought (the host restarted, or the session was killed) and has no \
+         saved layout. Workspace 4 is unbound. Start a new session with \
+         'i3mux activate --remote deepthought'."
+    );
+    assert_eq!(
+        lost(Lost::TakenElsewhere),
+        "ws4 was taken by another machine after your windows closed, and deepthought has no \
+         saved layout of it. Workspace 4 is unbound. To take it, run \
+         'i3mux activate --remote deepthought --session ws4'."
+    );
 }
 
 #[test]
@@ -1511,13 +1615,18 @@ fn resume_without_a_backup_restores_the_host_layout() {
 
     let outcome = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
 
-    let TerminalOutcome::Restored(attached) = outcome else {
+    let TerminalOutcome::Restored { attached, .. } = outcome else {
         panic!("{outcome:?}")
     };
-    assert_eq!(attached.source, LayoutSource::Host);
+    assert_eq!(attached.source, LayoutSource::HostWithoutBackup);
     assert_eq!(world.window_numbers("ws4"), [1, 2]);
     assert!(world.binding("4").unwrap().is_owned_by(&world.current_sway));
     assert_eq!(world.takes(), 2, "attach from the host layout takes");
+    // Design review nit: not "Resumed", and where the layout came from.
+    assert_eq!(
+        report_attached(&attached, "4", None).results[0],
+        "✓ Attached session 'ws4' from the layout saved on local to workspace 4 (2 terminals)"
+    );
 }
 
 #[test]
@@ -1589,7 +1698,7 @@ fn a_binding_from_before_tokens_resumes_while_the_host_has_none() {
     let outcome = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
 
     assert!(
-        matches!(&outcome, TerminalOutcome::Restored(a) if a.source == LayoutSource::Backup),
+        matches!(&outcome, TerminalOutcome::Restored { attached: a, .. } if a.source == LayoutSource::Backup),
         "{outcome:?}"
     );
     assert_eq!(world.window_numbers("ws4"), [1, 2]);
@@ -1648,6 +1757,222 @@ fn terminal_in_a_binding_of_this_sway_opens_one_window() {
     assert_eq!(world.window_numbers("ws4"), [1, 2]);
 }
 
+// -------------------------------------------------------- design review
+
+/// A binding of workspace 4 to `session` that this Sway owns, with no
+/// window open: not resumable.
+fn bind_owned(world: &World, session: &str) {
+    let token = world.take_elsewhere(session);
+    let binding = WorkspaceState::new(
+        world.host.host().clone(),
+        name(session),
+        token,
+        world.current_sway.clone(),
+    );
+    world
+        .store
+        .with_lock(|s| Ok(s.bind("4", binding)?))
+        .unwrap();
+}
+
+#[test]
+fn terminal_with_a_command_restores_then_opens_it() {
+    // Design review M2.
+    let world = World::new(Host::Local);
+    world.crashed("4", "ws4", Some(&[1, 2]));
+    world.host.add_shell("ws4-001", false);
+    world.host.add_shell("ws4-002", false);
+    let request = TerminalRequest {
+        command: Some("htop".into()),
+        ..TerminalRequest::default()
+    };
+
+    let outcome = terminal(&world.ports(), "4", &request).unwrap();
+
+    let TerminalOutcome::Restored {
+        attached,
+        then_opened,
+    } = outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(then_opened, Some(Choice::Create(t("ws4", 3))));
+    assert_eq!(world.window_numbers("ws4"), [1, 2, 3]);
+    let last = world.launcher.argvs().pop().unwrap();
+    assert_eq!(last[last.len() - 4..], ["attach", "-c", "htop", "ws4-003"]);
+    let label = opened_label(&request);
+    assert_eq!(
+        report_attached(&attached, "4", Some(&label)).results,
+        [
+            "✓ Resumed session 'ws4' from backup on local in workspace 4 (2 terminals), \
+          then opened 'htop'"
+        ]
+    );
+}
+
+#[test]
+fn terminal_new_restores_then_opens_a_new_shell() {
+    // Design review M2; a plain resume opens nothing more.
+    let world = World::new(Host::Local);
+    world.crashed("4", "ws4", Some(&[1]));
+    world.host.add_shell("ws4-002", false);
+    let request = TerminalRequest {
+        new: true,
+        ..TerminalRequest::default()
+    };
+    let outcome = terminal(&world.ports(), "4", &request).unwrap();
+    assert!(
+        matches!(&outcome, TerminalOutcome::Restored { then_opened: Some(Choice::Create(t)), .. } if t.number() == 3),
+        "{outcome:?}"
+    );
+    assert_eq!(opened_label(&request), "a new terminal");
+
+    let world = World::new(Host::Local);
+    world.crashed("4", "ws4", Some(&[1]));
+    let outcome = terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    assert!(
+        matches!(
+            &outcome,
+            TerminalOutcome::Restored {
+                then_opened: None,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(world.window_numbers("ws4"), [1]);
+}
+
+#[test]
+fn a_terminal_that_fails_after_a_restore_says_the_windows_are_back() {
+    let mut world = World::new(Host::Local);
+    world.launcher.fail_after = Some(2);
+    world.crashed("4", "ws4", Some(&[1, 2]));
+    let request = TerminalRequest {
+        command: Some("htop".into()),
+        ..TerminalRequest::default()
+    };
+
+    let err = terminal(&world.ports(), "4", &request).unwrap_err();
+
+    assert_eq!(
+        format!("{err:#}"),
+        "restored session 'ws4' in workspace 4, but did not open 'htop': terminal crashed"
+    );
+    assert!(world.binding("4").unwrap().is_owned_by(&world.current_sway));
+    assert_eq!(world.window_numbers("ws4"), [1, 2]);
+}
+
+#[test]
+fn bare_attach_resumes_a_binding_on_any_host() {
+    // Design review S3.
+    let world = World::new(deepthought());
+    world.crashed("4", "ws4", Some(&[1]));
+
+    let outcome = attach(&world.ports(), None, "4", None, false).unwrap();
+
+    assert!(
+        matches!(&outcome, AttachOutcome::Attached(a) if a.source == LayoutSource::Backup),
+        "{outcome:?}"
+    );
+    assert_eq!(world.window_numbers("ws4"), [1]);
+}
+
+#[test]
+fn attach_with_a_session_or_host_resumes_only_a_binding_that_matches() {
+    // Design review S3: --session without --remote means this machine.
+    let world = World::new(deepthought());
+    let binding = world.crashed("4", "ws4", Some(&[1]));
+    let (_local, hosts) = with_local_host(&world);
+    let ports = Ports {
+        hosts: hosts.as_ref(),
+        ..world.ports()
+    };
+
+    let err = attach(&ports, None, "4", Some(name("ws4")), false).unwrap_err();
+    assert!(
+        matches!(
+            command_error(&err),
+            CommandError::NoSavedSession {
+                host: Host::Local,
+                ..
+            }
+        ),
+        "{err:#}"
+    );
+    assert_eq!(world.binding("4"), Some(binding));
+
+    let outcome = attach(&ports, Some(&dt()), "4", Some(name("ws4")), false).unwrap();
+    assert!(
+        matches!(&outcome, AttachOutcome::Attached(a) if a.source == LayoutSource::Backup),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_taken_workspace_says_how_to_resume_it_when_it_can() {
+    // Design review S3.
+    let world = World::new(Host::Local);
+    world.crashed("4", "ws4", Some(&[1]));
+    world.save_layout("ws7", &[1]);
+
+    let err = attach(&world.ports(), None, "4", Some(name("ws7")), false).unwrap_err();
+
+    assert!(
+        matches!(
+            command_error(&err),
+            CommandError::ResumableWorkspaceTaken(_)
+        ),
+        "{err:#}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "workspace 4 is bound to session 'ws4' on local; use another workspace, or end that \
+         session with 'i3mux kill', or resume it with 'i3mux terminal'"
+    );
+    let err = activate(
+        &world.ports(),
+        &Host::Local,
+        &workspace("4", 4),
+        Some(name("ws7")),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .ends_with("or resume it with 'i3mux terminal'"),
+        "{err:#}"
+    );
+
+    let world = World::new(Host::Local);
+    bind_owned(&world, "ws4");
+    world.save_layout("ws7", &[1]);
+    let err = attach(&world.ports(), None, "4", Some(name("ws7")), false).unwrap_err();
+    assert!(err.downcast_ref::<BindError>().is_some(), "{err:#}");
+    assert!(!err.to_string().contains("resume"), "{err:#}");
+}
+
+#[test]
+fn nothing_to_detach_says_how_to_bring_the_windows_back() {
+    // Design review M3.
+    let world = World::new(Host::Local);
+    world.crashed("4", "ws4", Some(&[1]));
+    let err = detach(&world.ports(), "4", 0).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Workspace 4 has no windows of session 'ws4'; nothing to detach (to end the session, \
+         run 'i3mux kill'; or run 'i3mux terminal' to bring its windows back)"
+    );
+
+    let world = World::new(Host::Local);
+    bind_owned(&world, "ws4");
+    let err = detach(&world.ports(), "4", 0).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Workspace 4 has no windows of session 'ws4'; nothing to detach (to end the session, \
+         run 'i3mux kill')"
+    );
+}
+
 // ------------------------------------------------------------- watcher
 // Plan-layout-backup rule 17: whatever makes this Sway the owner of a
 // binding starts its layout watcher.
@@ -1660,7 +1985,7 @@ fn activate_and_attach_start_the_watcher() {
 
     let world = World::new(Host::Local);
     world.save_layout("ws4", &[1]);
-    attach(&world.ports(), &Host::Local, "4", None, false).unwrap();
+    attach(&world.ports(), None, "4", None, false).unwrap();
     assert_eq!(world.watcher.starts(), 1);
 }
 
@@ -1694,7 +2019,7 @@ fn a_refused_attach_starts_no_watcher() {
     let world = World::new(Host::Local);
     world.save_layout("ws4", &[1]);
     world.host.add_shell("ws4-001", true);
-    assert!(attach(&world.ports(), &Host::Local, "4", None, false).is_err());
+    assert!(attach(&world.ports(), None, "4", None, false).is_err());
     assert_eq!(world.watcher.starts(), 0);
 }
 
@@ -2159,7 +2484,7 @@ fn failed_attach_leaves_no_master_running() {
     let world = World::new(deepthought());
 
     let err = world
-        .finish(|ports| attach(ports, &deepthought(), "4", Some(name("nope")), false))
+        .finish(|ports| attach(ports, Some(&dt()), "4", Some(name("nope")), false))
         .unwrap_err();
 
     assert!(matches!(

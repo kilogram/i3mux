@@ -60,7 +60,7 @@ use master::{DirectSsh, Link, MasterState, Masters, SystemdMasters, TrackedMaste
 use mux::{Choice, Shell};
 use serde_json::Value;
 use session::{SavedSession, SessionError, TokenMatch};
-use state::{LocalState, StateLock, StateStore, WorkspaceState};
+use state::{BindError, LocalState, StateLock, StateStore, WorkspaceState};
 use sway_ops::Sway;
 use types::{Host, InvalidName, RemoteHost, SessionName, SwayInstance, TerminalName};
 use watch_unit::{NoWatcher, SystemdWatcher, Watcher};
@@ -204,10 +204,45 @@ enum CommandError {
         workspace: String,
         reason: &'static str,
     },
-    #[error("Workspace {workspace} has no windows of session '{session}'; nothing to detach (to end the session, run 'i3mux kill')")]
+    #[error(
+        "Workspace {workspace} has no windows of session '{session}'; nothing to detach \
+         (to end the session, run 'i3mux kill'{})",
+        resume_hint(*.resumable)
+    )]
     NothingToDetach {
         workspace: String,
         session: SessionName,
+        /// Its binding is resumable (plan-layout-backup decision 4).
+        resumable: bool,
+    },
+    /// A workspace bound to another session that `terminal` can resume.
+    #[error("{0}, or resume it with 'i3mux terminal'")]
+    ResumableWorkspaceTaken(BindError),
+    /// A resume dropped a binding that no longer held its session, and the
+    /// host has no saved layout to restore instead (plan-layout-backup
+    /// rules 13 and 13a).
+    #[error("{}", lost_without_layout(.session, .host, .workspace, *.lost))]
+    LostWithoutLayout {
+        session: SessionName,
+        host: Host,
+        workspace: String,
+        lost: Lost,
+    },
+    /// A resume dropped a binding that no longer held its session, and could
+    /// not restore the host's saved layout instead.
+    #[error(
+        "{} Restoring the layout last saved on {host} failed: {cause}. \
+         Workspace {workspace} is no longer bound. To take it, run '{}'.",
+        .lost.sentence(.session, .host),
+        attach_command(.host, .session)
+    )]
+    LostNotRestored {
+        session: SessionName,
+        host: Host,
+        workspace: String,
+        lost: Lost,
+        /// Why the restore failed, with its causes.
+        cause: String,
     },
     #[error("Workspace {0} already has i3mux terminals; detach or close them first")]
     WorkspaceHasTerminals(String),
@@ -455,40 +490,66 @@ fn cmd_terminal(
     }
     match terminal(ports, workspace.name(), request)? {
         TerminalOutcome::Opened(choice) => ports.log.debug(|| describe_choice(&choice)),
-        TerminalOutcome::Restored(attached) => {
-            for line in format_attached(&attached, workspace.name()) {
-                println!("{line}");
-            }
+        TerminalOutcome::Restored {
+            attached,
+            then_opened,
+        } => {
+            let then = then_opened.map(|_| opened_label(request));
+            report_attached(&attached, workspace.name(), then.as_deref()).print();
         }
     }
     Ok(ExitCode::SUCCESS)
 }
 
+/// What a command prints: notices on stderr, results on stdout.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Report {
+    notices: Vec<String>,
+    results: Vec<String>,
+}
+
+impl Report {
+    fn print(&self) {
+        for notice in &self.notices {
+            eprintln!("{notice}");
+        }
+        for result in &self.results {
+            println!("{result}");
+        }
+    }
+}
+
 fn cmd_detach(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
     let workspace = wm.focused_workspace()?;
     let detached = detach(ports, workspace.name(), now_unix())?;
-    println!("{}", format_detached(&detached));
+    report_detached(&detached).print();
     Ok(ExitCode::SUCCESS)
 }
 
 /// What `detach` prints. A session that another machine took since, or
-/// that ended, is closed here without a save (plan-layout-backup rule 5),
-/// and says so.
-fn format_detached(detached: &Detached) -> String {
+/// that ended, is closed here without a save (plan-layout-backup rule 5);
+/// a notice says so, and the exit status stays 0.
+fn report_detached(detached: &Detached) -> Report {
     let terminals = count(detached.terminals, "terminal", "terminals");
     let (session, host) = (&detached.session, &detached.host);
+    let closed = format!("Closed session '{session}' here. Not saved");
     match detached.token {
-        TokenMatch::Same => {
-            format!("✓ Detached session '{session}': layout of {terminals} saved on {host}")
-        }
-        TokenMatch::TakenElsewhere => format!(
-            "✓ Closed session '{session}' here: another machine took it since, \
-             so the layout of these {terminals} was not saved on {host}"
-        ),
-        TokenMatch::Ended => format!(
-            "✓ Closed session '{session}' here: it ended on {host}, \
-             so the layout of these {terminals} was not saved"
-        ),
+        TokenMatch::Same => Report {
+            results: vec![format!(
+                "✓ Detached session '{session}': layout of {terminals} saved on {host}"
+            )],
+            ..Report::default()
+        },
+        TokenMatch::TakenElsewhere => Report {
+            notices: vec![format!(
+                "{closed}: another machine took it, so {host} keeps that machine's layout."
+            )],
+            ..Report::default()
+        },
+        TokenMatch::Ended => Report {
+            notices: vec![format!("{closed}: {session} ended on {host}.")],
+            ..Report::default()
+        },
     }
 }
 
@@ -499,10 +560,11 @@ fn cmd_attach(
     session: Option<String>,
     force: bool,
 ) -> Result<ExitCode> {
-    let host = Host::from_remote_arg(remote)?;
+    let remote = remote.map(RemoteHost::new).transpose()?;
+    let host = remote.clone().map_or(Host::Local, Host::Ssh);
     let session = parse_session(session)?;
     let workspace = wm.focused_workspace()?;
-    match attach(ports, &host, workspace.name(), session, force)? {
+    match attach(ports, remote.as_ref(), workspace.name(), session, force)? {
         AttachOutcome::Choose(candidates) => {
             eprintln!("Several saved sessions on {host}:");
             for name in &candidates {
@@ -512,16 +574,16 @@ fn cmd_attach(
             Ok(ExitCode::from(EXIT_CHOOSE))
         }
         AttachOutcome::Attached(attached) => {
-            for line in format_attached(&attached, workspace.name()) {
-                println!("{line}");
-            }
+            report_attached(&attached, workspace.name(), None).print();
             Ok(ExitCode::SUCCESS)
         }
     }
 }
 
-/// What `attach`, or a `terminal` that brought windows back, prints.
-fn format_attached(attached: &Attached, workspace: &str) -> Vec<String> {
+/// What `attach`, or a `terminal` that brought windows back, prints. A lost
+/// binding is a notice (plan-layout-backup rules 13 and 13a). `then` names
+/// the terminal that `terminal -e` or `--new` opened after the restore.
+fn report_attached(attached: &Attached, workspace: &str, then: Option<&str>) -> Report {
     let Attached {
         session,
         host,
@@ -530,31 +592,94 @@ fn format_attached(attached: &Attached, workspace: &str) -> Vec<String> {
         source,
     } = attached;
     let terminals = count(*total, "terminal", "terminals");
-    let attached = || {
-        format!("✓ Attached session '{session}' from {host} to workspace {workspace} ({terminals})")
+    let headline = match source {
+        LayoutSource::Host | LayoutSource::HostAfterLoss(_) => {
+            format!("✓ Attached session '{session}' from {host} to workspace {workspace}")
+        }
+        LayoutSource::HostWithoutBackup => format!(
+            "✓ Attached session '{session}' from the layout saved on {host} to workspace {workspace}"
+        ),
+        LayoutSource::Backup => {
+            format!("✓ Resumed session '{session}' from backup on {host} in workspace {workspace}")
+        }
     };
-    let mut lines = match source {
-        LayoutSource::Host => vec![attached()],
-        LayoutSource::HostAfterLoss(lost) => vec![lost_notice(session, host, *lost), attached()],
-        LayoutSource::Backup => vec![format!(
-            "✓ Resumed session '{session}' on {host} in workspace {workspace} ({terminals})"
-        )],
-    };
+    let then = then.map(|label| format!(", then opened {label}"));
+    let mut results = vec![format!(
+        "{headline} ({terminals}){}",
+        then.unwrap_or_default()
+    )];
     if *recreated > 0 {
-        lines.push(format!(
+        results.push(format!(
             "  recreated {recreated} of {total} shells: the host had lost them, for example after a reboot"
         ));
     }
-    lines
+    let notices = match source {
+        LayoutSource::HostAfterLoss(lost) => vec![format!(
+            "{} Restoring the layout last saved on {host}.",
+            lost.sentence(session, host)
+        )],
+        LayoutSource::Host | LayoutSource::HostWithoutBackup | LayoutSource::Backup => vec![],
+    };
+    Report { notices, results }
 }
 
-/// Why a resume dropped its binding (plan-layout-backup rules 13 and 13a).
-fn lost_notice(session: &SessionName, host: &Host, lost: Lost) -> String {
+/// How the output names the terminal that `terminal -e` or `--new` opened.
+fn opened_label(request: &TerminalRequest) -> String {
+    request.command.as_ref().map_or_else(
+        || "a new terminal".to_owned(),
+        |command| format!("'{command}'"),
+    )
+}
+
+/// `--remote HOST `, or nothing for this machine, for commands in messages.
+fn remote_flag(host: &Host) -> String {
+    match host {
+        Host::Local => String::new(),
+        Host::Ssh(remote) => format!("--remote {remote} "),
+    }
+}
+
+/// The command that takes `session` on `host` from its saved layout.
+fn attach_command(host: &Host, session: &SessionName) -> String {
+    format!(
+        "i3mux attach {}--session {session} --force",
+        remote_flag(host)
+    )
+}
+
+/// The command that binds the focused workspace to a session on `host`:
+/// `session`, or the workspace's default.
+fn activate_command(host: &Host, session: Option<&SessionName>) -> String {
+    let session = session
+        .map(|s| format!("--session {s}"))
+        .unwrap_or_default();
+    format!("i3mux activate {}{session}", remote_flag(host))
+        .trim_end()
+        .to_owned()
+}
+
+/// [`CommandError::LostWithoutLayout`]: what happened, and the remedy.
+fn lost_without_layout(session: &SessionName, host: &Host, workspace: &str, lost: Lost) -> String {
     match lost {
-        Lost::TakenElsewhere => {
-            format!("{session} was taken by another machine since; using the layout saved there.")
-        }
-        Lost::Ended => format!("{session} ended on {host}."),
+        Lost::Ended => format!(
+            "{session} ended on {host} (the host restarted, or the session was killed) and has \
+             no saved layout. Workspace {workspace} is unbound. Start a new session with '{}'.",
+            activate_command(host, None)
+        ),
+        Lost::TakenElsewhere => format!(
+            "{session} was taken by another machine after your windows closed, and {host} has no \
+             saved layout of it. Workspace {workspace} is unbound. To take it, run '{}'.",
+            activate_command(host, Some(session))
+        ),
+    }
+}
+
+/// The end of [`CommandError::NothingToDetach`] for a resumable binding.
+fn resume_hint(resumable: bool) -> &'static str {
+    if resumable {
+        "; or run 'i3mux terminal' to bring its windows back"
+    } else {
+        ""
     }
 }
 
@@ -707,13 +832,7 @@ fn activate(
     let exec = (ports.hosts)(host);
     mux::list(exec.as_ref())?;
     ports.store.with_lock(|state| {
-        take_and_bind(
-            state,
-            exec.as_ref(),
-            workspace.name(),
-            &session,
-            ports.current_sway,
-        )
+        take_and_bind(state, ports, exec.as_ref(), workspace.name(), &session)
     })?;
     start_watcher(ports);
     let choice = open_terminal(ports, workspace.name(), &TerminalRequest::default())?;
@@ -721,24 +840,47 @@ fn activate(
 }
 
 /// Refuse a bind that guarantee 1 of `state` forbids, else take `session`
-/// on its host and bind `workspace` to it with the new token, owned by
-/// `owner`. The caller holds the state lock and commits (plan-layout-backup
+/// on its host and bind `workspace` to it with the new token, owned by this
+/// Sway. The caller holds the state lock and commits (plan-layout-backup
 /// rule 2). A resume never calls this (rule 3).
 ///
 /// If the take fails, `state` is unchanged. If the commit fails after the
 /// take, no binding holds the new token, and the next take replaces it.
 fn take_and_bind(
     state: &mut LocalState,
+    ports: &Ports,
     exec: &dyn HostExec,
     workspace: &str,
     session: &SessionName,
-    owner: &SwayInstance,
 ) -> Result<()> {
-    state.check_bind(workspace, exec.host(), session)?;
+    if let Err(refusal) = state.check_bind(workspace, exec.host(), session) {
+        return Err(bind_refusal(ports, state, workspace, refusal));
+    }
     let token = session::take(exec, session)?;
-    let binding = WorkspaceState::new(exec.host().clone(), session.clone(), token, owner.clone());
+    let owner = ports.current_sway.clone();
+    let binding = WorkspaceState::new(exec.host().clone(), session.clone(), token, owner);
     state.bind(workspace, binding)?;
     Ok(())
+}
+
+/// `refusal`, with the hint to resume the workspace if its binding is
+/// resumable. A failed Sway query only drops the hint.
+fn bind_refusal(
+    ports: &Ports,
+    state: &LocalState,
+    workspace: &str,
+    refusal: BindError,
+) -> anyhow::Error {
+    let resumable = matches!(refusal, BindError::WorkspaceTaken { .. })
+        && state.get(workspace).is_some_and(|binding| {
+            let tree = ports.sway.get_tree();
+            tree.is_ok_and(|tree| is_resumable(binding, ports.current_sway, &tree))
+        });
+    if resumable {
+        CommandError::ResumableWorkspaceTaken(refusal).into()
+    } else {
+        refusal.into()
+    }
 }
 
 /// Start the layout watcher of this Sway, once a binding that it owns is
@@ -809,36 +951,71 @@ enum TerminalOutcome {
     /// It opened one window (plan rule 4).
     Opened(Choice),
     /// It brought the windows of a resumable binding back
-    /// (plan-layout-backup rule 11).
-    Restored(Attached),
+    /// (plan-layout-backup rule 11), then, for `-e` or `--new`, opened the
+    /// requested terminal too.
+    Restored {
+        attached: Attached,
+        then_opened: Option<Choice>,
+    },
 }
 
 /// Open a terminal in the bound `workspace`, or, if its binding is
-/// resumable, resume it instead (plan-layout-backup rule 11).
+/// resumable, resume it instead (plan-layout-backup rule 11). After a
+/// resume, `-e` or `--new` still opens the requested terminal; a plain
+/// request opens nothing more.
 ///
 /// With no backup (rule 15), it restores the layout saved on the host, or,
-/// if there is none, opens one terminal as for a binding of this Sway. Both
-/// reattach with force: the host token is still the binding's, so no other
-/// machine took the session since.
+/// if there is none, opens the requested terminal as for a binding of this
+/// Sway. Both reattach with force: the host token is still the binding's,
+/// so no other machine took the session since.
 fn terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> Result<TerminalOutcome> {
-    let binding = match resume(ports, workspace, request.force, |_| true)? {
+    let attached = match resume(ports, workspace, request.force, |_| true)? {
         Resume::NotResumable => {
             return open_terminal(ports, workspace, request).map(TerminalOutcome::Opened);
         }
-        Resume::Restored(attached) => return Ok(TerminalOutcome::Restored(attached)),
-        Resume::NoBackup(binding) => binding,
+        Resume::Restored(attached) => attached,
+        Resume::NoBackup(binding) => {
+            let exec = (ports.hosts)(binding.host());
+            let Some(saved) = session::load(exec.as_ref(), binding.session())? else {
+                let forced = TerminalRequest {
+                    command: request.command.clone(),
+                    new: request.new,
+                    force: true,
+                };
+                return open_terminal(ports, workspace, &forced).map(TerminalOutcome::Opened);
+            };
+            let attached = attach_saved(ports, exec.as_ref(), workspace, &saved, true)?;
+            Attached {
+                source: LayoutSource::HostWithoutBackup,
+                ..attached
+            }
+        }
     };
-    let exec = (ports.hosts)(binding.host());
-    if let Some(saved) = session::load(exec.as_ref(), binding.session())? {
-        return attach_saved(ports, exec.as_ref(), workspace, &saved, true)
-            .map(TerminalOutcome::Restored);
+    let then_opened = open_after_restore(ports, workspace, request, &attached)?;
+    Ok(TerminalOutcome::Restored {
+        attached,
+        then_opened,
+    })
+}
+
+/// After a restore, open the terminal that `-e` or `--new` asked for.
+fn open_after_restore(
+    ports: &Ports,
+    workspace: &str,
+    request: &TerminalRequest,
+    restored: &Attached,
+) -> Result<Option<Choice>> {
+    if request.command.is_none() && !request.new {
+        return Ok(None);
     }
-    let forced = TerminalRequest {
-        command: request.command.clone(),
-        new: request.new,
-        force: true,
-    };
-    open_terminal(ports, workspace, &forced).map(TerminalOutcome::Opened)
+    let choice = open_terminal(ports, workspace, request).with_context(|| {
+        format!(
+            "restored session '{}' in workspace {workspace}, but did not open {}",
+            restored.session,
+            opened_label(request)
+        )
+    })?;
+    Ok(Some(choice))
 }
 
 /// What [`resume`] found or did.
@@ -952,8 +1129,9 @@ fn restore_backup(
 }
 
 /// After the binding of `workspace` was `lost` and dropped: attach the
-/// layout saved on the host (plan-layout-backup rules 13 and 13a). An error
-/// says why the workspace is no longer bound.
+/// layout saved on the host (plan-layout-backup rules 13 and 13a). Every
+/// error says that the workspace is unbound, and how to go on:
+/// [`CommandError::LostWithoutLayout`] or [`CommandError::LostNotRestored`].
 fn attach_lost_binding(
     ports: &Ports,
     binding: &WorkspaceState,
@@ -961,17 +1139,36 @@ fn attach_lost_binding(
     force: bool,
     lost: Lost,
 ) -> Result<Attached> {
-    let attached = attach_named(ports, binding.host(), workspace, binding.session(), force)
-        .with_context(|| {
-            format!(
-                "{} Workspace {workspace} is no longer bound to it",
-                lost_notice(binding.session(), binding.host(), lost)
-            )
-        })?;
-    Ok(Attached {
-        source: LayoutSource::HostAfterLoss(lost),
-        ..attached
-    })
+    let (session, host) = (binding.session(), binding.host());
+    let exec = (ports.hosts)(host);
+    let restored = session::load(exec.as_ref(), session)
+        .map_err(anyhow::Error::from)
+        .and_then(|saved| {
+            saved
+                .map(|saved| attach_saved(ports, exec.as_ref(), workspace, &saved, force))
+                .transpose()
+        });
+    match restored {
+        Ok(Some(attached)) => Ok(Attached {
+            source: LayoutSource::HostAfterLoss(lost),
+            ..attached
+        }),
+        Ok(None) => Err(CommandError::LostWithoutLayout {
+            session: session.clone(),
+            host: host.clone(),
+            workspace: workspace.to_owned(),
+            lost,
+        }
+        .into()),
+        Err(cause) => Err(CommandError::LostNotRestored {
+            session: session.clone(),
+            host: host.clone(),
+            workspace: workspace.to_owned(),
+            lost,
+            cause: format!("{cause:#}"),
+        }
+        .into()),
+    }
 }
 
 /// Launch the window of `terminal` and mark it.
@@ -1065,6 +1262,7 @@ fn detach(ports: &Ports, workspace: &str, saved_at_unix: u64) -> Result<Detached
         CommandError::NothingToDetach {
             workspace: workspace.to_owned(),
             session: name.clone(),
+            resumable: is_resumable(&binding, ports.current_sway, &tree),
         }
     })?;
     let saved = SavedSession::new(name.clone(), host.clone(), layout, saved_at_unix)?;
@@ -1139,6 +1337,20 @@ enum Lost {
     Ended,
 }
 
+impl Lost {
+    /// The sentence that tells the user what happened.
+    fn sentence(self, session: &SessionName, host: &Host) -> String {
+        match self {
+            Self::TakenElsewhere => {
+                format!("{session} was taken by another machine after your windows closed.")
+            }
+            Self::Ended => format!(
+                "{session} ended on {host} (the host restarted, or the session was killed)."
+            ),
+        }
+    }
+}
+
 /// Where the layout that `attach` or `terminal` restored came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutSource {
@@ -1147,6 +1359,9 @@ enum LayoutSource {
     /// The layout saved on the host, after the workspace's binding was lost
     /// (plan-layout-backup rules 13 and 13a).
     HostAfterLoss(Lost),
+    /// The layout saved on the host, for a resumable binding that this
+    /// machine has no backup of (rule 15).
+    HostWithoutBackup,
     /// This machine's backup: a resume (rule 12).
     Backup,
 }
@@ -1161,28 +1376,37 @@ struct Attached {
     source: LayoutSource,
 }
 
-/// Restore a session of `host` into `workspace`.
+/// Restore a session of `remote` (this machine if `None`) into `workspace`.
 ///
-/// If the workspace has a resumable binding on `host`, and `requested`
-/// names its session or none, `attach` resumes it (plan-layout-backup
-/// rule 11). Without a backup it restores that session's host layout, with
-/// force, as [`terminal`] does (rule 15). Otherwise it restores a saved
-/// session, as [`attach_from_host`].
+/// A resumable binding of the workspace is resumed (plan-layout-backup
+/// rule 11) when the request leaves it open: a bare `attach` resumes it
+/// whatever its host, and `--remote` or `--session` must match it. Without
+/// a backup it restores that session's host layout, with force, as
+/// [`terminal`] does (rule 15). Otherwise it restores a saved session, as
+/// [`attach_from_host`].
 fn attach(
     ports: &Ports,
-    host: &Host,
+    remote: Option<&RemoteHost>,
     workspace: &str,
     requested: Option<SessionName>,
     force: bool,
 ) -> Result<AttachOutcome> {
+    let host = remote.cloned().map_or(Host::Local, Host::Ssh);
+    let bare = remote.is_none() && requested.is_none();
     let wanted = |binding: &WorkspaceState| {
-        binding.host() == host && requested.as_ref().is_none_or(|s| s == binding.session())
+        bare || (binding.host() == &host
+            && requested.as_ref().is_none_or(|s| s == binding.session()))
     };
     match resume(ports, workspace, force, wanted)? {
         Resume::Restored(attached) => Ok(AttachOutcome::Attached(attached)),
-        Resume::NoBackup(binding) => attach_named(ports, host, workspace, binding.session(), true)
-            .map(AttachOutcome::Attached),
-        Resume::NotResumable => attach_from_host(ports, host, workspace, requested, force),
+        Resume::NoBackup(binding) => {
+            let attached = attach_named(ports, binding.host(), workspace, binding.session(), true)?;
+            Ok(AttachOutcome::Attached(Attached {
+                source: LayoutSource::HostWithoutBackup,
+                ..attached
+            }))
+        }
+        Resume::NotResumable => attach_from_host(ports, &host, workspace, requested, force),
     }
 }
 
@@ -1240,13 +1464,7 @@ fn attach_saved(
     let recreated = check_layout_shells(exec, saved.layout(), force)?;
     let mut lock = ports.store.lock()?;
     refuse_i3mux_windows(&ports.sway.get_tree()?, workspace)?;
-    take_and_bind(
-        lock.state_mut(),
-        exec,
-        workspace,
-        saved.name(),
-        ports.current_sway,
-    )?;
+    take_and_bind(lock.state_mut(), ports, exec, workspace, saved.name())?;
     lock.commit()?;
     start_watcher(ports);
     open_layout(ports, exec, saved.layout(), force)?;
