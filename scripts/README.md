@@ -16,11 +16,21 @@ bindsym $mod+m exec i3mux-rofi
 
 ## Menu
 
+In an unbound workspace:
+
 ```
 <last remote>   (shown once you have used a remote)
-Detach
 Attach
 List
+Kill
+```
+
+In a bound workspace:
+
+```
+Resume   (shown only when the workspace is resumable)
+List
+Detach
 Kill
 ```
 
@@ -28,17 +38,24 @@ Kill
   session and open the first shell.
 - Type a host such as `user@dev-box` to bind it to that host instead. The
   script remembers the host in `~/.config/i3mux/last_remote`.
+- `Resume` runs `i3mux terminal` in a workspace whose windows went away
+  with an earlier Sway, and brings them all back.
 - `Detach` saves the layout and closes the windows of the focused workspace.
 - `Attach` lists sessions on local and on the last remote, then restores the
   one you pick into the focused workspace.
-- `List` shows the same list read-only.
+- `List` shows the same list read-only. Pick a bound session to go to its
+  workspace.
 - `Kill` asks for confirmation, then kills the shells and deletes the layout.
 
-The list lines come straight from `i3mux sessions`, prefixed with the host
-they were read from:
+`Resume`, `Detach` and `Attach` show i3mux's own output in a notification.
+So a detach that saved nothing, because another machine took the session
+or the session ended, says so.
+
+The list lines come straight from `i3mux sessions --all`:
 
 ```
-local|ws4  (local)  2 windows
-dev-box|ws3  (dev-box)  detached, 3 terminals saved
-dev-box|ws7  (dev-box)  2 shells, no saved layout
+ws4  (local)  workspace 4, 2 windows
+ws5  (dev-box)  workspace 5, resumable, 3 terminals backed up
+ws3  (dev-box)  detached, 3 terminals saved
+ws7  (dev-box)  2 shells, no saved layout
 ```

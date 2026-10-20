@@ -10,6 +10,11 @@
   remote hosts still work, but windows do not reconnect after a network drop.
 - `shpool` on every host that runs shells: the desktop for local sessions
   and each remote host.
+- `flock` from util-linux on every host that runs shells. Every mainstream
+  Linux distribution has it.
+- A systemd user session on the desktop for layout backups. Without it,
+  i3mux works, but a workspace whose Sway died comes back only from the
+  layout of its last `detach`.
 - Rust toolchain to build i3mux.
 - Optional: `rofi` and `notify-send` for the menu script.
 
@@ -84,7 +89,10 @@ Reload with `$mod+Shift+c`.
    to stdout in non-interactive shells; i3mux parses that output.
 4. Keep shells alive after you log out. On systemd hosts run
    `loginctl enable-linger $USER` once. Without it some distributions kill
-   user processes when the last ssh session ends.
+   user processes when the last ssh session ends. Linger also keeps
+   `$XDG_RUNTIME_DIR`, where i3mux keeps the token of each session. Without
+   linger, logind removes that directory at the last logout, and i3mux then
+   reports the sessions as ended while their shells still run.
 5. Accept the host key once with a plain `ssh host`. i3mux runs ssh in batch
    mode, so it never asks.
 6. On hosts that you run, set `MaxSessions 100` in `/etc/ssh/sshd_config`
@@ -126,6 +134,31 @@ this feature, add this line to it:
 forward_env = ["SSH_CONNECTION", "SSH_CLIENT"]
 ```
 
+## Layout backups
+
+i3mux backs up the layout of each bound workspace on the desktop, so that
+`i3mux terminal` can bring the windows back after Sway dies (see
+[README.md](README.md#when-sway-dies)). A watcher writes the backups. It runs
+as the transient systemd user unit `i3mux-watch-ID.service`, one per Sway;
+the ID is a hash of `$SWAYSOCK`. i3mux starts it whenever it binds a
+workspace, and it stops when Sway exits.
+
+```bash
+systemctl --user list-units 'i3mux-watch-*'      # the watchers
+journalctl --user -u 'i3mux-watch-*'             # their log
+ls ~/.local/state/i3mux/backups/HOST/            # one SESSION.json per binding
+```
+
+The backups live in `$XDG_STATE_HOME/i3mux/backups`, by default
+`~/.local/state/i3mux/backups`. Set `I3MUX_BACKUP_DIR` to move them.
+Without a systemd user manager there is no watcher and no backup.
+
+On each host, i3mux keeps one token per session in
+`$XDG_RUNTIME_DIR/i3mux/sessions/`, or in `~/.local/state/i3mux/sessions/`
+if that variable is not set. The token tells which machine took the session
+last. A reboot of the host removes it, so the session ends there, as with
+tmux.
+
 ## Check the install
 
 ```bash
@@ -160,3 +193,14 @@ i3mux sessions
   cause, then press Enter to retry, or `q` to close the window.
 - See the connection state: `i3mux status`, or
   `systemctl --user status i3mux-ssh-HOST.service`.
+- "ws4 ended on HOST" while the shells still run: the host lost its token
+  of the session. Without linger, logind removes `$XDG_RUNTIME_DIR` at the
+  last logout; enable linger on the host (see above). After a reboot of
+  the host, the session did end.
+- "Not saved: another machine took it": another machine attached the
+  session after this one. Its layout stays on the host; `detach` closed the
+  windows here and saved nothing.
+- A workspace that `status` calls resumable has no windows: run
+  `i3mux terminal` there to bring them back.
+- No backups appear: check that `systemctl --user list-units
+  'i3mux-watch-*'` lists a watcher, and read its log.

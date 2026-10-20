@@ -1,6 +1,6 @@
 # Plan: keep the layout when Sway dies
 
-Date: 2026-10-19. Status: approved.
+Date: 2026-10-19. Status: implemented.
 
 ## Goal
 

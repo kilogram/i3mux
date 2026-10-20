@@ -264,6 +264,8 @@ struct MasterLog {
     fail_start: bool,
     /// Report no masters, as on a machine without systemd.
     direct: bool,
+    /// Report every master unit as not loaded.
+    inactive: bool,
 }
 
 /// Records, in order, each start and stop of a host's master. Every master
@@ -342,10 +344,11 @@ impl Masters for FakeMasters {
     }
 
     fn state(&self, _host: &RemoteHost) -> Result<MasterState, MasterError> {
+        let inactive = self.log.lock().unwrap().inactive;
         Ok(MasterState::Unit {
             unit: Self::unit(),
-            active_state: "active".into(),
-            restarts: 2,
+            active_state: if inactive { "inactive" } else { "active" }.into(),
+            restarts: if inactive { 0 } else { 2 },
         })
     }
 }
@@ -1340,7 +1343,8 @@ fn terminal_resumes_a_crashed_binding_from_its_backup() {
         Report {
             notices: vec![],
             results: vec![
-                "✓ Resumed session 'ws4' from backup on local in workspace 4 (2 terminals)".into(),
+                "✓ Resumed session 'ws4' from backup on this machine in workspace 4 (2 terminals)"
+                    .into(),
                 "  recreated 1 of 2 shells: the host had lost them, for example after a reboot"
                     .into(),
             ],
@@ -1427,11 +1431,11 @@ fn resume_after_another_take_uses_the_host_layout() {
         Report {
             notices: vec![
                 "ws4 was taken by another machine after your windows closed. \
-                           Restoring the layout last saved on local."
+                           Restoring the layout last saved on this machine."
                     .into()
             ],
             results: vec![
-                "✓ Attached session 'ws4' from local to workspace 4 (1 terminal)".into(),
+                "✓ Attached session 'ws4' from this machine to workspace 4 (1 terminal)".into(),
                 "  recreated 1 of 1 shells: the host had lost them, for example after a reboot"
                     .into()
             ],
@@ -1466,7 +1470,7 @@ fn resume_after_another_take_does_not_force_their_shells() {
     assert_eq!(
         format!("{err:#}"),
         "ws4 was taken by another machine after your windows closed. Restoring the layout \
-         last saved on local failed: Session 'ws4-001' is already attached from another \
+         last saved on this machine failed: Session 'ws4-001' is already attached from another \
          terminal or host; use --force to take over. Workspace 4 is no longer bound. \
          To take it, run 'i3mux attach --session ws4 --force'."
     );
@@ -1521,8 +1525,8 @@ fn resume_after_the_session_ended_uses_the_host_layout() {
     assert_eq!(
         report_attached(&attached, "4", None).notices,
         [
-            "ws4 ended on local (the host restarted, or the session was killed). \
-          Restoring the layout last saved on local."
+            "ws4 ended on this machine (the host restarted, or the session was killed). \
+          Restoring the layout last saved on this machine."
         ]
     );
     assert!(
@@ -1542,7 +1546,7 @@ fn resume_of_an_ended_session_without_a_host_layout_says_so() {
     // Design review S2.
     assert_eq!(
         format!("{err:#}"),
-        "ws4 ended on local (the host restarted, or the session was killed) and has no saved \
+        "ws4 ended on this machine (the host restarted, or the session was killed) and has no saved \
          layout. Workspace 4 is unbound. Start a new session with 'i3mux activate'."
     );
     assert_eq!(world.binding("4"), None);
@@ -1625,7 +1629,7 @@ fn resume_without_a_backup_restores_the_host_layout() {
     // Design review nit: not "Resumed", and where the layout came from.
     assert_eq!(
         report_attached(&attached, "4", None).results[0],
-        "✓ Attached session 'ws4' from the layout saved on local to workspace 4 (2 terminals)"
+        "✓ Attached session 'ws4' from the layout saved on this machine to workspace 4 (2 terminals)"
     );
 }
 
@@ -1804,7 +1808,7 @@ fn terminal_with_a_command_restores_then_opens_it() {
     assert_eq!(
         report_attached(&attached, "4", Some(&label)).results,
         [
-            "✓ Resumed session 'ws4' from backup on local in workspace 4 (2 terminals), \
+            "✓ Resumed session 'ws4' from backup on this machine in workspace 4 (2 terminals), \
           then opened 'htop'"
         ]
     );
@@ -1970,6 +1974,107 @@ fn nothing_to_detach_says_how_to_bring_the_windows_back() {
         err.to_string(),
         "Workspace 4 has no windows of session 'ws4'; nothing to detach (to end the session, \
          run 'i3mux kill')"
+    );
+}
+
+// ------------------------------------------------------ phase 5 wording
+
+#[test]
+fn sessions_show_a_resumable_workspace_and_its_backup() {
+    // Phase 5: the row says resumable, and how much the backup holds.
+    let world = World::new(Host::Local);
+    world.crashed("4", "ws4", Some(&[1, 2]));
+    world.crashed("5", "ws5", None);
+    world.bind("6", "ws6");
+    world.sway.open_marked("6", &world.mark("ws6-001"));
+
+    let rows = sessions(&world.ports(), &Host::Local).unwrap();
+
+    assert_eq!(
+        format_rows(&rows),
+        [
+            "ws4  (local)  workspace 4, resumable, 2 terminals backed up",
+            "ws5  (local)  workspace 5, resumable, no backup",
+            "ws6  (local)  workspace 6, 1 window",
+        ]
+    );
+}
+
+#[test]
+fn status_of_a_resumable_workspace_says_how_to_resume() {
+    // Phase 5: the connection line only while the host has a master.
+    let world = World::new(deepthought());
+    world.crashed("4", "ws4", Some(&[1]));
+    world.fakes.log.lock().unwrap().inactive = true;
+    let report = status(&world.ports(), "4").unwrap().unwrap();
+    assert_eq!(
+        format_status(&report),
+        [
+            "ws4  (deepthought)  workspace 4, resumable, 1 terminal backed up",
+            "  resume: run 'i3mux terminal' here",
+        ]
+    );
+
+    world.fakes.log.lock().unwrap().inactive = false;
+    let report = status(&world.ports(), "4").unwrap().unwrap();
+    assert_eq!(
+        format_status(&report)[2],
+        "  connection: active, 2 restarts (i3mux-ssh-fake.service)"
+    );
+}
+
+#[test]
+fn a_bound_workspace_with_an_inactive_master_still_shows_its_connection() {
+    // Only a resumable workspace drops the connection line.
+    let world = World::new(deepthought());
+    world.bind("3", "ws3");
+    world.sway.open_marked("3", &world.mark("ws3-001"));
+    world.fakes.log.lock().unwrap().inactive = true;
+    let report = status(&world.ports(), "3").unwrap().unwrap();
+    assert_eq!(
+        format_status(&report),
+        [
+            "ws3  (deepthought)  workspace 3, 1 window",
+            "  connection: inactive, 0 restarts (i3mux-ssh-fake.service)",
+        ]
+    );
+}
+
+#[test]
+fn messages_about_this_machine_say_so() {
+    // Phase 5: "this machine", not "local".
+    let detached = |token| Detached {
+        session: name("ws4"),
+        host: Host::Local,
+        terminals: 2,
+        token,
+    };
+    assert_eq!(
+        report_detached(&detached(TokenMatch::Same)).results,
+        ["✓ Detached session 'ws4': layout of 2 terminals saved on this machine"]
+    );
+    assert_eq!(
+        report_detached(&detached(TokenMatch::TakenElsewhere)).notices,
+        [
+            "Closed session 'ws4' here. Not saved: another machine took it, \
+          so this machine keeps that machine's layout."
+        ]
+    );
+    assert_eq!(
+        report_detached(&detached(TokenMatch::Ended)).notices,
+        ["Closed session 'ws4' here. Not saved: ws4 ended on this machine."]
+    );
+    let taken = CommandError::LostWithoutLayout {
+        session: name("ws4"),
+        host: Host::Local,
+        workspace: "4".into(),
+        lost: Lost::TakenElsewhere,
+    };
+    assert_eq!(
+        taken.to_string(),
+        "ws4 was taken by another machine after your windows closed, and this machine has \
+         no saved layout of it. Workspace 4 is unbound. To take it, run \
+         'i3mux activate --session ws4'."
     );
 }
 
@@ -2581,10 +2686,11 @@ fn status_shows_the_focused_session_without_asking_the_host() {
 fn status_of_a_local_session_has_no_connection() {
     let world = World::new(Host::Local);
     world.bind("4", "ws4");
+    world.sway.open_marked("4", &world.mark("ws4-001"));
     let report = status(&world.ports(), "4").unwrap().unwrap();
     assert_eq!(
         format_status(&report),
-        ["ws4  (local)  workspace 4, 0 windows"]
+        ["ws4  (local)  workspace 4, 1 window"]
     );
 }
 

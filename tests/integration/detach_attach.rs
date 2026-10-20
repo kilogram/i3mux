@@ -33,7 +33,10 @@ fn attach_brings_back_the_shells_that_detach_left(#[case] session: Session) -> R
 
     let out = env.i3mux().detach()?;
     assert!(
-        out.contains(&format!("layout of 2 terminals saved on {host}")),
+        out.contains(&format!(
+            "layout of 2 terminals saved on {}",
+            session.place()
+        )),
         "{out}"
     );
     env.wait_for_window_count(WS, 0)?;

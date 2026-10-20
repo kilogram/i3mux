@@ -5,9 +5,11 @@
 #   bindsym $mod+m exec i3mux-rofi
 #
 # The menu header shows the focused workspace's session. In a bound
-# workspace, detach and kill act on that session. In an unbound one, type a
-# hostname (or nothing for local) to activate it, or pick attach, list or
-# kill. Actions match without regard to case.
+# workspace, detach and kill act on that session; a resumable one (its
+# windows went away with an earlier Sway) offers resume first. In an unbound
+# one, type a hostname (or nothing for local) to activate it, or pick
+# attach, list or kill. Actions match without regard to case. Attach, detach
+# and resume show i3mux's own output in a notification.
 
 set -euo pipefail
 
@@ -33,6 +35,7 @@ notify() {
 # One row per session on this machine, on every bound host, and on the last
 # remote host, e.g.
 #   ws3  (deepthought)  workspace 3, 1 window
+#   ws5  (deepthought)  workspace 5, resumable, 3 terminals backed up
 #   ws4  (local)        detached, 3 terminals saved
 # Warnings about unreachable hosts go to stderr.
 all_sessions() {
@@ -93,12 +96,25 @@ show_list() {
 }
 
 # Print the workspace of a bound row:
-#   ws3  (deepthought)  workspace 3, 1 window, 2 orphans  ->  3
+#   ws3  (deepthought)  workspace 3, 1 window, 2 orphans           ->  3
+#   ws5  (deepthought)  workspace 5, resumable, 1 terminal backed up  ->  5
+#   ws6  (local)        workspace 6, resumable, no backup             ->  6
 # Fails for a row that is not bound here.
 row_workspace() {
-    local re='\)  workspace (.+), [0-9]+ windows?(, [0-9]+ orphans?)?$'
+    local re='\)  workspace (.+), ([0-9]+ windows?(, [0-9]+ orphans?)?|resumable, ([0-9]+ terminals? backed up|no backup))$'
     [[ $1 =~ $re ]] || return 1
     printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Whether the first line of `i3mux status` is a resumable row.
+row_resumable() {
+    local re='\)  workspace .+, resumable, '
+    [[ ${1%%$'\n'*} =~ $re ]]
+}
+
+# Show the output of a command that worked, if it printed anything.
+notify_output() {
+    [ -n "$1" ] && notify "$1" || true
 }
 
 rc=0
@@ -114,6 +130,9 @@ if [ "$bound" = 1 ]; then
     menu="list
 detach
 kill"
+    # resume first in a resumable workspace: it only brings windows back.
+    row_resumable "$status" && menu="resume
+$menu"
     mesg=$status
 else
     menu="attach
@@ -133,15 +152,26 @@ case "${selection,,}" in
         pick_session "Attach"
         [ "$SEL_HOST" != "local" ] && save_last_remote "$SEL_HOST"
         # shellcheck disable=SC2046
-        if ! error=$(i3mux attach $(host_args "$SEL_HOST") --session "$SEL_NAME" 2>&1); then
-            rofi -e "Attach failed: $error"
+        if output=$(i3mux attach $(host_args "$SEL_HOST") --session "$SEL_NAME" 2>&1); then
+            notify_output "$output"
+        else
+            rofi -e "Attach failed: $output"
         fi
         ;;
     detach)
-        if error=$(i3mux detach 2>&1); then
-            notify "Workspace detached"
+        # A detach that saved nothing (another machine took the session, or
+        # it ended) still exits 0; its output says so.
+        if output=$(i3mux detach 2>&1); then
+            notify_output "$output"
         else
-            rofi -e "Detach failed: $error"
+            rofi -e "Detach failed: $output"
+        fi
+        ;;
+    resume)
+        if output=$(i3mux terminal 2>&1); then
+            notify_output "$output"
+        else
+            rofi -e "Resume failed: $output"
         fi
         ;;
     list)

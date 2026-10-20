@@ -62,9 +62,11 @@ on `activate`, `attach` and `kill`.
    (every ssh client above goes through this one connection)
 
  ~/.config/i3mux/state.json          which workspace is bound to which session
+ ~/.local/state/i3mux/backups/       this machine's backup of each bound layout
  dev-box:~/.local/state/i3mux/       saved layouts, one JSON file per session,
                                      and the shpool daemon log
  dev-box:~/.local/run/i3mux/         the i3mux shpool daemon socket
+ dev-box:$XDG_RUNTIME_DIR/i3mux/     one token per session: who took it last
 ```
 
 1. `activate` records the binding and opens the first terminal.
@@ -79,6 +81,64 @@ on `activate`, `attach` and `kill`.
 
 Closing a window never kills a shell. Only `exit` in the shell or
 `i3mux kill` does.
+
+## When Sway dies
+
+i3mux keeps a backup of the layout of each bound workspace on this
+machine. When Sway dies without `detach`, for example after a flat battery,
+a crash or a logout, the next `i3mux terminal` in that workspace brings all
+its windows back.
+
+The words that i3mux uses for this:
+
+- **session**: the shells of one name on one host, such as `ws4` on
+  `dev-box`.
+- **binding**: this machine's record that a workspace shows a session.
+- **take**: `activate`, `attach` and `kill` take the session on its host.
+  The last take wins: a binding on another machine that took the session
+  before no longer holds it.
+- **resumable**: a binding whose windows went away with an earlier Sway.
+- **backup**: this machine's copy of the layout of a bound workspace.
+- **ended**: the host has no token for the session any more, after `kill`
+  or a reboot of the host.
+
+In a resumable workspace:
+
+| Command    | What it does                                                        |
+|------------|---------------------------------------------------------------------|
+| `terminal` | Restores every window, then runs `-e` or `--new` if you gave one.   |
+| `attach`   | The same with no options. With options, only for the session they name; `--session` alone names one on this machine. |
+| `detach`   | Has nothing to detach. Run `terminal` first.                        |
+| `kill`     | Ends the session: shells, saved layout, binding and backup.         |
+| `status`   | Says `resumable`, and to run `i3mux terminal`.                      |
+| `sessions` | Shows `resumable, 3 terminals backed up`, or `no backup`.           |
+
+- With no backup, `terminal` restores the layout that the last `detach`
+  saved on the host. With neither, it opens one terminal.
+- If another machine took the session since, i3mux says so. It drops the
+  binding and the backup, and restores the layout saved on the host.
+- If the session ended, i3mux says so and does the same. A reboot of the
+  host ends every session on it, as with tmux.
+- A `detach` after another machine took the session closes the windows,
+  saves nothing, and exits 0. It says why on stderr.
+- The backup follows Sway about 1 s behind, and stays on this machine. Only
+  `detach` saves a layout on the host.
+- A resume reattaches every shell with `--force`. It also disconnects a
+  client that you attached to one of those shells by hand.
+- After an ssh drop, a window of the old machine reattaches with `--force`
+  from its landing page, and does not take the session. "Last take wins"
+  decides whose layout is saved, not which client shows a shell.
+- The backups need a systemd user manager. A watcher, the user unit
+  `i3mux-watch-ID`, writes them. Without a user manager there is no
+  watcher and no backup.
+
+```bash
+systemctl --user list-units 'i3mux-watch-*'   # the watcher of each Sway
+ls ~/.local/state/i3mux/backups/HOST/         # one backup per bound session
+```
+
+See [INSTALL.md](INSTALL.md#layout-backups) and
+[docs/PLAN-layout-backup.md](docs/PLAN-layout-backup.md).
 
 ## Remote hosts
 

@@ -38,6 +38,16 @@ impl Session {
         }
     }
 
+    /// How detach, attach and resume messages name the host: the host, or
+    /// "this machine".
+    #[must_use]
+    pub fn place(self) -> &'static str {
+        match self {
+            Self::Local => "this machine",
+            Self::Remote => REMOTE_HOST,
+        }
+    }
+
     /// The home directory of the user that owns the shells.
     #[must_use]
     pub fn home(self) -> &'static str {

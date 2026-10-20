@@ -149,6 +149,18 @@ pub enum MasterState {
     },
 }
 
+impl MasterState {
+    /// Whether a master unit exists: active, starting, or waiting to
+    /// restart. systemd reports a unit that is not loaded as `inactive`.
+    #[must_use]
+    pub fn has_master(&self) -> bool {
+        match self {
+            Self::Direct => false,
+            Self::Unit { active_state, .. } => active_state != "inactive",
+        }
+    }
+}
+
 impl fmt::Display for MasterState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -626,6 +638,20 @@ mod tests {
             ("activating".to_owned(), 3)
         );
         assert_eq!(parse_show(""), (String::new(), 0));
+    }
+
+    #[test]
+    fn only_a_loaded_unit_is_a_master() {
+        let unit = |active_state: &str| MasterState::Unit {
+            unit: UnitName::from_escaped_host("deepthought").unwrap(),
+            active_state: active_state.to_owned(),
+            restarts: 0,
+        };
+        assert!(!MasterState::Direct.has_master());
+        assert!(!unit("inactive").has_master());
+        for state in ["active", "activating", "failed"] {
+            assert!(unit(state).has_master(), "{state}");
+        }
     }
 
     #[test]

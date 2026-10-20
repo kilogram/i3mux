@@ -231,9 +231,10 @@ enum CommandError {
     /// A resume dropped a binding that no longer held its session, and could
     /// not restore the host's saved layout instead.
     #[error(
-        "{} Restoring the layout last saved on {host} failed: {cause}. \
+        "{} Restoring the layout last saved on {} failed: {cause}. \
          Workspace {workspace} is no longer bound. To take it, run '{}'.",
         .lost.sentence(.session, .host),
+        place(.host),
         attach_command(.host, .session)
     )]
     LostNotRestored {
@@ -531,7 +532,7 @@ fn cmd_detach(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
 /// a notice says so, and the exit status stays 0.
 fn report_detached(detached: &Detached) -> Report {
     let terminals = count(detached.terminals, "terminal", "terminals");
-    let (session, host) = (&detached.session, &detached.host);
+    let (session, host) = (&detached.session, place(&detached.host));
     let closed = format!("Closed session '{session}' here. Not saved");
     match detached.token {
         TokenMatch::Same => Report {
@@ -592,15 +593,16 @@ fn report_attached(attached: &Attached, workspace: &str, then: Option<&str>) -> 
         source,
     } = attached;
     let terminals = count(*total, "terminal", "terminals");
+    let place = place(host);
     let headline = match source {
         LayoutSource::Host | LayoutSource::HostAfterLoss(_) => {
-            format!("✓ Attached session '{session}' from {host} to workspace {workspace}")
+            format!("✓ Attached session '{session}' from {place} to workspace {workspace}")
         }
         LayoutSource::HostWithoutBackup => format!(
-            "✓ Attached session '{session}' from the layout saved on {host} to workspace {workspace}"
+            "✓ Attached session '{session}' from the layout saved on {place} to workspace {workspace}"
         ),
         LayoutSource::Backup => {
-            format!("✓ Resumed session '{session}' from backup on {host} in workspace {workspace}")
+            format!("✓ Resumed session '{session}' from backup on {place} in workspace {workspace}")
         }
     };
     let then = then.map(|label| format!(", then opened {label}"));
@@ -615,7 +617,7 @@ fn report_attached(attached: &Attached, workspace: &str, then: Option<&str>) -> 
     }
     let notices = match source {
         LayoutSource::HostAfterLoss(lost) => vec![format!(
-            "{} Restoring the layout last saved on {host}.",
+            "{} Restoring the layout last saved on {place}.",
             lost.sentence(session, host)
         )],
         LayoutSource::Host | LayoutSource::HostWithoutBackup | LayoutSource::Backup => vec![],
@@ -629,6 +631,15 @@ fn opened_label(request: &TerminalRequest) -> String {
         || "a new terminal".to_owned(),
         |command| format!("'{command}'"),
     )
+}
+
+/// How messages about the lost, resumed or detached sessions of a host name
+/// it: the host, or "this machine".
+fn place(host: &Host) -> &str {
+    match host {
+        Host::Local => "this machine",
+        Host::Ssh(remote) => remote.as_str(),
+    }
 }
 
 /// `--remote HOST `, or nothing for this machine, for commands in messages.
@@ -660,15 +671,16 @@ fn activate_command(host: &Host, session: Option<&SessionName>) -> String {
 
 /// [`CommandError::LostWithoutLayout`]: what happened, and the remedy.
 fn lost_without_layout(session: &SessionName, host: &Host, workspace: &str, lost: Lost) -> String {
+    let place = place(host);
     match lost {
         Lost::Ended => format!(
-            "{session} ended on {host} (the host restarted, or the session was killed) and has \
+            "{session} ended on {place} (the host restarted, or the session was killed) and has \
              no saved layout. Workspace {workspace} is unbound. Start a new session with '{}'.",
             activate_command(host, None)
         ),
         Lost::TakenElsewhere => format!(
-            "{session} was taken by another machine after your windows closed, and {host} has no \
-             saved layout of it. Workspace {workspace} is unbound. To take it, run '{}'.",
+            "{session} was taken by another machine after your windows closed, and {place} has \
+             no saved layout of it. Workspace {workspace} is unbound. To take it, run '{}'.",
             activate_command(host, Some(session))
         ),
     }
@@ -1345,7 +1357,8 @@ impl Lost {
                 format!("{session} was taken by another machine after your windows closed.")
             }
             Self::Ended => format!(
-                "{session} ended on {host} (the host restarted, or the session was killed)."
+                "{session} ended on {} (the host restarted, or the session was killed).",
+                place(host)
             ),
         }
     }
@@ -1596,6 +1609,13 @@ enum RowStatus {
         windows: usize,
         orphans: usize,
     },
+    /// Bound to a workspace on this machine, but its windows went away with
+    /// an earlier Sway: `terminal` resumes it (plan-layout-backup
+    /// decision 4). `backed_up` counts the terminals of its backup.
+    Resumable {
+        workspace: String,
+        backed_up: Option<usize>,
+    },
     /// Not bound here, but a terminal elsewhere shows at least one shell.
     AttachedElsewhere { shells: usize },
     /// Not bound here, no shell attached; a saved layout exists.
@@ -1613,11 +1633,8 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
     let shells = mux::list(exec.as_ref())?;
     let saved = session::list(exec.as_ref())?;
     let state = ports.store.load()?;
-    let bound: Vec<(&str, &SessionName)> = state
-        .bindings()
-        .filter(|(_, b)| b.host() == host)
-        .map(|(ws, b)| (ws, b.session()))
-        .collect();
+    let bound: Vec<(&str, &WorkspaceState)> =
+        state.bindings().filter(|(_, b)| b.host() == host).collect();
     let tree = if bound.is_empty() {
         None
     } else {
@@ -1628,7 +1645,7 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
         .iter()
         .map(|s| s.name().session())
         .chain(saved.iter())
-        .chain(bound.iter().map(|(_, name)| *name))
+        .chain(bound.iter().map(|(_, binding)| binding.session()))
         .collect();
     let mut rows = Vec::new();
     for name in names {
@@ -1636,9 +1653,11 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
             .iter()
             .filter(|s| s.name().session() == name)
             .collect();
-        let workspace = bound.iter().find(|(_, b)| *b == name).map(|(ws, _)| *ws);
-        let status = match (&tree, workspace) {
-            (Some(tree), Some(workspace)) => bound_status(tree, host, name, workspace, &alive),
+        let bound_here = bound.iter().find(|(_, b)| b.session() == name);
+        let status = match (&tree, bound_here) {
+            (Some(tree), Some((workspace, binding))) => {
+                bound_status(ports, tree, binding, workspace, &alive)?
+            }
             _ if alive.iter().any(|s| s.is_attached()) => RowStatus::AttachedElsewhere {
                 shells: alive.len(),
             },
@@ -1656,24 +1675,37 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
     Ok(rows)
 }
 
-/// Windows of a session bound here, and its shells without a window.
+/// Windows of a session bound here, and its shells without a window; or,
+/// for a resumable binding, the size of its backup.
 fn bound_status(
+    ports: &Ports,
     tree: &Value,
-    host: &Host,
-    name: &SessionName,
+    binding: &WorkspaceState,
     workspace: &str,
     alive: &[&Shell],
-) -> RowStatus {
-    let marked = window::session_terminals(tree, host, name);
+) -> Result<RowStatus> {
+    if is_resumable(binding, ports.current_sway, tree) {
+        return resumable_status(ports, binding, workspace);
+    }
+    let marked = window::session_terminals(tree, binding.host(), binding.session());
     let orphans = alive
         .iter()
         .filter(|s| !s.is_attached() && !marked.contains(s.name()))
         .count();
-    RowStatus::Bound {
+    Ok(RowStatus::Bound {
         workspace: workspace.to_owned(),
         windows: marked.len(),
         orphans,
-    }
+    })
+}
+
+/// [`RowStatus::Resumable`], with the size of the binding's backup.
+fn resumable_status(ports: &Ports, binding: &WorkspaceState, workspace: &str) -> Result<RowStatus> {
+    let backed_up = ports.backups.read(binding)?;
+    Ok(RowStatus::Resumable {
+        workspace: workspace.to_owned(),
+        backed_up: backed_up.map(|layout| layout.terminals().len()),
+    })
 }
 
 /// What `sessions --all` found.
@@ -1716,7 +1748,8 @@ fn sessions_all(ports: &Ports, extra: Option<Host>) -> Result<Listing> {
 #[derive(Debug)]
 struct StatusReport {
     row: SessionRow,
-    /// The state of a remote host's ssh master; `None` for this machine.
+    /// The state of a remote host's ssh master; `None` for this machine,
+    /// and for a resumable binding whose host has no master.
     connection: Option<MasterState>,
 }
 
@@ -1729,7 +1762,17 @@ fn status(ports: &Ports, workspace: &str) -> Result<Option<StatusReport>> {
         return Ok(None);
     };
     let tree = ports.sway.get_tree()?;
-    let windows = window::session_terminals(&tree, binding.host(), binding.session()).len();
+    let resumable = is_resumable(&binding, ports.current_sway, &tree);
+    let status = if resumable {
+        resumable_status(ports, &binding, workspace)?
+    } else {
+        let windows = window::session_terminals(&tree, binding.host(), binding.session()).len();
+        RowStatus::Bound {
+            workspace: workspace.to_owned(),
+            windows,
+            orphans: 0,
+        }
+    };
     let connection = match binding.host() {
         Host::Local => None,
         Host::Ssh(remote) => Some(ports.masters.state(remote)?),
@@ -1738,20 +1781,21 @@ fn status(ports: &Ports, workspace: &str) -> Result<Option<StatusReport>> {
         row: SessionRow {
             name: binding.session().clone(),
             host: binding.host().clone(),
-            status: RowStatus::Bound {
-                workspace: workspace.to_owned(),
-                windows,
-                orphans: 0,
-            },
+            status,
         },
-        connection,
+        connection: connection.filter(|c| !resumable || c.has_master()),
     }))
 }
 
-/// The row, then `  connection: ...` for a remote host. The first line is
-/// a `sessions` row; scripts/i3mux-rofi reads its first word and host.
+/// The row, then `  resume: ...` for a resumable binding, then
+/// `  connection: ...` for a remote host. The first line is a `sessions`
+/// row; scripts/i3mux-rofi reads its first word, its host, and whether it
+/// is resumable.
 fn format_status(report: &StatusReport) -> Vec<String> {
     let mut lines = format_rows(std::slice::from_ref(&report.row));
+    if matches!(report.row.status, RowStatus::Resumable { .. }) {
+        lines.push("  resume: run 'i3mux terminal' here".to_owned());
+    }
     if let Some(connection) = &report.connection {
         lines.push(format!("  connection: {connection}"));
     }
@@ -1769,9 +1813,11 @@ fn saved_status(exec: &dyn HostExec, name: &SessionName) -> Result<RowStatus> {
     }
 }
 
-/// `ws4  (deepthought)  workspace 4, 3 windows, 1 orphan`. The first word is
-/// the session name and the host is in parentheses; scripts/i3mux-rofi
-/// relies on both.
+/// `ws4  (deepthought)  workspace 4, 3 windows, 1 orphan`, or
+/// `ws4  (deepthought)  workspace 4, resumable, 3 terminals backed up`. The
+/// first word is the session name and the host is in parentheses;
+/// scripts/i3mux-rofi relies on both, and on the text after the host of a
+/// bound row.
 fn format_rows(rows: &[SessionRow]) -> Vec<String> {
     let width = rows
         .iter()
@@ -1796,6 +1842,17 @@ fn format_rows(rows: &[SessionRow]) -> Vec<String> {
                     "workspace {workspace}, {}",
                     count(*windows, "window", "windows")
                 ),
+                RowStatus::Resumable {
+                    workspace,
+                    backed_up: Some(terminals),
+                } => format!(
+                    "workspace {workspace}, resumable, {} backed up",
+                    count(*terminals, "terminal", "terminals")
+                ),
+                RowStatus::Resumable {
+                    workspace,
+                    backed_up: None,
+                } => format!("workspace {workspace}, resumable, no backup"),
                 RowStatus::AttachedElsewhere { shells } => {
                     format!("attached elsewhere, {}", count(*shells, "shell", "shells"))
                 }
