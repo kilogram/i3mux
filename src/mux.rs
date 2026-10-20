@@ -436,16 +436,22 @@ mod tests {
         fn remove_file(&self, _: &str) -> Result<bool, HostError> {
             unreachable!()
         }
-        fn take_token(&self, _: &str) -> Result<String, HostError> {
+        fn take_token(&self, _: &SessionName) -> Result<String, HostError> {
+            unreachable!()
+        }
+        fn read_token(&self, _: &SessionName) -> Result<Option<String>, HostError> {
+            unreachable!()
+        }
+        fn remove_token(&self, _: &SessionName) -> Result<(), HostError> {
             unreachable!()
         }
         fn write_file_if_token(
             &self,
             _: &str,
             _: &str,
-            _: &str,
+            _: &SessionName,
             _: Option<&crate::types::Token>,
-        ) -> Result<bool, HostError> {
+        ) -> Result<crate::host::CheckedWrite, HostError> {
             unreachable!()
         }
     }

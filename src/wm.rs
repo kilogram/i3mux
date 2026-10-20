@@ -8,6 +8,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::sway_ops::Sway;
+use crate::types::SwayInstance;
+
+/// The kernel's random id of the running boot.
+const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
 /// Talking to Sway failed.
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +30,8 @@ pub enum WmError {
     },
     #[error("Sway reports no focused workspace")]
     NoFocusedWorkspace,
+    #[error("cannot read the boot id from {BOOT_ID}: {0}")]
+    BootId(#[source] std::io::Error),
 }
 
 /// A workspace as `swaymsg -t get_workspaces` reports it.
@@ -78,6 +84,19 @@ impl Wm {
         Ok(Self {
             socket: socket.into(),
         })
+    }
+
+    /// The running Sway: this boot's id and Sway's socket
+    /// (plan-layout-backup decision 2).
+    ///
+    /// # Errors
+    /// [`WmError::BootId`] if the boot id cannot be read.
+    pub fn instance(&self) -> Result<SwayInstance, WmError> {
+        let boot_id = std::fs::read_to_string(BOOT_ID).map_err(WmError::BootId)?;
+        Ok(SwayInstance::new(
+            boot_id.trim(),
+            self.socket.to_string_lossy(),
+        ))
     }
 
     /// Run `swaymsg -s SOCKET <args>` and return stdout.

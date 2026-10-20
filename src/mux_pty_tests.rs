@@ -84,6 +84,7 @@ impl Scratch {
             Host::Local,
             RunnerConfig {
                 local_home: home.path().to_path_buf(),
+                local_runtime_dir: Some(home.path().join("xdg")),
                 ssh_control_dir: home.path().join("ssh"),
                 masters: std::sync::Arc::new(crate::master::DirectSsh),
             },

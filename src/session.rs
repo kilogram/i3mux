@@ -1,6 +1,6 @@
 //! Saved sessions: the layout of a detached session, stored on the host that
 //! runs its shells, at `~/.local/state/i3mux/sessions/{name}.json`, and the
-//! session's token, at `~/.local/state/i3mux/sessions/{name}.token`.
+//! session's token, in the host's runtime directory (see `host`).
 //!
 //! Guarantees:
 //!
@@ -10,8 +10,13 @@
 //!   session's shells.
 //! - A loaded file's `name` field matches its file name.
 //! - [`take`] writes a new token to the host and returns it
-//!   (plan-layout-backup rule 1). Nothing here deletes a token file, so a
-//!   token never comes back after `kill`.
+//!   (plan-layout-backup rule 1). [`read_token`] only reads it (rule 3).
+//!   [`remove_token`] ends the session (rule 1b). A token never comes back:
+//!   each take writes 16 new random bytes.
+//! - [`compare_tokens`] is the one rule for whether a binding still holds
+//!   its session: same token, another token, or no token file (rules 4, 5,
+//!   13 and 13a). The checked-write script on the host applies the same
+//!   rule for [`save_if_token`].
 //! - [`save_if_token`] is the only way to write a layout. It writes only if
 //!   the host still has the caller's token, and it compares and writes in one
 //!   host script under `flock` (plan-layout-backup rule 4). It replaces the
@@ -19,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::host::{HostError, HostExec};
+use crate::host::{CheckedWrite, HostError, HostExec};
 use crate::layout::Layout;
 use crate::types::{Host, InvalidToken, SessionName, TerminalName, Token};
 
@@ -48,7 +53,7 @@ pub enum SessionError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("{host} returned a bad token for session '{session}': {source}")]
+    #[error("{host} has a bad token for session '{session}': {source}")]
     BadToken {
         host: Host,
         session: SessionName,
@@ -97,16 +102,7 @@ impl SavedSession {
         layout: Layout,
         saved_at_unix: u64,
     ) -> Result<Self, SessionError> {
-        let terminals = layout.terminals();
-        if terminals.is_empty() {
-            return Err(SessionError::Empty { session: name });
-        }
-        if let Some(foreign) = terminals.into_iter().find(|t| t.session() != &name) {
-            return Err(SessionError::ForeignTerminal {
-                session: name,
-                terminal: foreign.clone(),
-            });
-        }
+        check_layout(&name, &layout)?;
         Ok(Self {
             name,
             host,
@@ -116,17 +112,41 @@ impl SavedSession {
     }
 
     #[must_use]
+    pub fn name(&self) -> &SessionName {
+        &self.name
+    }
+
+    #[must_use]
     pub fn layout(&self) -> &Layout {
         &self.layout
     }
 }
 
-fn path_of(name: &SessionName) -> String {
-    format!("{SESSIONS_DIR}/{name}.json")
+/// Check that `layout` can be restored as session `name`: it has at least
+/// one terminal, and every terminal belongs to `name`. Saved sessions and
+/// local backups both pass this check.
+///
+/// # Errors
+/// [`SessionError::Empty`] if `layout` has no terminals,
+/// [`SessionError::ForeignTerminal`] if one belongs to another session.
+pub fn check_layout(name: &SessionName, layout: &Layout) -> Result<(), SessionError> {
+    let terminals = layout.terminals();
+    if terminals.is_empty() {
+        return Err(SessionError::Empty {
+            session: name.clone(),
+        });
+    }
+    match terminals.into_iter().find(|t| t.session() != name) {
+        Some(foreign) => Err(SessionError::ForeignTerminal {
+            session: name.clone(),
+            terminal: foreign.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
-fn token_path_of(name: &SessionName) -> String {
-    format!("{SESSIONS_DIR}/{name}.token")
+fn path_of(name: &SessionName) -> String {
+    format!("{SESSIONS_DIR}/{name}.json")
 }
 
 /// Take session `name` on `host`: replace its token with a new one and
@@ -138,26 +158,72 @@ fn token_path_of(name: &SessionName) -> String {
 /// unchanged. [`SessionError::BadToken`] if the host printed something that
 /// is not a token.
 pub fn take(host: &dyn HostExec, name: &SessionName) -> Result<Token, SessionError> {
-    let printed = host.take_token(&token_path_of(name))?;
-    Token::parse(&printed).map_err(|source| SessionError::BadToken {
+    let printed = host.take_token(name)?;
+    parse_token(host, name, &printed)
+}
+
+/// The host's token of session `name`, or `None` if it has none: no take
+/// ever happened, or the session ended (rule 1b). Reads without the lock: a
+/// take replaces the file by rename, so a read sees the old or the new
+/// token. Never writes (plan-layout-backup rule 3).
+///
+/// # Errors
+/// [`SessionError::Host`] if the host fails, [`SessionError::BadToken`] if
+/// the file holds something that is not a token (rule 14).
+pub fn read_token(host: &dyn HostExec, name: &SessionName) -> Result<Option<Token>, SessionError> {
+    host.read_token(name)?
+        .map(|text| parse_token(host, name, text.trim_end()))
+        .transpose()
+}
+
+/// End session `name` on `host`: delete its token file, under the token
+/// lock (plan-layout-backup rule 1b). Every binding with a token of this
+/// session then finds it ended.
+///
+/// # Errors
+/// [`SessionError::Host`] if the host fails.
+pub fn remove_token(host: &dyn HostExec, name: &SessionName) -> Result<(), SessionError> {
+    Ok(host.remove_token(name)?)
+}
+
+fn parse_token(host: &dyn HostExec, name: &SessionName, text: &str) -> Result<Token, SessionError> {
+    Token::parse(text).map_err(|source| SessionError::BadToken {
         host: host.host().clone(),
         session: name.clone(),
         source,
     })
 }
 
-/// What [`save_if_token`] did.
+/// Whether a binding with token `ours` still holds its session, given the
+/// host's token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SaveOutcome {
-    /// The host had the caller's token: the layout is saved.
-    Saved,
-    /// A later take changed the host's token: nothing is written.
+pub enum TokenMatch {
+    /// The host has the binding's token, or neither has one (a binding from
+    /// before tokens, plan-layout-backup rule 4).
+    Same,
+    /// The host has another token: another machine took the session since
+    /// (rules 5 and 13).
     TakenElsewhere,
+    /// The binding has a token, and the host has no token file: `kill` or a
+    /// host reboot ended the session (rules 1a, 1b and 13a).
+    Ended,
 }
 
-/// Write `session` to its file on `host`, replacing any earlier save, if the
-/// host's token of the session is `token`. `None` matches a host with no
-/// token file: a binding from before tokens (plan-layout-backup rule 4).
+/// Compare the token `ours` of a binding with the host's token `host`.
+#[must_use]
+pub fn compare_tokens(ours: Option<&Token>, host: Option<&Token>) -> TokenMatch {
+    match (ours, host) {
+        (Some(_), None) => TokenMatch::Ended,
+        (ours, host) if ours == host => TokenMatch::Same,
+        _ => TokenMatch::TakenElsewhere,
+    }
+}
+
+/// Write `session` to its file on `host`, replacing any earlier save, if
+/// [`compare_tokens`] with the host's token is [`TokenMatch::Same`]. The
+/// compare and the write run in one host script under `flock`
+/// (plan-layout-backup rule 4). Returns what the compare found; only
+/// [`TokenMatch::Same`] wrote.
 ///
 /// # Errors
 /// [`SessionError::Host`] if the host fails; the old file is then unchanged.
@@ -165,18 +231,16 @@ pub fn save_if_token(
     host: &dyn HostExec,
     session: &SavedSession,
     token: Option<&Token>,
-) -> Result<SaveOutcome, SessionError> {
+) -> Result<TokenMatch, SessionError> {
     let json = serde_json::to_string_pretty(session).map_err(|source| SessionError::Encode {
         session: session.name.clone(),
         source,
     })?;
-    let path = path_of(&session.name);
-    let token_path = token_path_of(&session.name);
-    let written = host.write_file_if_token(&path, &json, &token_path, token)?;
-    Ok(if written {
-        SaveOutcome::Saved
-    } else {
-        SaveOutcome::TakenElsewhere
+    let written = host.write_file_if_token(&path_of(&session.name), &json, &session.name, token)?;
+    Ok(match written {
+        CheckedWrite::Written => TokenMatch::Same,
+        CheckedWrite::OtherToken => TokenMatch::TakenElsewhere,
+        CheckedWrite::NoTokenFile => TokenMatch::Ended,
     })
 }
 
@@ -235,6 +299,7 @@ mod tests {
             Host::Local,
             RunnerConfig {
                 local_home: home.to_path_buf(),
+                local_runtime_dir: Some(home.join("run")),
                 ssh_control_dir: home.join("ssh"),
                 masters: std::sync::Arc::new(crate::master::DirectSsh),
             },
@@ -276,7 +341,7 @@ mod tests {
 
         for session in ["ws7", "ws4"] {
             let outcome = save_if_token(&host, &saved(session), None).unwrap();
-            assert_eq!(outcome, SaveOutcome::Saved);
+            assert_eq!(outcome, TokenMatch::Same);
         }
         assert!(home
             .path()
@@ -298,7 +363,7 @@ mod tests {
         let first = take(&host, &name("ws4")).unwrap();
         let second = take(&host, &name("ws4")).unwrap();
         assert_ne!(first, second);
-        let file = home.path().join(SESSIONS_DIR).join("ws4.token");
+        let file = home.path().join("run/i3mux/sessions/ws4.token");
         assert_eq!(
             std::fs::read_to_string(file).unwrap(),
             format!("{}\n", second.as_str())
@@ -318,13 +383,13 @@ mod tests {
         let mine = take(&host, &name("ws4")).unwrap();
         assert_eq!(
             save_if_token(&host, &saved("ws4"), None).unwrap(),
-            SaveOutcome::TakenElsewhere,
+            TokenMatch::TakenElsewhere,
             "a binding without a token does not hold a taken session"
         );
         assert_eq!(load(&host, &name("ws4")).unwrap(), None);
         assert_eq!(
             save_if_token(&host, &saved("ws4"), Some(&mine)).unwrap(),
-            SaveOutcome::Saved
+            TokenMatch::Same
         );
 
         take(&host, &name("ws4")).unwrap();
@@ -332,9 +397,70 @@ mod tests {
         newer.saved_at_unix += 1;
         assert_eq!(
             save_if_token(&host, &newer, Some(&mine)).unwrap(),
-            SaveOutcome::TakenElsewhere
+            TokenMatch::TakenElsewhere
         );
         assert_eq!(load(&host, &name("ws4")).unwrap(), Some(saved("ws4")));
+    }
+
+    #[test]
+    fn read_token_reads_what_the_last_take_wrote() {
+        // Plan-layout-backup rules 3 and 14.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        assert_eq!(read_token(&host, &name("ws4")).unwrap(), None);
+        let taken = take(&host, &name("ws4")).unwrap();
+        assert_eq!(
+            read_token(&host, &name("ws4")).unwrap(),
+            Some(taken.clone())
+        );
+        assert_eq!(
+            read_token(&host, &name("ws4")).unwrap(),
+            Some(taken),
+            "a read never takes"
+        );
+
+        let file = home.path().join("run/i3mux/sessions/ws4.token");
+        std::fs::write(&file, "not a token\n").unwrap();
+        let err = read_token(&host, &name("ws4")).unwrap_err();
+        assert!(matches!(err, SessionError::BadToken { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_removed_token_ends_the_session() {
+        // Plan-layout-backup rules 1b and 5.
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let mine = take(&host, &name("ws4")).unwrap();
+        remove_token(&host, &name("ws4")).unwrap();
+        assert_eq!(read_token(&host, &name("ws4")).unwrap(), None);
+        assert_eq!(
+            save_if_token(&host, &saved("ws4"), Some(&mine)).unwrap(),
+            TokenMatch::Ended
+        );
+        assert_eq!(load(&host, &name("ws4")).unwrap(), None);
+        assert_eq!(
+            save_if_token(&host, &saved("ws4"), None).unwrap(),
+            TokenMatch::Same,
+            "a binding from before tokens matches no token file"
+        );
+    }
+
+    #[test]
+    fn compare_tokens_tells_same_taken_and_ended_apart() {
+        // Plan-layout-backup rules 4, 5, 13 and 13a. The checked-write
+        // script on the host applies the same rule; host::tests cover it.
+        let a = Token::parse(&"a".repeat(32)).unwrap();
+        let b = Token::parse(&"b".repeat(32)).unwrap();
+        let cases = [
+            (Some(&a), Some(&a), TokenMatch::Same),
+            (None, None, TokenMatch::Same),
+            (Some(&a), Some(&b), TokenMatch::TakenElsewhere),
+            (None, Some(&b), TokenMatch::TakenElsewhere),
+            (Some(&a), None, TokenMatch::Ended),
+        ];
+        for (ours, host, expected) in cases {
+            assert_eq!(compare_tokens(ours, host), expected, "{ours:?} {host:?}");
+        }
     }
 
     #[test]
@@ -345,7 +471,7 @@ mod tests {
         take(&host, &name("ws7")).unwrap();
         assert_eq!(
             save_if_token(&host, &saved("ws4"), Some(&ws4)).unwrap(),
-            SaveOutcome::Saved
+            TokenMatch::Same
         );
     }
 

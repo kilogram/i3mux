@@ -14,6 +14,7 @@
 //!   (plan rule 3).
 //! - [`Token`]: always 32 lowercase hex digits, so never empty and safe as a
 //!   shell argument.
+//! - [`SwayInstance`]: equal only for the same Sway run in the same boot.
 
 use std::fmt;
 use std::str::FromStr;
@@ -344,6 +345,27 @@ impl TryFrom<String> for Token {
 impl From<Token> for String {
     fn from(token: Token) -> Self {
         token.0
+    }
+}
+
+/// One run of Sway: the id of the boot it runs in and its IPC socket path.
+/// A reboot or a restarted Sway is another instance. The owner of a binding
+/// is the instance that holds its windows (plan-layout-backup decision 2).
+/// Compared for equality only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwayInstance {
+    boot_id: String,
+    socket: String,
+}
+
+impl SwayInstance {
+    /// The Sway that listens on `socket` in the boot `boot_id`.
+    #[must_use]
+    pub fn new(boot_id: impl Into<String>, socket: impl Into<String>) -> Self {
+        Self {
+            boot_id: boot_id.into(),
+            socket: socket.into(),
+        }
     }
 }
 

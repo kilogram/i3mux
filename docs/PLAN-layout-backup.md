@@ -41,13 +41,15 @@ took it last wins, and the other machine says so.
 ```
  machine A                                     host: ~/.local/state/i3mux/sessions/
  sway ──events──► i3mux watch (state lock)       ws4.json   layout from detach
-                    │ owner == this sway?        ws4.token  T2
+                    │ owner == this sway?      host: $XDG_RUNTIME_DIR/i3mux/sessions/
+                    │                            ws4.token  T2
                     ▼
  ~/.local/state/i3mux/backups/HOST/ws4.json  {token T1, layout}
  state.json: ws 4 → {host, ws4, token T1, owner}
 
  resume in ws 4:  host token == T1 → restore the backup
                   host token != T1 → drop the binding, attach from ws4.json
+                  no token file    → session ended: drop the binding, attach
                   host unreachable → error, nothing changes
 ```
 
@@ -56,8 +58,12 @@ took it last wins, and the other machine says so.
 Token:
 
 1. A take writes a new token to `SESSION.token` on the host under `flock`.
-   `activate`, `attach` from the host layout, and `kill` take. Nothing
-   deletes a token file.
+   `activate`, `attach` from the host layout, and `kill` take.
+1a. The token file lives in `$XDG_RUNTIME_DIR/i3mux/sessions/` on the host,
+   or in `~/.local/state/i3mux/sessions/` when that variable is unset. A host
+   reboot removes it, so the session ends, as with tmux.
+1b. `kill` deletes the token file under the same `flock`. A missing token
+   file means the session ended.
 2. `attach` takes under the local state lock, after all its refusals.
 3. A resume reads the token and never writes it.
 4. `detach` writes the host layout only when the host token equals the
@@ -65,7 +71,8 @@ Token:
    `flock`. A binding with no token matches a host with no token file.
 5. When `detach` finds a different token, it closes its windows and unbinds.
    It does not run `shpool detach` and does not write the host layout. It
-   says that another machine took the session.
+   says that another machine took the session, or, with no token file, that
+   the session ended.
 
 Backup:
 
@@ -88,6 +95,8 @@ Resume:
 13. Different token: drop the binding and the backup. Say "ws4 was taken by
     another machine since; using the layout saved there." Then attach from
     the host layout, as today.
+13a. No token file: drop the binding and the backup. Say "ws4 ended on
+    HOST." Then attach from the host layout, as today.
 14. Unreachable host or unreadable token: report the error. The binding and
     the backup do not change.
 15. No backup: attach from the host layout, as today.
@@ -119,6 +128,9 @@ Other:
 
 - Clocks or counters to order layouts: clocks differ, and a counter can
   repeat after `kill`. Equality on a random token is enough.
+- Token on disk with the host boot id: works without linger, but adds a boot
+  id check. Cost of the runtime dir: without linger, logind can remove it
+  while shells live. i3mux then says "ended" and uses the host layout.
 - `live`/`closed` modes set at watcher start: wrong after a watcher restart
   or a window opened before the watcher. The owner field replaces them.
 - Backup inside `state.json`: one bad layout would quarantine every binding.

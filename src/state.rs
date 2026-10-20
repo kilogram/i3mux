@@ -20,19 +20,19 @@
 //! 5. **Old files load unchanged** (plan-layout-backup rule 19): fields added
 //!    to a binding have serde defaults, and a binding without them saves
 //!    back to the same JSON.
-//! 6. **Every new binding has a token** (plan-layout-backup decision 2):
-//!    [`WorkspaceState::new`] needs one. Only a binding loaded from a file
-//!    written before tokens has none.
+//! 6. **Every new binding has a token and an owner** (plan-layout-backup
+//!    decision 2): [`WorkspaceState::new`] needs both. Only a binding loaded
+//!    from a file written before tokens or owners lacks them.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Host, SessionName, Token};
+use crate::types::{Host, SessionName, SwayInstance, Token};
 
 /// What a workspace is bound to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,21 +44,27 @@ pub struct WorkspaceState {
     /// no token file (plan-layout-backup rule 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<Token>,
+    /// The Sway instance that holds this binding's windows. A binding that
+    /// another instance owns, or none, is resumable (plan-layout-backup
+    /// decision 4). `None` in a binding from before owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<SwayInstance>,
 }
 
 impl WorkspaceState {
     /// A binding to `session` on `host`, made by the take that returned
-    /// `token`.
+    /// `token`, with its windows in the Sway `owner`.
     #[must_use]
-    pub fn new(host: Host, session: SessionName, token: Token) -> Self {
+    pub fn new(host: Host, session: SessionName, token: Token, owner: SwayInstance) -> Self {
         Self {
             host,
             session,
             token: Some(token),
+            owner: Some(owner),
         }
     }
 
-    /// A binding as a file from before tokens has it.
+    /// A binding as a file from before tokens and owners has it.
     #[cfg(test)]
     #[must_use]
     pub fn without_token(host: Host, session: SessionName) -> Self {
@@ -66,6 +72,16 @@ impl WorkspaceState {
             host,
             session,
             token: None,
+            owner: None,
+        }
+    }
+
+    /// The same binding, with its windows in the Sway `owner`.
+    #[must_use]
+    pub fn with_owner(self, owner: SwayInstance) -> Self {
+        Self {
+            owner: Some(owner),
+            ..self
         }
     }
 
@@ -83,6 +99,18 @@ impl WorkspaceState {
     #[must_use]
     pub fn token(&self) -> Option<&Token> {
         self.token.as_ref()
+    }
+
+    /// The Sway that holds this binding's windows, if it has an owner.
+    #[must_use]
+    pub fn owner(&self) -> Option<&SwayInstance> {
+        self.owner.as_ref()
+    }
+
+    /// Whether the Sway `sway` owns this binding.
+    #[must_use]
+    pub fn is_owned_by(&self, sway: &SwayInstance) -> bool {
+        self.owner.as_ref() == Some(sway)
     }
 }
 
@@ -288,25 +316,14 @@ impl StateStore {
         })
     }
 
-    /// Replace the file atomically: write a sibling temp file, fsync it,
-    /// rename it over the target. A failed save leaves the old file intact.
+    /// Replace the file atomically with [`replace_file`]. A failed save
+    /// leaves the old file intact.
     ///
     /// # Errors
     /// If the directory or temp file cannot be written.
     pub fn save(&self, state: &LocalState) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
         let contents = serde_json::to_string_pretty(state).context("cannot encode the state")?;
-        {
-            let mut file = fs::File::create(&tmp)
-                .with_context(|| format!("cannot create {}", tmp.display()))?;
-            file.write_all(contents.as_bytes())?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, &self.path)
-            .with_context(|| format!("cannot replace {}", self.path.display()))
+        replace_file(&self.path, &contents)
     }
 
     /// Take the exclusive lock and load the state. The lock is held until
@@ -351,6 +368,29 @@ impl StateStore {
         lock.commit()?;
         Ok(out)
     }
+}
+
+/// Replace the JSON file at `path` atomically: create its directory, write
+/// a sibling `.tmp` file, fsync it, rename it over `path`. Readers see the
+/// old or the new file, never a part. The temp name is fixed, so callers
+/// hold the state lock.
+///
+/// # Errors
+/// If the directory or temp file cannot be written; `path` is then
+/// unchanged.
+pub fn replace_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file =
+            fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
 /// The state, loaded under the exclusive lock. Dropping it releases the lock
@@ -409,8 +449,13 @@ mod tests {
         Token::parse(&digit.to_string().repeat(32)).unwrap()
     }
 
+    fn sway(pid: u32) -> SwayInstance {
+        SwayInstance::new("boot-1", format!("/run/user/1000/sway-ipc.1000.{pid}.sock"))
+    }
+
     fn taken(host: Host, session: &str, digit: char) -> WorkspaceState {
-        WorkspaceState::new(host, SessionName::new(session).unwrap(), token(digit))
+        let session = SessionName::new(session).unwrap();
+        WorkspaceState::new(host, session, token(digit), sway(1))
     }
 
     fn sample_state(ws: &str) -> LocalState {
@@ -480,7 +525,7 @@ mod tests {
                 .clone()
                 .bind(
                     ws,
-                    WorkspaceState::new(remote(), session.clone(), token('b')),
+                    WorkspaceState::new(remote(), session.clone(), token('b'), sway(1)),
                 )
                 .unwrap_err();
             assert_eq!(checked, bound);
@@ -525,16 +570,34 @@ mod tests {
     }
 
     #[test]
-    fn binding_with_a_token_saves_it() {
+    fn binding_with_a_token_and_an_owner_saves_both() {
         let mut state = LocalState::default();
         state.bind("4", taken(remote(), "ws4", 'c')).unwrap();
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(
             json,
             serde_json::json!({"workspaces": {"4": {
-                "host": "user@host", "session": "ws4", "token": "c".repeat(32)}}})
+                "host": "user@host", "session": "ws4", "token": "c".repeat(32),
+                "owner": {"boot_id": "boot-1",
+                          "socket": "/run/user/1000/sway-ipc.1000.1.sock"}}}})
         );
         assert_eq!(serde_json::from_value::<LocalState>(json).unwrap(), state);
+    }
+
+    #[test]
+    fn a_binding_is_owned_only_by_its_own_sway() {
+        // Plan-layout-backup decision 2: another boot or another Sway run is
+        // another owner.
+        let owned = taken(remote(), "ws4", 'a');
+        assert!(owned.is_owned_by(&sway(1)));
+        assert!(!owned.is_owned_by(&sway(2)));
+        let rebooted = SwayInstance::new("boot-2", "/run/user/1000/sway-ipc.1000.1.sock");
+        assert!(!owned.is_owned_by(&rebooted));
+        let legacy = binding(remote(), "ws4");
+        assert!(!legacy.is_owned_by(&sway(1)));
+        let adopted = legacy.with_owner(sway(2));
+        assert!(adopted.is_owned_by(&sway(2)));
+        assert_eq!(adopted.token(), None, "an owner changes nothing else");
     }
 
     #[test]
@@ -563,7 +626,9 @@ mod tests {
                 ("mail", "user@mail.example", "mail"),
             ]
         );
-        assert!(state.bindings().all(|(_, b)| b.token().is_none()));
+        assert!(state
+            .bindings()
+            .all(|(_, b)| b.token().is_none() && b.owner().is_none()));
 
         store.save(&state).unwrap();
         let saved: serde_json::Value =
