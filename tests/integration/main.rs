@@ -27,6 +27,7 @@ mod infrastructure;
 mod layout_basic;
 mod layout_nested;
 mod layout_tabbed;
+mod rebind;
 mod sessions;
 mod terminal;
 mod window_command;

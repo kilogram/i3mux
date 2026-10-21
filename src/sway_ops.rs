@@ -176,6 +176,9 @@ pub mod testing {
                 let rest = rest.trim();
                 if let Some(mark) = rest.strip_prefix("mark --add ") {
                     window.3.push(mark.trim_matches('"').to_owned());
+                } else if let Some(mark) = rest.strip_prefix("unmark ") {
+                    let mark = mark.trim_matches('"');
+                    window.3.retain(|m| m != mark);
                 } else if let Some(name) = rest.strip_prefix("move container to workspace ") {
                     let name = name.strip_prefix('"').and_then(|n| n.strip_suffix('"'));
                     let name = name.ok_or_else(|| anyhow!("unquoted workspace"))?;

@@ -131,6 +131,32 @@ impl LocalState {
         }
     }
 
+    /// Move the binding of `ws` to `host`; its session and window command
+    /// stay (PLAN-terminal-here decision 3). Moving it to its own host, or
+    /// an unbound `ws`, changes nothing.
+    ///
+    /// # Errors
+    /// [`BindError::SessionBoundElsewhere`] if another workspace has this
+    /// session on `host`.
+    pub fn rebind(&mut self, ws: &str, host: &Host) -> Result<(), BindError> {
+        let Some(current) = self.workspaces.get(ws) else {
+            return Ok(());
+        };
+        if let Some(other) = self.workspace_of(host, &current.session) {
+            if other != ws {
+                return Err(BindError::SessionBoundElsewhere {
+                    host: host.clone(),
+                    session: current.session.clone(),
+                    workspace: other.to_owned(),
+                });
+            }
+        }
+        if let Some(binding) = self.workspaces.get_mut(ws) {
+            binding.host = host.clone();
+        }
+        Ok(())
+    }
+
     /// Remove the binding of `ws`, returning it.
     pub fn unbind(&mut self, ws: &str) -> Option<WorkspaceState> {
         self.workspaces.remove(ws)
@@ -417,6 +443,35 @@ mod tests {
         let before = state.clone();
         state.bind("3", binding(remote(), "mysession")).unwrap();
         assert_eq!(state, before);
+    }
+
+    /// PLAN-terminal-here decision 3: a rebind keeps the session and the
+    /// window command, refuses a session the new host binds elsewhere, and
+    /// changes nothing for its own host or an unbound workspace.
+    #[test]
+    fn rebind_moves_only_the_host() {
+        let command = crate::types::WindowTemplate::new("w {shell}").unwrap();
+        let mut state = LocalState::default();
+        state
+            .bind(
+                "4",
+                binding(Host::Local, "ws4").with_window_command(Some(command.clone())),
+            )
+            .unwrap();
+        state.rebind("4", &remote()).unwrap();
+        assert_eq!(
+            state.get("4"),
+            Some(&binding(remote(), "ws4").with_window_command(Some(command)))
+        );
+        let same = state.clone();
+        state.rebind("4", &remote()).unwrap();
+        state.rebind("9", &Host::Local).unwrap();
+        assert_eq!(state, same);
+        state.bind("5", binding(Host::Local, "ws4")).unwrap();
+        assert!(matches!(
+            state.rebind("4", &Host::Local),
+            Err(BindError::SessionBoundElsewhere { workspace, .. }) if workspace == "5"
+        ));
     }
 
     #[test]

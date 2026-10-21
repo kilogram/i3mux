@@ -157,6 +157,13 @@ pub fn mark_command(con_id: u64, mark: &Mark) -> String {
     format!("[con_id={con_id}] mark --add \"{mark}\"")
 }
 
+/// `[con_id=N] unmark "MARK"`: the command that takes `mark` off window
+/// `con_id`.
+#[must_use]
+pub fn unmark_command(con_id: u64, mark: &Mark) -> String {
+    format!("[con_id={con_id}] unmark \"{mark}\"")
+}
+
 /// `[con_id=N] move container to workspace "NAME"`: the command that moves
 /// window `con_id` to the workspace called `name`, which Sway creates if it
 /// does not exist. `"` and `\` in the name are escaped.

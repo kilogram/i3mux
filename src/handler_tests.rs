@@ -729,6 +729,98 @@ fn status_names_the_window_command() {
     );
 }
 
+// --------------------------------------------------------------- rebind
+
+/// PLAN-terminal-here decision 3: `attach --rebind-only` moves the binding
+/// and re-marks the session's windows. It keeps the session and the window
+/// command, contacts no host (the world's host factory knows only the old
+/// host), starts no master, and opens, closes and attaches nothing.
+#[test]
+fn rebind_moves_the_binding_and_re_marks_the_windows_only() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+    world.sway.open_marked("4", &world.mark("ws4-002"));
+    world.sway.open("4", "firefox");
+
+    let rebound = world
+        .finish(|ports| rebind(ports, &deepthought(), &name("ws4")))
+        .unwrap();
+
+    assert_eq!(
+        rebound,
+        Rebound {
+            workspace: "4".into(),
+            from: Some(Host::Local),
+            remarked: 2
+        }
+    );
+    let binding = world.store.load().unwrap().get("4").cloned().unwrap();
+    assert_eq!(binding.host(), &deepthought());
+    assert_eq!(binding.session(), &name("ws4"));
+    assert_eq!(binding.window_command().unwrap().as_str(), "w {shell}");
+    let tree = world.sway.get_tree().unwrap();
+    assert_eq!(
+        window::session_terminals(&tree, &deepthought(), &name("ws4")),
+        [t("ws4", 1), t("ws4", 2)]
+    );
+    assert!(window::session_terminals(&tree, &Host::Local, &name("ws4")).is_empty());
+    assert_eq!(world.sway.window_count(), 3, "nothing opened or closed");
+    assert!(world.launches().is_empty());
+    assert!(
+        world.fakes.events().is_empty(),
+        "no master started or stopped"
+    );
+}
+
+/// A second run changes nothing, and a run cut after the binding moved
+/// re-marks the windows left behind.
+#[test]
+fn rebind_again_finishes_a_cut_run_and_changes_nothing_else() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap();
+    let left = world.sway.open_marked("4", &world.mark("ws4-003"));
+    let before = world.sway.commands().len();
+
+    let again = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap();
+
+    assert_eq!(again.from, None);
+    assert_eq!(again.remarked, 1);
+    assert_eq!(world.sway.commands().len(), before + 2);
+    let third = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap();
+    assert_eq!((third.from, third.remarked), (None, 0));
+    assert_eq!(world.sway.commands().len(), before + 2, "nothing more");
+    let tree = world.sway.get_tree().unwrap();
+    assert!(window::i3mux_windows_in(&tree)
+        .iter()
+        .any(|(id, mark)| *id == left && mark.host() == &deepthought()));
+}
+
+#[test]
+fn rebind_refuses_a_session_bound_nowhere_or_twice() {
+    let world = World::new(Host::Local);
+    let err = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap_err();
+    assert!(matches!(
+        command_error(&err),
+        CommandError::NothingToRebind(_)
+    ));
+
+    world.bind("4", "ws4");
+    let elsewhere = WorkspaceState::new(deepthought(), name("ws4"));
+    world
+        .store
+        .with_lock(|s| Ok(s.bind("5", elsewhere)?))
+        .unwrap();
+    let err = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("Session 'ws4' is bound in workspaces 4 and 5"),
+        "{err}"
+    );
+    assert!(world.sway.commands().is_empty());
+}
+
 // ------------------------------------------------------------- activate
 
 #[test]
@@ -1696,6 +1788,14 @@ fn status_of_an_unbound_workspace_is_none() {
 fn cli_definition_is_valid() {
     use clap::CommandFactory;
     Cli::command().debug_assert();
+}
+
+#[test]
+fn rebind_only_needs_a_session_and_takes_no_force() {
+    let parse = |args: &[&str]| Cli::try_parse_from([&["i3mux", "attach"], args].concat());
+    assert!(parse(&["--rebind-only", "--remote", "h"]).is_err());
+    assert!(parse(&["--rebind-only", "--session", "s", "--force"]).is_err());
+    assert!(parse(&["--rebind-only", "--remote", "h", "--session", "s"]).is_ok());
 }
 
 #[test]

@@ -41,6 +41,7 @@ i3mux terminal -e htop            # run a command in a fresh persistent shell
 i3mux terminal --no-hold -e make  # close the window as soon as its shell ends
 i3mux detach                      # save the layout, close the windows, keep the shells
 i3mux attach --session ws3        # restore the layout and reattach every shell
+i3mux attach --remote dev-box --session ws3 --rebind-only  # move ws3's binding to dev-box, touch no window
 i3mux sessions [--remote host]    # what exists, where, and in what state
 i3mux sessions --all              # this machine and every host a workspace is bound to
 i3mux status                      # the focused workspace's session and ssh connection (exit 3 if none)
@@ -112,6 +113,18 @@ i3mux activate --window-command 'my-window --shell {shell}'
   another host, and `terminal --here` reads the host from the binding.
 - `detach` saves the command with the layout, `attach` binds with it
   again, and `i3mux status` shows it.
+
+## Move a binding to another host
+
+`i3mux attach --remote NEW --session S --rebind-only` moves the binding
+of session S, in whatever workspace has it, to host NEW (no `--remote`:
+this machine). It re-marks the windows of S as windows of NEW, and does
+nothing else: it opens, closes and attaches no window, contacts no host,
+and starts no ssh connection. The windows keep showing what they showed.
+A program that keeps a session's shells on two hosts, and moves them
+itself, uses it to point the workspace at the new host; a window command
+that reads the binding then follows it. Running it again is harmless: it
+re-marks any window left with the old host and changes nothing else.
 
 ## Shells made by other programs
 

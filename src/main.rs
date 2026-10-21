@@ -122,6 +122,10 @@ enum CliCommand {
         session: Option<String>,
         #[arg(long, help = FORCE_HELP)]
         force: bool,
+        /// Only move the binding of --session to the --remote host and
+        /// re-mark its windows: open, close and attach nothing
+        #[arg(long, requires = "session", conflicts_with = "force")]
+        rebind_only: bool,
     },
     /// List the sessions on a host
     Sessions {
@@ -212,6 +216,16 @@ enum CommandError {
     NoSavedSessions(Host),
     #[error("No session '{session}' on {host}")]
     NoSuchSession { session: SessionName, host: Host },
+    #[error("No workspace is bound to session '{0}'; nothing to rebind")]
+    NothingToRebind(SessionName),
+    #[error(
+        "Session '{session}' is bound in workspaces {workspaces} (on different hosts); \
+         rebind needs one: end the other with 'i3mux kill --remote HOST --session {session}'"
+    )]
+    BoundTwice {
+        session: SessionName,
+        workspaces: String,
+    },
     #[error(
         "No workspace is bound to session '{session}' on {host}; run 'i3mux activate{} --session {session}' in the workspace that should show it",
         remote_flag(.host)
@@ -313,7 +327,14 @@ fn dispatch(
             remote,
             session,
             force,
+            rebind_only: false,
         } => cmd_attach(ports, wm, remote, session, force),
+        CliCommand::Attach {
+            remote,
+            session,
+            rebind_only: true,
+            ..
+        } => cmd_rebind(ports, remote, session),
         CliCommand::Sessions { remote, all } => cmd_sessions(ports, remote, all),
         CliCommand::Status => cmd_status(ports, wm),
         CliCommand::Open {
@@ -519,6 +540,22 @@ fn cmd_attach(
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn cmd_rebind(ports: &Ports, remote: Option<String>, session: Option<String>) -> Result<ExitCode> {
+    let host = Host::from_remote_arg(remote)?;
+    let session = parse_session(session)?
+        .context("i3mux bug: clap lets --rebind-only through without --session")?;
+    let rebound = rebind(ports, &host, &session)?;
+    let moved = rebound
+        .from
+        .map_or_else(|| "already".to_owned(), |from| format!("moved from {from}"));
+    println!(
+        "✓ Workspace {}: session '{session}' {moved} on {host}; {} re-marked",
+        rebound.workspace,
+        count(rebound.remarked, "window", "windows")
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_sessions(ports: &Ports, remote: Option<String>, all: bool) -> Result<ExitCode> {
@@ -1030,6 +1067,64 @@ fn attach(
 enum Pick {
     One(SessionName),
     Several(Vec<SessionName>),
+}
+
+/// What `attach --rebind-only` did.
+#[derive(Debug, PartialEq, Eq)]
+struct Rebound {
+    workspace: String,
+    /// The host the binding left; `None` if it was on the new host already.
+    from: Option<Host>,
+    /// The windows that now carry the new host in their mark.
+    remarked: usize,
+}
+
+/// Move the binding of `session` to `host`, and re-mark the session's
+/// windows that show another host (PLAN-terminal-here decision 3).
+///
+/// It contacts no host, starts no master, and opens, closes or attaches
+/// no window: the windows keep running what they run. Under the state lock
+/// throughout. The binding is committed first, then the windows are
+/// re-marked; a run cut in between leaves windows with the old host, and
+/// a second run re-marks them. A second run changes nothing else.
+fn rebind(ports: &Ports, host: &Host, session: &SessionName) -> Result<Rebound> {
+    let mut lock = ports.store.lock()?;
+    let bound: Vec<(String, Host)> = lock
+        .state()
+        .bindings()
+        .filter(|(_, b)| b.session() == session)
+        .map(|(ws, b)| (ws.to_owned(), b.host().clone()))
+        .collect();
+    let (workspace, old) = match bound.as_slice() {
+        [] => return Err(CommandError::NothingToRebind(session.clone()).into()),
+        [(workspace, old)] => (workspace.clone(), old.clone()),
+        several => {
+            let workspaces: Vec<&str> = several.iter().map(|(ws, _)| ws.as_str()).collect();
+            return Err(CommandError::BoundTwice {
+                session: session.clone(),
+                workspaces: workspaces.join(" and "),
+            }
+            .into());
+        }
+    };
+    if &old != host {
+        lock.state_mut().rebind(&workspace, host)?;
+        lock.commit()?;
+    }
+    let stale: Vec<(u64, Mark)> = window::i3mux_windows_in(&ports.sway.get_tree()?)
+        .into_iter()
+        .filter(|(_, mark)| mark.terminal().session() == session && mark.host() != host)
+        .collect();
+    for (con_id, mark) in &stale {
+        let new = Mark::new(host.clone(), mark.terminal().clone());
+        ports.sway.run(&window::unmark_command(*con_id, mark))?;
+        ports.sway.run(&window::mark_command(*con_id, &new))?;
+    }
+    Ok(Rebound {
+        workspace,
+        from: (&old != host).then_some(old),
+        remarked: stale.len(),
+    })
 }
 
 /// The saved sessions of the host that are not bound on this machine.
