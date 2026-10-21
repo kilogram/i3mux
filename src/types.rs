@@ -12,6 +12,8 @@
 //! - [`TerminalName`]: always `{session}-{NNN}`. `Display` and `FromStr`
 //!   round-trip, and [`TerminalName::parse`] matches one session exactly
 //!   (plan rule 3).
+//! - [`WindowTemplate`]: a command line that splits into at least one word
+//!   (PLAN-terminal-here decision 2).
 
 use std::fmt;
 use std::str::FromStr;
@@ -27,6 +29,8 @@ pub enum InvalidName {
     Host { value: String, reason: &'static str },
     #[error("invalid terminal name '{0}': expected {{session}}-{{NNN}}, for example ws4-001")]
     Terminal(String),
+    #[error("invalid window command '{value}': {reason}")]
+    WindowCommand { value: String, reason: &'static str },
 }
 
 /// The name of an i3mux session, for example `ws4`.
@@ -256,6 +260,75 @@ impl TerminalName {
     }
 }
 
+/// A window command: what each window of a binding runs instead of i3mux's
+/// wrapper (PLAN-terminal-here decision 2). The text splits into words as a
+/// shell splits them (quotes, backslashes), and no shell runs it. In each
+/// word, [`WindowTemplate::SESSION`] becomes the session name and
+/// [`WindowTemplate::SHELL`] the shell name; any other text stays as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct WindowTemplate {
+    text: String,
+    words: Vec<String>,
+}
+
+impl WindowTemplate {
+    /// Replaced by the session name, for example `ws4`.
+    pub const SESSION: &'static str = "{session}";
+    /// Replaced by the shell name, for example `ws4-002`.
+    pub const SHELL: &'static str = "{shell}";
+
+    /// Validate `text` as a window command.
+    ///
+    /// # Errors
+    /// [`InvalidName::WindowCommand`] if its quotes do not close, or it has
+    /// no word.
+    pub fn new(text: impl Into<String>) -> Result<Self, InvalidName> {
+        let text = text.into();
+        let invalid = |reason| InvalidName::WindowCommand {
+            value: text.clone(),
+            reason,
+        };
+        let words = shell_words::split(&text).map_err(|_| invalid("a quote does not close"))?;
+        if words.is_empty() {
+            return Err(invalid("it has no command"));
+        }
+        Ok(Self { text, words })
+    }
+
+    /// The command as given.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// The argv of the window of `shell`.
+    #[must_use]
+    pub fn argv(&self, shell: &TerminalName) -> Vec<String> {
+        let (session, shell) = (shell.session().as_str(), shell.to_string());
+        self.words
+            .iter()
+            .map(|word| {
+                word.replace(Self::SESSION, session)
+                    .replace(Self::SHELL, &shell)
+            })
+            .collect()
+    }
+}
+
+impl TryFrom<String> for WindowTemplate {
+    type Error = InvalidName;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<WindowTemplate> for String {
+    fn from(template: WindowTemplate) -> Self {
+        template.text
+    }
+}
+
 /// Digits as `Display` writes them (`{:03}`), so parsing round-trips.
 fn parse_canonical_number(digits: &str) -> Option<u32> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -326,6 +399,35 @@ mod tests {
 
     fn session(name: &str) -> SessionName {
         SessionName::new(name).unwrap()
+    }
+
+    /// PLAN-terminal-here decision 2: the command splits as a shell splits
+    /// it, the placeholders become the names in every word they appear in,
+    /// other braces stay, and the text round-trips through serde.
+    #[test]
+    fn a_window_command_substitutes_the_session_and_the_shell() {
+        let template =
+            WindowTemplate::new(r#"my-window --name "{session} / {shell}" {shell} '{x}'"#).unwrap();
+        let shell = TerminalName::new(&session("ws4"), 2);
+        assert_eq!(
+            template.argv(&shell),
+            ["my-window", "--name", "ws4 / ws4-002", "ws4-002", "{x}"]
+        );
+        let json = serde_json::to_string(&template).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WindowTemplate>(&json).unwrap(),
+            template
+        );
+        for bad in ["", "   ", "sh -c 'open"] {
+            assert!(
+                matches!(
+                    WindowTemplate::new(bad),
+                    Err(InvalidName::WindowCommand { .. })
+                ),
+                "{bad:?}"
+            );
+            assert!(serde_json::from_str::<WindowTemplate>(&format!("{bad:?}")).is_err());
+        }
     }
 
     #[test]

@@ -29,3 +29,4 @@ mod layout_nested;
 mod layout_tabbed;
 mod sessions;
 mod terminal;
+mod window_command;

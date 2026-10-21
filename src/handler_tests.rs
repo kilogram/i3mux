@@ -31,6 +31,8 @@ struct HostState {
     stuck_clients: bool,
     /// Every `shpool detach` call, by its names.
     detach_calls: Vec<Vec<String>>,
+    /// Every shell made with `shpool attach -b`: its name and `-c` command.
+    created: Vec<(String, Option<String>)>,
 }
 
 impl HostState {
@@ -141,6 +143,18 @@ impl HostExec for FakeHost {
         if let Some(at) = argv.iter().position(|a| a == "kill") {
             for name in &argv[at + 1..] {
                 state.shells.remove(name);
+            }
+        }
+        if let Some(at) = argv.iter().position(|a| a == "attach") {
+            if argv.get(at + 1).is_some_and(|a| a == "-b") {
+                let name = argv.last().cloned().unwrap_or_default();
+                let tail = &argv[at..];
+                let cmd = tail
+                    .iter()
+                    .position(|a| a == "-c")
+                    .and_then(|c| tail.get(c + 1).cloned());
+                state.shells.entry(name.clone()).or_insert(false);
+                state.created.push((name, cmd));
             }
         }
         if let Some(at) = argv.iter().position(|a| a == "detach") {
@@ -562,13 +576,166 @@ fn terminal_in_unbound_workspace_is_refused() {
     );
 }
 
+// ------------------------------------------------------- window command
+
+fn template(text: &str) -> WindowTemplate {
+    WindowTemplate::new(text).unwrap()
+}
+
+impl World {
+    /// Bind `workspace` to `session` with the window command `command`.
+    fn bind_with(&self, workspace: &str, session: &str, command: &str) {
+        let binding = WorkspaceState::new(self.host.host().clone(), name(session))
+            .with_window_command(Some(template(command)));
+        self.store
+            .with_lock(|s| Ok(s.bind(workspace, binding)?))
+            .unwrap();
+    }
+
+    fn created(&self) -> Vec<(String, Option<String>)> {
+        self.host.state.lock().unwrap().created.clone()
+    }
+
+    fn launches(&self) -> Vec<WindowCommand> {
+        self.launcher.launches.lock().unwrap().clone()
+    }
+}
+
+/// PLAN-terminal-here decision 2: `activate --window-command` stores the
+/// command in the binding, makes the first shell without attaching it, and
+/// runs the command, with the names, instead of the wrapper.
+#[test]
+fn activate_runs_the_window_command_in_the_first_window() {
+    let world = World::new(Host::Local);
+    let (_, choice) = activate(
+        &world.ports(),
+        &Host::Local,
+        &workspace("4", 4),
+        None,
+        Some(template("my-window --session {session} {shell}")),
+    )
+    .unwrap();
+
+    assert_eq!(choice, Choice::Create(t("ws4", 1)));
+    assert_eq!(world.created(), [("ws4-001".to_owned(), None)]);
+    assert_eq!(
+        world.launches(),
+        [WindowCommand::Custom(
+            ["my-window", "--session", "ws4", "ws4-001"]
+                .map(str::to_owned)
+                .to_vec()
+        )]
+    );
+    assert_eq!(
+        world.window_numbers("ws4"),
+        [1],
+        "the window keeps its mark"
+    );
+    let binding = world.store.load().unwrap().get("4").cloned().unwrap();
+    assert_eq!(
+        binding.window_command().unwrap().as_str(),
+        "my-window --session {session} {shell}"
+    );
+}
+
+/// `terminal` runs the window command too: an orphan is shown as it is,
+/// and a new shell (here with `-e`) is made first, with its command.
+#[test]
+fn terminal_runs_the_window_command_and_makes_a_new_shell_first() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    world.host.add_shell("ws4-001", false);
+
+    let orphan = open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+    let request = TerminalRequest {
+        command: Some("htop".into()),
+        ..TerminalRequest::default()
+    };
+    let fresh = open_terminal(&world.ports(), "4", &request).unwrap();
+
+    assert_eq!(orphan, Choice::Reattach(t("ws4", 1)));
+    assert_eq!(fresh, Choice::Create(t("ws4", 2)));
+    assert_eq!(
+        world.created(),
+        [("ws4-002".to_owned(), Some("htop".to_owned()))],
+        "an orphan is never made again"
+    );
+    assert_eq!(
+        world.launches(),
+        [
+            WindowCommand::Custom(vec!["w".into(), "ws4-001".into()]),
+            WindowCommand::Custom(vec!["w".into(), "ws4-002".into()]),
+        ]
+    );
+}
+
+/// `detach` saves the window command with the layout, and `attach` binds
+/// with it again and runs it in every window, making the shells the host
+/// lost.
+#[test]
+fn detach_and_attach_keep_the_window_command() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    world.host.add_shell("ws4-001", true);
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+    world.host.state.lock().unwrap().detach_lag = 0;
+    detach(&world.ports(), "4", 0).unwrap();
+    world.host.state.lock().unwrap().shells.clear();
+
+    attach(&world.ports(), &Host::Local, "4", Some(name("ws4")), false).unwrap();
+
+    let binding = world.store.load().unwrap().get("4").cloned().unwrap();
+    assert_eq!(binding.window_command().unwrap().as_str(), "w {shell}");
+    assert_eq!(world.created(), [("ws4-001".to_owned(), None)]);
+    assert_eq!(
+        world.launches(),
+        [WindowCommand::Custom(vec!["w".into(), "ws4-001".into()])]
+    );
+}
+
+/// `open` shows a shell that another program made through the window
+/// command of the workspace bound to its session; the shell is not made
+/// again.
+#[test]
+fn open_runs_the_window_command() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {session} {shell}");
+    world.host.add_shell("ws4-007", false);
+
+    open(&world.ports(), &Host::Local, &t("ws4", 7), false).unwrap();
+
+    assert!(world.created().is_empty());
+    assert_eq!(
+        world.launches(),
+        [WindowCommand::Custom(vec![
+            "w".into(),
+            "ws4".into(),
+            "ws4-007".into()
+        ])]
+    );
+}
+
+#[test]
+fn status_names_the_window_command() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    let report = status(&world.ports(), "4").unwrap().unwrap();
+    assert_eq!(
+        format_status(&report),
+        [
+            "ws4  (local)  workspace 4, 0 windows",
+            "  window command: w {shell}"
+        ]
+    );
+}
+
 // ------------------------------------------------------------- activate
 
 #[test]
 fn activate_binds_and_opens_the_first_terminal() {
     let world = World::new(Host::Local);
     let (session, choice) =
-        activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+        activate(&world.ports(), &Host::Local, &workspace("4", 4), None, None).unwrap();
     assert_eq!(session, name("ws4"));
     assert_eq!(choice, Choice::Create(t("ws4", 1)));
     assert_eq!(
@@ -584,7 +751,7 @@ fn activate_on_unreachable_host_binds_nothing() {
     let remote = Host::Ssh(RemoteHost::new("deepthought").unwrap());
     let world = World::new(remote.clone());
     world.host.state.lock().unwrap().unreachable = true;
-    let err = activate(&world.ports(), &remote, &workspace("4", 4), None).unwrap_err();
+    let err = activate(&world.ports(), &remote, &workspace("4", 4), None, None).unwrap_err();
     assert!(err.to_string().contains("cannot reach"), "{err:#}");
     assert_eq!(world.store.load().unwrap().bindings().count(), 0);
 }
@@ -592,21 +759,36 @@ fn activate_on_unreachable_host_binds_nothing() {
 #[test]
 fn activate_named_workspace_uses_its_name_as_session() {
     let world = World::new(Host::Local);
-    let (session, _) = activate(&world.ports(), &Host::Local, &workspace("q", -1), None).unwrap();
+    let (session, _) = activate(
+        &world.ports(),
+        &Host::Local,
+        &workspace("q", -1),
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(session, name("q"));
 }
 
 #[test]
 fn activate_numbered_workspace_uses_ws_prefix() {
     let world = World::new(Host::Local);
-    let (session, _) = activate(&world.ports(), &Host::Local, &workspace("4", 4), None).unwrap();
+    let (session, _) =
+        activate(&world.ports(), &Host::Local, &workspace("4", 4), None, None).unwrap();
     assert_eq!(session, name("ws4"));
 }
 
 #[test]
 fn activate_workspace_with_invalid_name_needs_a_session_name() {
     let world = World::new(Host::Local);
-    let err = activate(&world.ports(), &Host::Local, &workspace("a:b", -1), None).unwrap_err();
+    let err = activate(
+        &world.ports(),
+        &Host::Local,
+        &workspace("a:b", -1),
+        None,
+        None,
+    )
+    .unwrap_err();
     assert!(
         matches!(command_error(&err), CommandError::NoDefaultSession { workspace, .. } if workspace == "a:b")
     );
@@ -616,6 +798,7 @@ fn activate_workspace_with_invalid_name_needs_a_session_name() {
         &Host::Local,
         &workspace("a:b", -1),
         Some(name("notes")),
+        None,
     )
     .unwrap();
     assert_eq!(session, name("notes"));

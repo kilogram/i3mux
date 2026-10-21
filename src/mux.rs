@@ -253,6 +253,25 @@ pub fn attach_argv(
     host.attach_argv(&shpool_argv(&args))
 }
 
+/// Make shell `name` on `host` without attaching it: `shpool attach -b`,
+/// running `cmd` (split by shpool with shell-words rules) instead of the
+/// login shell if given. The caller knows the shell does not exist: on an
+/// existing name, shpool would attach that shell and ignore `cmd`.
+///
+/// # Errors
+/// As [`list`].
+pub fn create(host: &dyn HostExec, name: &TerminalName, cmd: Option<&str>) -> Result<(), MuxError> {
+    let name = name.to_string();
+    let mut args = vec!["attach", "-b"];
+    if let Some(cmd) = cmd {
+        args.extend(["-c", cmd]);
+    }
+    args.push(&name);
+    host.run(&shpool_argv(&args), None)
+        .map(drop)
+        .map_err(|err| classify(host.host(), err))
+}
+
 /// Kill the given shells. Shells that are already gone are not an error.
 ///
 /// # Errors

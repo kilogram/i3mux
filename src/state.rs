@@ -26,19 +26,40 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Host, SessionName};
+use crate::types::{Host, SessionName, WindowTemplate};
 
 /// What a workspace is bound to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     host: Host,
     session: SessionName,
+    /// What each window of the workspace runs instead of i3mux's wrapper
+    /// (PLAN-terminal-here decision 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_command: Option<WindowTemplate>,
 }
 
 impl WorkspaceState {
     #[must_use]
     pub fn new(host: Host, session: SessionName) -> Self {
-        Self { host, session }
+        Self {
+            host,
+            session,
+            window_command: None,
+        }
+    }
+
+    /// This binding, with `window_command` as its window command.
+    #[must_use]
+    pub fn with_window_command(mut self, window_command: Option<WindowTemplate>) -> Self {
+        self.window_command = window_command;
+        self
+    }
+
+    /// The window command, if the binding has one.
+    #[must_use]
+    pub fn window_command(&self) -> Option<&WindowTemplate> {
+        self.window_command.as_ref()
     }
 
     #[must_use]
@@ -431,6 +452,30 @@ mod tests {
             json,
             serde_json::json!({"workspaces": {"4": {"host": "user@host", "session": "mysession"}}})
         );
+    }
+
+    /// PLAN-terminal-here decision 2: a binding keeps its window command
+    /// across a save, and a binding without one writes no field, so a file
+    /// of an earlier i3mux reads the same.
+    #[test]
+    fn a_window_command_is_saved_with_its_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let command = crate::types::WindowTemplate::new("w {shell}").unwrap();
+        let mut state = LocalState::default();
+        state
+            .bind(
+                "4",
+                binding(remote(), "ws4").with_window_command(Some(command.clone())),
+            )
+            .unwrap();
+        state.bind("5", binding(Host::Local, "ws5")).unwrap();
+        store.save(&state).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.get("4").unwrap().window_command(), Some(&command));
+        assert_eq!(loaded.get("5").unwrap().window_command(), None);
+        let text = fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert_eq!(text.matches("window_command").count(), 1, "{text}");
     }
 
     #[test]

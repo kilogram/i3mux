@@ -34,6 +34,7 @@ for_window [con_mark="^_i3mux:"] border normal 2
 ```bash
 i3mux activate                    # bind focused workspace to a local session, open a shell
 i3mux activate --remote dev-box   # same, shells run on dev-box over ssh
+i3mux activate --window-command 'CMD {shell}'  # each window runs CMD (see "Window commands")
 i3mux terminal                    # another shell (reattaches an orphan first)
 i3mux terminal --new              # always a fresh shell
 i3mux terminal -e htop            # run a command in a fresh persistent shell
@@ -85,6 +86,32 @@ window stays open with a hint until you press Enter: the shell may be
 attached from another terminal. `i3mux terminal --no-hold` opens a window
 that closes as soon as its shell ends or is detached, with the shell's
 exit status, like tmux's `remain-on-exit off`.
+
+## Window commands
+
+A workspace can give each of its windows a command of your own, run
+instead of i3mux's attach:
+
+```bash
+i3mux activate --window-command 'my-window --shell {shell}'
+```
+
+- i3mux splits the command into words as a shell does (quotes and
+  backslashes), but runs no shell: no variables, pipes or `~`. In each
+  word, `{session}` becomes the session name (`ws3`) and `{shell}` the
+  name of the window's shell (`ws3-002`). Other text stays as it is.
+- `terminal`, `attach` and `open` run it in every window they open in the
+  workspace. The window keeps its mark, so `detach`, `kill`, `sessions`
+  and `status` count it as one of the session's windows.
+- i3mux makes a new shell first, without attaching it (`shpool attach
+  -b`, with the `-e` command if one is given). The command attaches the
+  shell itself, for example with `i3mux terminal --here --shell {shell}`
+  (see "Join a session from any terminal"), which ignores the window
+  command. When the command ends, the window ends: there is no hint.
+- There is no `{host}`: `attach --rebind-only` can move the binding to
+  another host, and `terminal --here` reads the host from the binding.
+- `detach` saves the command with the layout, `attach` binds with it
+  again, and `i3mux status` shows it.
 
 ## Shells made by other programs
 

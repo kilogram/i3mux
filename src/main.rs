@@ -46,7 +46,7 @@ use serde_json::Value;
 use session::{SavedSession, SessionError};
 use state::{StateStore, WorkspaceState};
 use sway_ops::Sway;
-use types::{Host, InvalidName, RemoteHost, SessionName, TerminalName};
+use types::{Host, InvalidName, RemoteHost, SessionName, TerminalName, WindowTemplate};
 use window::Mark;
 use wm::{Wm, WorkspaceInfo};
 
@@ -89,6 +89,11 @@ enum CliCommand {
         /// Session name [default: wsN for workspace N]
         #[arg(short, long)]
         session: Option<String>,
+        /// Each window of this workspace runs CMD instead of i3mux's own
+        /// attach; {session} and {shell} in CMD become the session and the
+        /// shell names
+        #[arg(long, value_name = "CMD")]
+        window_command: Option<String>,
     },
     /// Open a terminal: a persistent shell in a bound workspace, else a plain terminal
     Terminal {
@@ -284,7 +289,11 @@ fn dispatch(
     command: CliCommand,
 ) -> Result<ExitCode> {
     match command {
-        CliCommand::Activate { remote, session } => cmd_activate(ports, wm, remote, session),
+        CliCommand::Activate {
+            remote,
+            session,
+            window_command,
+        } => cmd_activate(ports, wm, remote, session, window_command),
         CliCommand::Terminal {
             exec,
             new,
@@ -431,11 +440,13 @@ fn cmd_activate(
     wm: &Wm,
     remote: Option<String>,
     session: Option<String>,
+    window_command: Option<String>,
 ) -> Result<ExitCode> {
     let host = Host::from_remote_arg(remote)?;
     let session = parse_session(session)?;
+    let window_command = window_command.map(WindowTemplate::new).transpose()?;
     let workspace = wm.focused_workspace()?;
-    let (session, choice) = activate(ports, &host, &workspace, session)?;
+    let (session, choice) = activate(ports, &host, &workspace, session, window_command)?;
     println!(
         "✓ Workspace {} bound to session '{session}' on {host}",
         workspace.name()
@@ -627,25 +638,30 @@ fn default_session(workspace: &WorkspaceInfo) -> Result<SessionName, CommandErro
         workspace: workspace.name().to_owned(),
         reason: match err {
             InvalidName::Session { reason, .. } => reason,
-            InvalidName::Host { .. } | InvalidName::Terminal(_) => "invalid name",
+            InvalidName::Host { .. }
+            | InvalidName::Terminal(_)
+            | InvalidName::WindowCommand { .. } => "invalid name",
         },
     })
 }
 
-/// Bind `workspace` to `session` on `host`, then open its first terminal.
-/// The host is checked (reachable, shpool installed) before anything is bound.
+/// Bind `workspace` to `session` on `host`, with `window_command` for its
+/// windows, then open its first terminal. The host is checked (reachable,
+/// shpool installed) before anything is bound.
 fn activate(
     ports: &Ports,
     host: &Host,
     workspace: &WorkspaceInfo,
     session: Option<SessionName>,
+    window_command: Option<WindowTemplate>,
 ) -> Result<(SessionName, Choice)> {
     let session = match session {
         Some(session) => session,
         None => default_session(workspace)?,
     };
     mux::list((ports.hosts)(host).as_ref())?;
-    let binding = WorkspaceState::new(host.clone(), session.clone());
+    let binding =
+        WorkspaceState::new(host.clone(), session.clone()).with_window_command(window_command);
     ports
         .store
         .with_lock(|state| Ok(state.bind(workspace.name(), binding)?))?;
@@ -688,15 +704,36 @@ fn open_terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> R
         ports,
         host.as_ref(),
         choice.name(),
-        request.force,
-        request.command.as_deref(),
-        WrapperOptions {
-            no_hold: request.no_hold,
-            attach_only: false,
+        &WindowSpec {
+            force: request.force,
+            command: request.command.as_deref(),
+            options: WrapperOptions {
+                no_hold: request.no_hold,
+                attach_only: false,
+            },
+            template: binding.window_command(),
+            exists: matches!(choice, Choice::Reattach(_)),
         },
     )?;
     drop(lock);
     Ok(choice)
+}
+
+/// How a window shows its shell.
+#[derive(Debug, Default)]
+struct WindowSpec<'a> {
+    /// Take the shell over from any other client.
+    force: bool,
+    /// What a new shell runs instead of the login shell.
+    command: Option<&'a str>,
+    /// How the wrapper ends the window.
+    options: WrapperOptions,
+    /// The binding's window command, run instead of the wrapper
+    /// (PLAN-terminal-here decision 2).
+    template: Option<&'a WindowTemplate>,
+    /// The shell runs already. With a window command, i3mux makes a missing
+    /// shell first, so that the command can attach it.
+    exists: bool,
 }
 
 /// Launch the window of `terminal` and mark it; return its container id.
@@ -704,19 +741,25 @@ fn open_window(
     ports: &Ports,
     host: &dyn HostExec,
     terminal: &TerminalName,
-    force: bool,
-    command: Option<&str>,
-    options: WrapperOptions,
+    spec: &WindowSpec,
 ) -> Result<u64> {
     let mark = Mark::new(host.host().clone(), terminal.clone());
-    let window = window_command(ports, host, terminal, force, command)?;
+    let window = match spec.template {
+        Some(template) => {
+            if !spec.exists {
+                mux::create(host, terminal, spec.command)?;
+            }
+            WindowCommand::Custom(template.argv(terminal))
+        }
+        None => window_command(ports, host, terminal, spec.force, spec.command)?,
+    };
     ports
         .log
         .debug(|| format!("opening {mark}: {}", shell_words::join(window.argv())));
     let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
     ports
         .launcher
-        .spawn(&mark.app_id(), &title, &window, options)?;
+        .spawn(&mark.app_id(), &title, &window, spec.options)?;
     sway_ops::wait_for_window_and_mark(ports.sway, &mark)
 }
 
@@ -776,6 +819,11 @@ fn open(ports: &Ports, host: &Host, terminal: &TerminalName, force: bool) -> Res
             session: terminal.session().clone(),
             host: host.clone(),
         })?;
+    let template = lock
+        .state()
+        .get(&workspace)
+        .and_then(WorkspaceState::window_command)
+        .cloned();
     if window::session_terminals(&ports.sway.get_tree()?, host, terminal.session())
         .contains(terminal)
     {
@@ -796,9 +844,12 @@ fn open(ports: &Ports, host: &Host, terminal: &TerminalName, force: bool) -> Res
         ports,
         exec.as_ref(),
         terminal,
-        force,
-        None,
-        WrapperOptions::default(),
+        &WindowSpec {
+            force,
+            template: template.as_ref(),
+            exists: true,
+            ..WindowSpec::default()
+        },
     )?;
     ports
         .sway
@@ -843,7 +894,8 @@ fn detach(ports: &Ports, workspace: &str, saved_at_unix: u64) -> Result<Detached
             workspace: workspace.to_owned(),
             session: name.clone(),
         })?;
-    let saved = SavedSession::new(name.clone(), host.clone(), layout, saved_at_unix)?;
+    let saved = SavedSession::new(name.clone(), host.clone(), layout, saved_at_unix)?
+        .with_window_command(binding.window_command().cloned());
     let exec = (ports.hosts)(host);
     session::save(exec.as_ref(), &saved)?;
     let closed = sway_ops::kill_all(ports.sway, host, name)?;
@@ -948,20 +1000,22 @@ fn attach(
     {
         return Err(CommandError::WorkspaceHasTerminals(workspace.to_owned()).into());
     }
-    lock.state_mut()
-        .bind(workspace, WorkspaceState::new(host.clone(), name.clone()))?;
+    let template = saved.window_command();
+    lock.state_mut().bind(
+        workspace,
+        WorkspaceState::new(host.clone(), name.clone()).with_window_command(template.cloned()),
+    )?;
     lock.commit()?;
     for step in layout::restore_plan(saved.layout()) {
         match step {
             Step::Launch(terminal) => {
-                open_window(
-                    ports,
-                    exec.as_ref(),
-                    &terminal,
+                let spec = WindowSpec {
                     force,
-                    None,
-                    WrapperOptions::default(),
-                )?;
+                    template,
+                    exists: find(&terminal).is_some(),
+                    ..WindowSpec::default()
+                };
+                open_window(ports, exec.as_ref(), &terminal, &spec)?;
             }
             Step::Sway(command) => ports.sway.run(command)?,
         }
@@ -1164,6 +1218,8 @@ struct StatusReport {
     row: SessionRow,
     /// The state of a remote host's ssh master; `None` for this machine.
     connection: Option<MasterState>,
+    /// The binding's window command, if it has one.
+    window_command: Option<WindowTemplate>,
 }
 
 /// The session bound to `workspace`, its window count, and the state of
@@ -1181,6 +1237,7 @@ fn status(ports: &Ports, workspace: &str) -> Result<Option<StatusReport>> {
         Host::Ssh(remote) => Some(ports.masters.state(remote)?),
     };
     Ok(Some(StatusReport {
+        window_command: binding.window_command().cloned(),
         row: SessionRow {
             name: binding.session().clone(),
             host: binding.host().clone(),
@@ -1194,12 +1251,16 @@ fn status(ports: &Ports, workspace: &str) -> Result<Option<StatusReport>> {
     }))
 }
 
-/// The row, then `  connection: ...` for a remote host. The first line is
-/// a `sessions` row; scripts/i3mux-rofi reads its first word and host.
+/// The row, then `  connection: ...` for a remote host and `  window
+/// command: ...` for a binding with one. The first line is a `sessions`
+/// row; scripts/i3mux-rofi reads its first word and host.
 fn format_status(report: &StatusReport) -> Vec<String> {
     let mut lines = format_rows(std::slice::from_ref(&report.row));
     if let Some(connection) = &report.connection {
         lines.push(format!("  connection: {connection}"));
+    }
+    if let Some(window_command) = &report.window_command {
+        lines.push(format!("  window command: {}", window_command.as_str()));
     }
     lines
 }

@@ -45,6 +45,9 @@ pub enum WindowCommand {
     /// Attach a remote shell through its host's ssh master, and recover when
     /// the connection drops.
     Remote(RemoteAttach),
+    /// The binding's window command (PLAN-terminal-here decision 2), run
+    /// as it is, without the wrapper.
+    Custom(Vec<String>),
 }
 
 impl WindowCommand {
@@ -52,7 +55,7 @@ impl WindowCommand {
     #[must_use]
     pub fn argv(&self) -> &[String] {
         match self {
-            Self::Plain(argv) => argv,
+            Self::Plain(argv) | Self::Custom(argv) => argv,
             Self::Remote(remote) => &remote.argv,
         }
     }
@@ -205,11 +208,17 @@ impl Launcher for TerminalLauncher {
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Result<()> {
+        let argv = match command {
+            WindowCommand::Custom(argv) => argv.clone(),
+            WindowCommand::Plain(_) | WindowCommand::Remote(_) => {
+                wrapper_argv(&self.wrapper, title, command, options)
+            }
+        };
         spawn_detached(&window_argv(
             &self.program,
             Some(app_id),
             Some(title),
-            &wrapper_argv(&self.wrapper, title, command, options),
+            &argv,
         ))
     }
 }

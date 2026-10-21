@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::host::{HostError, HostExec};
 use crate::layout::Layout;
-use crate::types::{Host, SessionName, TerminalName};
+use crate::types::{Host, SessionName, TerminalName, WindowTemplate};
 
 /// Directory of saved sessions, relative to the host user's home.
 const SESSIONS_DIR: &str = ".local/state/i3mux/sessions";
@@ -54,6 +54,10 @@ pub struct SavedSession {
     host: Host,
     layout: Layout,
     saved_at_unix: u64,
+    /// The window command of the binding it was detached from
+    /// (PLAN-terminal-here decision 2): `attach` binds with it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_command: Option<WindowTemplate>,
 }
 
 #[derive(Deserialize)]
@@ -62,12 +66,15 @@ struct SavedSessionFields {
     host: Host,
     layout: Layout,
     saved_at_unix: u64,
+    #[serde(default)]
+    window_command: Option<WindowTemplate>,
 }
 
 impl TryFrom<SavedSessionFields> for SavedSession {
     type Error = SessionError;
     fn try_from(f: SavedSessionFields) -> Result<Self, Self::Error> {
-        Self::new(f.name, f.host, f.layout, f.saved_at_unix)
+        Ok(Self::new(f.name, f.host, f.layout, f.saved_at_unix)?
+            .with_window_command(f.window_command))
     }
 }
 
@@ -98,12 +105,26 @@ impl SavedSession {
             host,
             layout,
             saved_at_unix,
+            window_command: None,
         })
+    }
+
+    /// This save, with the binding's window command.
+    #[must_use]
+    pub fn with_window_command(mut self, window_command: Option<WindowTemplate>) -> Self {
+        self.window_command = window_command;
+        self
     }
 
     #[must_use]
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// The window command of the binding it was detached from.
+    #[must_use]
+    pub fn window_command(&self) -> Option<&WindowTemplate> {
+        self.window_command.as_ref()
     }
 }
 
@@ -230,6 +251,25 @@ mod tests {
         assert!(delete(&host, &name("ws4")).unwrap());
         assert!(!delete(&host, &name("ws4")).unwrap());
         assert_eq!(list(&host).unwrap(), [name("ws7")]);
+    }
+
+    /// PLAN-terminal-here decision 2: a save keeps the binding's window
+    /// command; a save without one, as an earlier i3mux wrote it, loads.
+    #[test]
+    fn a_save_keeps_the_window_command() {
+        let home = tempfile::tempdir().unwrap();
+        let host = local(home.path());
+        let command = WindowTemplate::new("w {shell}").unwrap();
+        save(
+            &host,
+            &saved("ws4").with_window_command(Some(command.clone())),
+        )
+        .unwrap();
+        save(&host, &saved("ws5")).unwrap();
+        let ws4 = load(&host, &name("ws4")).unwrap().unwrap();
+        let ws5 = load(&host, &name("ws5")).unwrap().unwrap();
+        assert_eq!(ws4.window_command(), Some(&command));
+        assert_eq!(ws5.window_command(), None);
     }
 
     #[test]
