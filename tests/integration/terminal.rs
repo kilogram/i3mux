@@ -150,7 +150,7 @@ fn remote_shell_survives_its_window_closing() -> Result<()> {
     assert_eq!(
         env.i3mux().sessions(session)?,
         [format!(
-            "{NAME}  ({})  0 windows, 1 orphan",
+            "{NAME}  ({})  workspace {WS}, 0 windows, 1 orphan",
             session.host_label()
         )]
     );
