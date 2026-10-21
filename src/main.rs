@@ -124,6 +124,16 @@ enum CliCommand {
     },
     /// Show the session of the focused workspace and its ssh connection, without contacting its host
     Status,
+    /// Open a window on an existing shell, in the workspace bound to its session
+    Open {
+        /// The host that runs the shell [default: this machine]
+        #[arg(short, long)]
+        remote: Option<String>,
+        #[arg(long, help = FORCE_HELP)]
+        force: bool,
+        /// The shell: {session}-{NNN}, for example ws4-003
+        shell: String,
+    },
     /// End a session: close its windows, kill its shells, delete its saved layout
     Kill {
         /// The host that runs the shells [default: this machine]
@@ -192,6 +202,13 @@ enum CommandError {
     NoSavedSessions(Host),
     #[error("No session '{session}' on {host}")]
     NoSuchSession { session: SessionName, host: Host },
+    #[error(
+        "No workspace is bound to session '{session}' on {host}; run 'i3mux activate{} --session {session}' in the workspace that should show it",
+        remote_flag(.host)
+    )]
+    NotBound { session: SessionName, host: Host },
+    #[error("No shell '{terminal}' on {host}; run 'i3mux sessions{}' to list sessions", remote_flag(.host))]
+    NoSuchShell { terminal: TerminalName, host: Host },
     #[error(
         "Session '{session}' is detached, but the windows of session {session} did not \
          disconnect from their shells ({terminals}) within {waited_ms} ms; \
@@ -279,6 +296,11 @@ fn dispatch(
         } => cmd_attach(ports, wm, remote, session, force),
         CliCommand::Sessions { remote, all } => cmd_sessions(ports, remote, all),
         CliCommand::Status => cmd_status(ports, wm),
+        CliCommand::Open {
+            remote,
+            force,
+            shell,
+        } => cmd_open(ports, remote, &shell, force),
         CliCommand::Kill { remote, session } => cmd_kill(ports, wm, remote, session),
     }
 }
@@ -351,6 +373,15 @@ fn terminal_program() -> String {
         .ok()
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "foot".to_owned())
+}
+
+/// ` --remote HOST` for a remote host, else nothing: the flag a message
+/// tells the user to pass.
+fn remote_flag(host: &Host) -> String {
+    match host {
+        Host::Local => String::new(),
+        Host::Ssh(remote) => format!(" --remote {remote}"),
+    }
 }
 
 fn parse_session(session: Option<String>) -> Result<Option<SessionName>> {
@@ -479,6 +510,20 @@ fn cmd_status(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
     };
     for line in format_status(&report) {
         println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_open(ports: &Ports, remote: Option<String>, shell: &str, force: bool) -> Result<ExitCode> {
+    let host = Host::from_remote_arg(remote)?;
+    let terminal: TerminalName = shell.parse()?;
+    match open(ports, &host, &terminal, force)? {
+        Opened::Window(workspace) => {
+            println!("✓ Opened shell {terminal} of {host} in workspace {workspace}");
+        }
+        Opened::AlreadyOpen(workspace) => {
+            println!("✓ Shell {terminal} of {host} already has a window in workspace {workspace}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -618,14 +663,14 @@ fn open_terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> R
     Ok(choice)
 }
 
-/// Launch the window of `terminal` and mark it.
+/// Launch the window of `terminal` and mark it; return its container id.
 fn open_window(
     ports: &Ports,
     host: &dyn HostExec,
     terminal: &TerminalName,
     force: bool,
     command: Option<&str>,
-) -> Result<()> {
+) -> Result<u64> {
     let mark = Mark::new(host.host().clone(), terminal.clone());
     let window = window_command(ports, host, terminal, force, command)?;
     ports
@@ -633,8 +678,7 @@ fn open_window(
         .debug(|| format!("opening {mark}: {}", shell_words::join(window.argv())));
     let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
     ports.launcher.spawn(&mark.app_id(), &title, &window)?;
-    sway_ops::wait_for_window_and_mark(ports.sway, &mark)?;
-    Ok(())
+    sway_ops::wait_for_window_and_mark(ports.sway, &mark)
 }
 
 /// What the window of `terminal` runs. A remote window goes through its
@@ -662,6 +706,59 @@ fn window_command(
             shell: terminal.clone(),
         }),
     })
+}
+
+/// What `open` did.
+#[derive(Debug, PartialEq, Eq)]
+enum Opened {
+    /// A new window shows the shell, in this workspace.
+    Window(String),
+    /// The shell already had a window here, in this workspace.
+    AlreadyOpen(String),
+}
+
+/// Open a window on `terminal`, an existing shell of `host`, in the
+/// workspace bound to its session.
+///
+/// Another program may make the shell (README, "Shells made by other
+/// programs"); `open` never creates one. Under the state lock, as
+/// [`open_terminal`]: a concurrent `terminal` never reattaches the same
+/// shell. The binding is read before the host is asked, so a session that
+/// no workspace shows touches no host. A shell that has a window here gets
+/// no second one. The window opens where Sway puts new windows, then moves
+/// to the bound workspace; focus stays where it was.
+fn open(ports: &Ports, host: &Host, terminal: &TerminalName, force: bool) -> Result<Opened> {
+    let lock = ports.store.lock()?;
+    let workspace = lock
+        .state()
+        .workspace_of(host, terminal.session())
+        .map(str::to_owned)
+        .ok_or_else(|| CommandError::NotBound {
+            session: terminal.session().clone(),
+            host: host.clone(),
+        })?;
+    if window::session_terminals(&ports.sway.get_tree()?, host, terminal.session())
+        .contains(terminal)
+    {
+        return Ok(Opened::AlreadyOpen(workspace));
+    }
+    let exec = (ports.hosts)(host);
+    let shell = mux::list(exec.as_ref())?
+        .into_iter()
+        .find(|s| s.name() == terminal)
+        .ok_or_else(|| CommandError::NoSuchShell {
+            terminal: terminal.clone(),
+            host: host.clone(),
+        })?;
+    if shell.is_attached() && !force {
+        return Err(CommandError::AlreadyAttached(terminal.clone()).into());
+    }
+    let con_id = open_window(ports, exec.as_ref(), terminal, force, None)?;
+    ports
+        .sway
+        .run(&window::move_to_workspace_command(con_id, &workspace))?;
+    drop(lock);
+    Ok(Opened::Window(workspace))
 }
 
 #[derive(Debug)]
@@ -810,7 +907,9 @@ fn attach(
     lock.commit()?;
     for step in layout::restore_plan(saved.layout()) {
         match step {
-            Step::Launch(terminal) => open_window(ports, exec.as_ref(), &terminal, force, None)?,
+            Step::Launch(terminal) => {
+                open_window(ports, exec.as_ref(), &terminal, force, None)?;
+            }
             Step::Sway(command) => ports.sway.run(command)?,
         }
     }

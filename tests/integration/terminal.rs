@@ -45,6 +45,41 @@ fn next_terminal_reattaches_the_shell_of_a_closed_window(#[case] session: Sessio
     Ok(())
 }
 
+/// A shell that another program made on the host shows in the workspace
+/// bound to its session, while another workspace has the focus, and it is
+/// the same shell: `i3mux open` (README, "Shells made by other programs").
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote)]
+fn open_shows_a_shell_that_another_program_made(#[case] session: Session) -> Result<()> {
+    let env = TestEnvironment::new()?;
+    env.activate(session, WS)?;
+    let made = terminal(NAME, 7);
+    env.make_host_shell(session, &made, "sleep 100000")?;
+    wait_until("the made shell is disconnected", || {
+        Ok(env.shell(session, &made)?.is_some_and(|s| !s.attached))
+    })?;
+    let pid = env.shell(session, &made)?.unwrap().pid;
+    env.focus_workspace(1)?;
+
+    env.i3mux()
+        .run(&format!("open{} {made}", session.remote_flag()))?
+        .ok()?;
+
+    assert_eq!(
+        env.marks(WS)?,
+        [session.mark(NAME, 1), session.mark(NAME, 7)]
+    );
+    assert!(
+        env.marks(1)?.is_empty(),
+        "the window moved to workspace {WS}"
+    );
+    let shell = env.shell(session, &made)?.unwrap();
+    assert!(shell.attached);
+    assert_eq!(shell.pid, pid, "open shows the shell, it never replaces it");
+    Ok(())
+}
+
 /// `terminal --new` starts a new shell even when an orphan exists.
 #[test]
 fn terminal_new_skips_orphans() -> Result<()> {

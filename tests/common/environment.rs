@@ -167,6 +167,25 @@ impl TestEnvironment {
         Ok(shells)
     }
 
+    /// Make shell `name` on `session`'s host running `command`, as another
+    /// program does (README, "Shells made by other programs").
+    pub fn make_host_shell(&self, session: Session, name: &str, command: &str) -> Result<()> {
+        let home = session.home();
+        let cmd = format!(
+            "shpool --socket {home}/.local/run/i3mux/shpool.socket \
+             --config-file {home}/.config/i3mux/shpool.toml attach -b -c {} {name}",
+            shell_words::quote(command)
+        );
+        let output = self.exec_on_host(session, &cmd)?;
+        if !output.status.success() {
+            bail!(
+                "shpool attach -b {name} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
     /// End shell `name` on `session`'s host, as a reboot would.
     pub fn kill_host_shell(&self, session: Session, name: &str) -> Result<()> {
         let cmd = format!(

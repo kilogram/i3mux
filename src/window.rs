@@ -144,6 +144,15 @@ pub fn mark_command(con_id: u64, mark: &Mark) -> String {
     format!("[con_id={con_id}] mark --add \"{mark}\"")
 }
 
+/// `[con_id=N] move container to workspace "NAME"`: the command that moves
+/// window `con_id` to the workspace called `name`, which Sway creates if it
+/// does not exist. `"` and `\` in the name are escaped.
+#[must_use]
+pub fn move_to_workspace_command(con_id: u64, name: &str) -> String {
+    let quoted = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[con_id={con_id}] move container to workspace \"{quoted}\"")
+}
+
 /// `[con_mark="^_i3mux:{host}:{session}-[0-9]+$"] kill`: the one command
 /// that closes every window of a session. Anchored at both ends so session
 /// `ws4` never matches the windows of session `ws4-x`.
@@ -338,6 +347,18 @@ mod tests {
         add_mark(&mut tree, 1019, &mark(&Host::Local, "ws3", 1).to_string());
         assert_eq!(find_by_app_id(&tree, "Alacritty"), Some(1001));
         assert_eq!(find_by_app_id(&tree, "nothing"), None);
+    }
+
+    #[test]
+    fn move_command_quotes_the_workspace_name() {
+        assert_eq!(
+            move_to_workspace_command(7, "4"),
+            "[con_id=7] move container to workspace \"4\""
+        );
+        assert_eq!(
+            move_to_workspace_command(7, r#"a "b" \c"#),
+            r#"[con_id=7] move container to workspace "a \"b\" \\c""#
+        );
     }
 
     #[test]

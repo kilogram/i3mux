@@ -43,6 +43,7 @@ i3mux sessions [--remote host]    # what exists, where, and in what state
 i3mux sessions --all              # this machine and every host a workspace is bound to
 i3mux status                      # the focused workspace's session and ssh connection (exit 3 if none)
 i3mux kill --session ws3          # kill the shells and forget the layout
+i3mux open --remote dev-box ws3-004  # show an existing shell in the workspace bound to ws3
 ```
 
 The default session name is `ws` plus the workspace number, or the
@@ -79,6 +80,33 @@ on `activate`, `attach` and `kill`.
 
 Closing a window never kills a shell. Only `exit` in the shell or
 `i3mux kill` does.
+
+## Shells made by other programs
+
+A program on a host can start a shell that i3mux shows, such as a job
+that must outlive any window. This is the whole contract:
+
+1. Make the shell in i3mux's shpool daemon on the host:
+   `shpool --socket ~/.local/run/i3mux/shpool.socket --config-file
+   ~/.config/i3mux/shpool.toml attach -b [-d DIR] [-c CMD] NAME`.
+   If no daemon runs, `attach -b` starts one, and i3mux uses it from then
+   on. i3mux writes the config file the first time it runs a command on
+   the host; the program never writes it.
+2. `NAME` is `{session}-{NNN}`. The session is the one bound to the
+   workspace that should show the shell. The number is one more than the
+   highest live shell of that session in `shpool list`, as `i3mux
+   terminal --new` picks it.
+3. `i3mux open [--remote HOST] NAME` shows the shell in the workspace
+   bound to its session. It never creates a shell, and it refuses a
+   session that no workspace here is bound to. Until then, the shell is an
+   orphan of its session: `i3mux terminal` in that workspace reattaches
+   it, and `detach`, `attach` and `kill` treat it as one of the session's
+   shells.
+
+If i3mux opens a terminal of the same session at the same moment, both
+can pick the same number. shpool then attaches the second `attach -b` to
+the first shell and ignores its `-c`. A program that needs its command to
+run checks the shell's process afterwards.
 
 ## Remote hosts
 

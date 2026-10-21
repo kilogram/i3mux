@@ -82,8 +82,8 @@ pub mod testing {
     use std::sync::Mutex;
 
     /// An in-memory Sway: one output, workspaces with flat window lists.
-    /// Understands `mark --add` and the `con_mark` kill; records every
-    /// command.
+    /// Understands `mark --add`, `move container to workspace` (by
+    /// `con_id`) and the `con_mark` kill; records every command.
     #[derive(Default)]
     pub struct FakeSway {
         state: Mutex<FakeState>,
@@ -168,16 +168,21 @@ pub mod testing {
             if let Some(rest) = command.strip_prefix("[con_id=") {
                 let (id, rest) = rest.split_once(']').ok_or_else(|| anyhow!("bad command"))?;
                 let id: u64 = id.parse()?;
-                let mark = rest
-                    .trim()
-                    .strip_prefix("mark --add ")
-                    .ok_or_else(|| anyhow!("bad"))?;
                 let window = state
                     .windows
                     .iter_mut()
                     .find(|w| w.1 == id)
                     .ok_or_else(|| anyhow!("no {id}"))?;
-                window.3.push(mark.trim_matches('"').to_owned());
+                let rest = rest.trim();
+                if let Some(mark) = rest.strip_prefix("mark --add ") {
+                    window.3.push(mark.trim_matches('"').to_owned());
+                } else if let Some(name) = rest.strip_prefix("move container to workspace ") {
+                    let name = name.strip_prefix('"').and_then(|n| n.strip_suffix('"'));
+                    let name = name.ok_or_else(|| anyhow!("unquoted workspace"))?;
+                    window.0 = name.replace("\\\"", "\"").replace("\\\\", "\\");
+                } else {
+                    return Err(anyhow!("bad command: {command}"));
+                }
             } else if let Some(rest) = command.strip_prefix("[con_mark=\"") {
                 let (pattern, _) = rest.split_once("\"]").ok_or_else(|| anyhow!("bad"))?;
                 let re = regex::Regex::new(pattern)?;

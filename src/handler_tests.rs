@@ -859,6 +859,122 @@ fn attach_unknown_session_is_an_error() {
     ));
 }
 
+// ----------------------------------------------------------------- open
+
+/// The marks of the i3mux windows on `workspace`.
+fn marks_on(world: &World, workspace: &str) -> Vec<String> {
+    let tree = world.sway.get_tree().unwrap();
+    window::find_workspace(&tree, workspace)
+        .map(|ws| {
+            window::i3mux_windows_in(ws)
+                .into_iter()
+                .map(|(_, mark)| mark.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn open_shows_a_shell_in_the_workspace_bound_to_its_session() {
+    // A shell that another program made (README, "Shells made by other
+    // programs"): the window attaches it as it is, without a command, and
+    // lands in the bound workspace, not the focused one ("4").
+    let world = World::new(deepthought());
+    world.bind("9", "ws9");
+    world.host.add_shell("ws9-003", false);
+
+    let opened = world
+        .finish(|ports| open(ports, &deepthought(), &t("ws9", 3), false))
+        .unwrap();
+
+    assert_eq!(opened, Opened::Window("9".to_owned()));
+    assert_eq!(marks_on(&world, "9"), [world.mark("ws9-003").to_string()]);
+    assert!(marks_on(&world, "4").is_empty());
+    let launch = &world.launcher.argvs()[0];
+    assert_eq!(launch[launch.len() - 2..], ["attach", "ws9-003"]);
+    assert!(
+        world.fakes.running(&dt()),
+        "the bound host keeps its master"
+    );
+}
+
+#[test]
+fn open_of_a_shell_that_has_a_window_opens_no_second_one() {
+    let world = World::new(Host::Local);
+    world.bind("9", "ws9");
+    world.host.add_shell("ws9-003", false);
+    let ports = world.ports();
+
+    let first = open(&ports, &Host::Local, &t("ws9", 3), false).unwrap();
+    let again = open(&ports, &Host::Local, &t("ws9", 3), false).unwrap();
+
+    assert_eq!(first, Opened::Window("9".to_owned()));
+    assert_eq!(again, Opened::AlreadyOpen("9".to_owned()));
+    assert_eq!(world.launcher.argvs().len(), 1);
+}
+
+#[test]
+fn open_of_a_session_bound_nowhere_is_refused_without_asking_the_host() {
+    let world = World::new(deepthought());
+    world.host.add_shell("ws9-003", false);
+
+    let err = world
+        .finish(|ports| open(ports, &deepthought(), &t("ws9", 3), false))
+        .unwrap_err();
+
+    assert!(
+        matches!(command_error(&err), CommandError::NotBound { .. }),
+        "{err:#}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "No workspace is bound to session 'ws9' on deepthought; run 'i3mux activate --remote \
+         deepthought --session ws9' in the workspace that should show it"
+    );
+    assert!(
+        world.fakes.events().is_empty(),
+        "{:?}",
+        world.fakes.events()
+    );
+    assert!(world.launcher.argvs().is_empty());
+}
+
+#[test]
+fn open_never_creates_a_shell() {
+    // `shpool attach` would create a missing shell: open refuses first.
+    let world = World::new(Host::Local);
+    world.bind("9", "ws9");
+    world.host.add_shell("ws9-001", false);
+
+    let err = open(&world.ports(), &Host::Local, &t("ws9", 3), false).unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "No shell 'ws9-003' on local; run 'i3mux sessions' to list sessions"
+    );
+    assert!(world.launcher.argvs().is_empty());
+    assert_eq!(world.host.shells().len(), 1);
+}
+
+#[test]
+fn open_takes_over_a_shell_attached_elsewhere_only_with_force() {
+    let world = World::new(Host::Local);
+    world.bind("9", "ws9");
+    world.host.add_shell("ws9-003", true);
+
+    let err = open(&world.ports(), &Host::Local, &t("ws9", 3), false).unwrap_err();
+    assert!(
+        matches!(command_error(&err), CommandError::AlreadyAttached(_)),
+        "{err:#}"
+    );
+    assert!(world.launcher.argvs().is_empty());
+
+    let opened = open(&world.ports(), &Host::Local, &t("ws9", 3), true).unwrap();
+    assert_eq!(opened, Opened::Window("9".to_owned()));
+    let launch = &world.launcher.argvs()[0];
+    assert_eq!(launch[launch.len() - 3..], ["attach", "-f", "ws9-003"]);
+}
+
 // ----------------------------------------------------------------- kill
 
 #[test]
