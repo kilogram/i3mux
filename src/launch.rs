@@ -3,12 +3,13 @@
 //! An i3mux window runs the wrapper in `$TERMINAL`:
 //!
 //! ```text
-//! wrapper.sh TITLE ARGV...
-//! wrapper.sh --remote HOST SHELL UNIT N REATTACH... TITLE ARGV...
+//! wrapper.sh [--no-hold] [--attach-only] TITLE ARGV...
+//! wrapper.sh [--no-hold] [--attach-only] --remote HOST SHELL UNIT N REATTACH... TITLE ARGV...
 //! ```
 //!
 //! The wrapper sets the title once, runs ARGV with no shell, and keeps the
-//! window open if ARGV fails (plan decisions 10 and 13). A remote window
+//! window open if ARGV fails (plan decisions 10 and 13), unless
+//! [`WrapperOptions::no_hold`]. A remote window
 //! also recovers from a lost ssh connection: it shows a landing page while
 //! UNIT, the host's ssh master, reconnects, then runs REATTACH, the N-word
 //! argv that attaches SHELL with `--force` (plan-ssh-recovery rules 7-11).
@@ -71,15 +72,35 @@ pub struct RemoteAttach {
     pub shell: TerminalName,
 }
 
+/// How the wrapper ends a window. The default keeps today's behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WrapperOptions {
+    /// End the window with the shell's exit status when the shell ends or
+    /// is detached, never keeping it open with a hint (PLAN-terminal-here
+    /// decision 4).
+    pub no_hold: bool,
+    /// The argv attaches an existing shell only: after exit 75 (the shpool
+    /// daemon was replaced) the wrapper does not run it again, since that
+    /// would start a new shell under the same name.
+    pub attach_only: bool,
+}
+
 /// Opens terminal windows. [`TerminalLauncher`] is the real one; tests use
 /// fakes that add windows to a fake Sway.
 pub trait Launcher {
     /// Start a window with `app_id` and `title` that runs `command` through
-    /// the wrapper. Returns once the terminal process has started.
+    /// the wrapper, with `options`. Returns once the terminal process has
+    /// started.
     ///
     /// # Errors
     /// If the terminal cannot be started.
-    fn spawn(&self, app_id: &str, title: &str, command: &WindowCommand) -> Result<()>;
+    fn spawn(
+        &self,
+        app_id: &str,
+        title: &str,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Result<()>;
 }
 
 /// How an emulator takes the app id and the command.
@@ -177,20 +198,38 @@ impl TerminalLauncher {
 }
 
 impl Launcher for TerminalLauncher {
-    fn spawn(&self, app_id: &str, title: &str, command: &WindowCommand) -> Result<()> {
+    fn spawn(
+        &self,
+        app_id: &str,
+        title: &str,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Result<()> {
         spawn_detached(&window_argv(
             &self.program,
             Some(app_id),
             Some(title),
-            &wrapper_argv(&self.wrapper, title, command),
+            &wrapper_argv(&self.wrapper, title, command, options),
         ))
     }
 }
 
-/// `wrapper.sh [--remote HOST SHELL UNIT N REATTACH...] TITLE ARGV...`, the
-/// wrapper's only command line (see the module docs).
-fn wrapper_argv(wrapper: &Path, title: &str, command: &WindowCommand) -> Vec<String> {
+/// `wrapper.sh [--no-hold] [--attach-only] [--remote HOST SHELL UNIT N
+/// REATTACH...] TITLE ARGV...`, the wrapper's only command line (see the
+/// module docs).
+fn wrapper_argv(
+    wrapper: &Path,
+    title: &str,
+    command: &WindowCommand,
+    options: WrapperOptions,
+) -> Vec<String> {
     let mut argv = vec![wrapper.display().to_string()];
+    if options.no_hold {
+        argv.push("--no-hold".to_owned());
+    }
+    if options.attach_only {
+        argv.push("--attach-only".to_owned());
+    }
     if let WindowCommand::Remote(remote) = command {
         argv.extend([
             "--remote".to_owned(),
@@ -344,6 +383,8 @@ exit 0
     struct WrapperWorld {
         dir: tempfile::TempDir,
         wrapper: PathBuf,
+        /// The options the window runs with.
+        options: WrapperOptions,
     }
 
     impl WrapperWorld {
@@ -357,7 +398,11 @@ exit 0
             fs::create_dir_all(dir.path().join("fake")).unwrap();
             write_script(&bin.join("systemctl"), FAKE_SYSTEMCTL);
             write_script(&bin.join("journalctl"), FAKE_JOURNALCTL);
-            Self { dir, wrapper }
+            Self {
+                dir,
+                wrapper,
+                options: WrapperOptions::default(),
+            }
         }
 
         fn fake(&self, file: &str) -> PathBuf {
@@ -401,7 +446,7 @@ exit 0
             );
             // Run it with bash rather than exec it: ETXTBSY, as above.
             let mut child = Command::new("bash")
-                .args(wrapper_argv(&self.wrapper, "t", command))
+                .args(wrapper_argv(&self.wrapper, "t", command, self.options))
                 .env("FAKE", self.dir.path().join("fake"))
                 .env("PATH", path)
                 .stdin(Stdio::piped())
@@ -452,7 +497,12 @@ exit 0
     fn remote_window_puts_its_recovery_words_before_the_title() {
         let command = remote(strings(&["ssh", "a b"]), strings(&["ssh", "-f", "c'd"]));
         assert_eq!(
-            wrapper_argv(Path::new("/w.sh"), "i3mux:deepthought:ws4-002", &command),
+            wrapper_argv(
+                Path::new("/w.sh"),
+                "i3mux:deepthought:ws4-002",
+                &command,
+                WrapperOptions::default()
+            ),
             strings(&[
                 "/w.sh",
                 "--remote",
@@ -470,7 +520,7 @@ exit 0
         );
         let plain = WindowCommand::Plain(strings(&["x"]));
         assert_eq!(
-            wrapper_argv(Path::new("/w.sh"), "t", &plain),
+            wrapper_argv(Path::new("/w.sh"), "t", &plain, WrapperOptions::default()),
             ["/w.sh", "t", "x"]
         );
     }
@@ -646,6 +696,62 @@ exit 0
             "{text}"
         );
         assert!(text.contains("with exit status 75."), "{text}");
+    }
+
+    #[test]
+    fn a_no_hold_window_ends_with_the_shell_and_never_pauses() {
+        // PLAN-terminal-here decision 4: a failure or a quick end ends the
+        // window at once, with the shell's status, and no hint; stdin stays
+        // open, so a pause would hang until it closes.
+        let mut world = WrapperWorld::new();
+        world.options.no_hold = true;
+        for (argv, status) in [
+            (strings(&["sh", "-c", "exit 3"]), 3),
+            (strings(&["true"]), 0),
+        ] {
+            let started = std::time::Instant::now();
+            let out = world.run(&WindowCommand::Plain(argv), "", Duration::from_secs(5));
+            assert_eq!(out.status.code(), Some(status));
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "it waited for Enter"
+            );
+            assert!(
+                !text(&out.stdout).contains("Press Enter"),
+                "{}",
+                text(&out.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn an_attach_only_window_starts_no_new_shell_after_the_daemon_was_replaced() {
+        // The argv attaches an existing shell: running it again after exit
+        // 75 would start a new one under its name.
+        let mut world = WrapperWorld::new();
+        world.options = WrapperOptions {
+            no_hold: true,
+            attach_only: true,
+        };
+        world.set_unit(None, "active", "running", "A", 0);
+        let command = remote(attach("plain", "exit 75"), attach("force", "exit 0"));
+        let out = world.run(&command, "", AT_ONCE);
+        assert_eq!(out.status.code(), Some(75));
+        assert_eq!(world.read("runs"), "plain\n");
+        assert!(!text(&out.stdout).contains("Starting a new shell"));
+    }
+
+    #[test]
+    fn the_options_come_before_the_remote_words() {
+        let command = remote(strings(&["ssh", "a"]), strings(&["ssh", "-f"]));
+        let options = WrapperOptions {
+            no_hold: true,
+            attach_only: true,
+        };
+        assert_eq!(
+            wrapper_argv(Path::new("/w.sh"), "t", &command, options)[..4],
+            strings(&["/w.sh", "--no-hold", "--attach-only", "--remote"])
+        );
     }
 
     #[test]

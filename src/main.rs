@@ -38,7 +38,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use host::{HostExec, HostRunner, RunnerConfig};
-use launch::{Launcher, RemoteAttach, TerminalLauncher, WindowCommand};
+use launch::{Launcher, RemoteAttach, TerminalLauncher, WindowCommand, WrapperOptions};
 use layout::Step;
 use master::{DirectSsh, Link, MasterState, Masters, SystemdMasters, TrackedMasters};
 use mux::{Choice, Shell};
@@ -100,6 +100,10 @@ enum CliCommand {
         new: bool,
         #[arg(long, help = FORCE_HELP)]
         force: bool,
+        /// Close the window as soon as its shell ends or is detached, with
+        /// the shell's exit status, instead of keeping it open with a hint
+        #[arg(long)]
+        no_hold: bool,
     },
     /// Save the focused workspace's layout on the session's host and close its windows
     Detach,
@@ -281,11 +285,17 @@ fn dispatch(
 ) -> Result<ExitCode> {
     match command {
         CliCommand::Activate { remote, session } => cmd_activate(ports, wm, remote, session),
-        CliCommand::Terminal { exec, new, force } => {
+        CliCommand::Terminal {
+            exec,
+            new,
+            force,
+            no_hold,
+        } => {
             let request = TerminalRequest {
                 command: exec,
                 new,
                 force,
+                no_hold,
             };
             cmd_terminal(ports, wm, launcher, &request)
         }
@@ -602,6 +612,8 @@ struct TerminalRequest {
     new: bool,
     /// Take over shells attached elsewhere.
     force: bool,
+    /// End the window when its shell ends, with no pause.
+    no_hold: bool,
 }
 
 /// `wsN` for a numbered workspace, else the workspace name itself.
@@ -678,6 +690,10 @@ fn open_terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> R
         choice.name(),
         request.force,
         request.command.as_deref(),
+        WrapperOptions {
+            no_hold: request.no_hold,
+            attach_only: false,
+        },
     )?;
     drop(lock);
     Ok(choice)
@@ -690,6 +706,7 @@ fn open_window(
     terminal: &TerminalName,
     force: bool,
     command: Option<&str>,
+    options: WrapperOptions,
 ) -> Result<u64> {
     let mark = Mark::new(host.host().clone(), terminal.clone());
     let window = window_command(ports, host, terminal, force, command)?;
@@ -697,7 +714,9 @@ fn open_window(
         .log
         .debug(|| format!("opening {mark}: {}", shell_words::join(window.argv())));
     let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
-    ports.launcher.spawn(&mark.app_id(), &title, &window)?;
+    ports
+        .launcher
+        .spawn(&mark.app_id(), &title, &window, options)?;
     sway_ops::wait_for_window_and_mark(ports.sway, &mark)
 }
 
@@ -773,7 +792,14 @@ fn open(ports: &Ports, host: &Host, terminal: &TerminalName, force: bool) -> Res
     if shell.is_attached() && !force {
         return Err(CommandError::AlreadyAttached(terminal.clone()).into());
     }
-    let con_id = open_window(ports, exec.as_ref(), terminal, force, None)?;
+    let con_id = open_window(
+        ports,
+        exec.as_ref(),
+        terminal,
+        force,
+        None,
+        WrapperOptions::default(),
+    )?;
     ports
         .sway
         .run(&window::move_to_workspace_command(con_id, &workspace))?;
@@ -928,7 +954,14 @@ fn attach(
     for step in layout::restore_plan(saved.layout()) {
         match step {
             Step::Launch(terminal) => {
-                open_window(ports, exec.as_ref(), &terminal, force, None)?;
+                open_window(
+                    ports,
+                    exec.as_ref(),
+                    &terminal,
+                    force,
+                    None,
+                    WrapperOptions::default(),
+                )?;
             }
             Step::Sway(command) => ports.sway.run(command)?,
         }

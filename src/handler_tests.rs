@@ -299,6 +299,8 @@ struct FakeLauncher {
     host: FakeHost,
     workspace: String,
     launches: Mutex<Vec<WindowCommand>>,
+    /// The wrapper options of each launch, in order.
+    options: Mutex<Vec<WrapperOptions>>,
     fail_after: Option<usize>,
 }
 
@@ -311,12 +313,19 @@ impl FakeLauncher {
 }
 
 impl Launcher for FakeLauncher {
-    fn spawn(&self, app_id: &str, _title: &str, command: &WindowCommand) -> Result<()> {
+    fn spawn(
+        &self,
+        app_id: &str,
+        _title: &str,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Result<()> {
         let mut launches = self.launches.lock().unwrap();
         if self.fail_after.is_some_and(|n| launches.len() >= n) {
             anyhow::bail!("terminal crashed");
         }
         launches.push(command.clone());
+        self.options.lock().unwrap().push(options);
         let mark = Mark::parse(app_id).unwrap();
         self.host.add_shell(&mark.terminal().to_string(), true);
         self.sway.open(&self.workspace, app_id);
@@ -351,6 +360,7 @@ impl World {
             host: host.clone(),
             workspace: "4".into(),
             launches: Mutex::default(),
+            options: Mutex::default(),
             fail_after: None,
         };
         let fake = host.clone();
@@ -1219,6 +1229,32 @@ fn sessions_all_survives_an_unreachable_host() {
 
 fn dt() -> RemoteHost {
     RemoteHost::new("deepthought").unwrap()
+}
+
+/// PLAN-terminal-here decision 4: `terminal --no-hold` asks the wrapper to
+/// end the window with its shell; other windows keep today's hold.
+#[test]
+fn a_no_hold_terminal_tells_its_wrapper_not_to_hold() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    let request = TerminalRequest {
+        no_hold: true,
+        ..TerminalRequest::default()
+    };
+    open_terminal(&world.ports(), "4", &request).unwrap();
+    open_terminal(&world.ports(), "4", &TerminalRequest::default()).unwrap();
+
+    let options = world.launcher.options.lock().unwrap().clone();
+    assert_eq!(
+        options,
+        [
+            WrapperOptions {
+                no_hold: true,
+                attach_only: false
+            },
+            WrapperOptions::default()
+        ]
+    );
 }
 
 #[test]

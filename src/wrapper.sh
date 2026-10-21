@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # i3mux terminal wrapper. i3mux builds its command line in launch.rs:
 #
-#   wrapper.sh TITLE ARGV...
-#   wrapper.sh --remote HOST SHELL UNIT N REATTACH... TITLE ARGV...
+#   wrapper.sh [--no-hold] [--attach-only] TITLE ARGV...
+#   wrapper.sh [--no-hold] [--attach-only] --remote HOST SHELL UNIT N REATTACH... TITLE ARGV...
 #
 # Sets the window title once and runs ARGV as given (no shell parses it).
 # Keeps the window open with a hint when ARGV fails or ends within 2 s.
 # shpool refuses a second client of a shell with exit status 0, so a quick
 # end is the only sign that another terminal or host took the shell first.
+# With --no-hold it never keeps the window: it exits with ARGV's status.
+# With --attach-only, ARGV only attaches an existing shell: after exit 75
+# it does not run ARGV again, which would start a new shell of that name.
 #
 # A remote window (--remote) attaches SHELL on HOST through the ssh master
 # that the systemd user unit UNIT runs. REATTACH is the N-word argv that
@@ -25,6 +28,16 @@
 # bash, not sh: the landing page refreshes once a second while it waits for
 # a key, which needs `read -t`, and REATTACH needs an array.
 set -u
+
+no_hold= attach_only=
+while :; do
+    case ${1-} in
+        --no-hold) no_hold=1 ;;
+        --attach-only) attach_only=1 ;;
+        *) break ;;
+    esac
+    shift
+done
 
 remote=
 if [ "${1-}" = --remote ]; then
@@ -150,7 +163,7 @@ while :; do
         continue
     fi
     [ -n "$ssh_error" ] && printf '%s\n' "$ssh_error" >&2
-    if [ "$status" -eq 75 ] && [ -z "$replaced" ]; then
+    if [ "$status" -eq 75 ] && [ -z "$replaced" ] && [ -z "$attach_only" ]; then
         replaced=1
         say "Starting a new shell in this window."
         continue
@@ -158,6 +171,7 @@ while :; do
     break
 done
 elapsed=$(($(date +%s) - start))
+[ -n "$no_hold" ] && exit "$status"
 if [ "$status" -ne 0 ] || [ "$elapsed" -lt 2 ]; then
     printf '\n[i3mux] %s ended after %s s with exit status %s.\n' "$title" "$elapsed" "$status"
     printf '[i3mux] If the shell is already attached from another terminal or host,\n'

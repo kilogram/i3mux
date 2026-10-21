@@ -37,6 +37,7 @@ i3mux activate --remote dev-box   # same, shells run on dev-box over ssh
 i3mux terminal                    # another shell (reattaches an orphan first)
 i3mux terminal --new              # always a fresh shell
 i3mux terminal -e htop            # run a command in a fresh persistent shell
+i3mux terminal --no-hold -e make  # close the window as soon as its shell ends
 i3mux detach                      # save the layout, close the windows, keep the shells
 i3mux attach --session ws3        # restore the layout and reattach every shell
 i3mux sessions [--remote host]    # what exists, where, and in what state
@@ -79,7 +80,11 @@ on `activate`, `attach` and `kill`.
    terminal per shell. shpool restores the last 10 000 lines of each.
 
 Closing a window never kills a shell. Only `exit` in the shell or
-`i3mux kill` does.
+`i3mux kill` does. When a shell ends with an error, or within 2 s, its
+window stays open with a hint until you press Enter: the shell may be
+attached from another terminal. `i3mux terminal --no-hold` opens a window
+that closes as soon as its shell ends or is detached, with the shell's
+exit status, like tmux's `remain-on-exit off`.
 
 ## Shells made by other programs
 
