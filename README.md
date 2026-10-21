@@ -89,6 +89,9 @@ that must outlive any window. This is the whole contract:
 1. Make the shell in i3mux's shpool daemon on the host:
    `shpool --socket ~/.local/run/i3mux/shpool.socket --config-file
    ~/.config/i3mux/shpool.toml attach -b [-d DIR] [-c CMD] NAME`.
+   shpool does not make the socket's directory: create
+   `~/.local/run/i3mux` with mode 0700 first if it is missing, as i3mux
+   does.
    If no daemon runs, `attach -b` starts one, and i3mux uses it from then
    on. i3mux writes the config file the first time it runs a command on
    the host; the program never writes it.
