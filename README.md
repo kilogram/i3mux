@@ -133,8 +133,8 @@ Each one shows what happened and how systemd retries:
 
 When the master is back, every window reattaches its shell by itself.
 `i3mux status` shows the state of the connection. After each command, i3mux
-stops the unit of each host that the command used and no workspace is bound
-to. Logout stops them all.
+stops the unit of each host that the command used, that no workspace is
+bound to and that no window shows a shell of. Logout stops them all.
 Without a systemd user manager, each ssh connects on its own and windows do
 not reconnect. See [INSTALL.md](INSTALL.md#remote-hosts) for the ssh setup
 and [docs/PLAN-ssh-recovery-controlmaster.md](docs/PLAN-ssh-recovery-controlmaster.md)

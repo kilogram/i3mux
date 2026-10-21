@@ -373,7 +373,9 @@ impl World {
     /// Run a core function as `run` runs a command: then stop the masters
     /// that no workspace uses.
     fn finish<T>(&self, command: impl FnOnce(&Ports) -> Result<T>) -> Result<T> {
-        with_unused_masters_stopped(&self.store, &self.masters, || command(&self.ports()))
+        with_unused_masters_stopped(&self.store, &self.masters, self.sway.as_ref(), || {
+            command(&self.ports())
+        })
     }
 
     fn ports(&self) -> Ports<'_> {
@@ -1374,6 +1376,46 @@ fn sessions_of_an_unbound_host_stop_its_master() {
     assert_eq!(rows.len(), 1);
     assert_eq!(world.fakes.stopped(), [dt()]);
     assert!(!world.fakes.running(&dt()));
+}
+
+// PLAN-terminal-here decision 5: a window marked with a host keeps the
+// host's master, bound or not.
+
+#[test]
+fn a_master_stays_while_a_window_is_marked_with_its_host() {
+    // No workspace is bound to deepthought, but a window still shows one of
+    // its shells: listing its sessions must not cut that window's link.
+    let world = World::new(deepthought());
+    world.host.add_shell("ws4-001", true);
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+
+    world
+        .finish(|ports| sessions(ports, &deepthought()))
+        .unwrap();
+
+    assert!(
+        world.fakes.stopped().is_empty(),
+        "{:?}",
+        world.fakes.events()
+    );
+    assert!(world.fakes.running(&dt()));
+}
+
+#[test]
+fn the_master_stops_once_no_window_is_marked_with_its_host() {
+    let world = World::new(deepthought());
+    world.host.add_shell("ws4-001", false);
+    world.sway.open("4", "foot");
+
+    world
+        .finish(|ports| sessions(ports, &deepthought()))
+        .unwrap();
+
+    assert_eq!(
+        world.fakes.stopped(),
+        [dt()],
+        "an unmarked window keeps nothing"
+    );
 }
 
 #[test]

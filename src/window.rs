@@ -119,6 +119,19 @@ pub fn i3mux_windows_in(node: &Value) -> Vec<(u64, Mark)> {
         .collect()
 }
 
+/// Every host that an i3mux window anywhere in the tree is marked with,
+/// once each.
+#[must_use]
+pub fn hosts_with_windows(tree: &Value) -> Vec<Host> {
+    let mut hosts = Vec::new();
+    for (_, mark) in i3mux_windows_in(tree) {
+        if !hosts.contains(&mark.host) {
+            hosts.push(mark.host);
+        }
+    }
+    hosts
+}
+
 /// Terminals of `session` on `host` that have a window anywhere in the tree.
 #[must_use]
 pub fn session_terminals(tree: &Value, host: &Host, session: &SessionName) -> Vec<TerminalName> {

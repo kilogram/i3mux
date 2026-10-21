@@ -11,8 +11,9 @@
 //!
 //! Every command, on success and on failure, ends in
 //! [`with_unused_masters_stopped`]: it stops the ssh master of each host the
-//! command touched that no workspace is bound to (plan-ssh-recovery
-//! rule 12). Nothing runs on a host after that stop.
+//! command touched that no workspace is bound to and no window is marked
+//! with (plan-ssh-recovery rule 12; PLAN-terminal-here decision 5). Nothing
+//! runs on a host after that stop.
 
 mod host;
 mod launch;
@@ -267,7 +268,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         },
         disconnect_wait: DISCONNECT_WAIT,
     };
-    with_unused_masters_stopped(&store, &masters, || {
+    with_unused_masters_stopped(&store, &masters, &wm, || {
         dispatch(&ports, &wm, &launcher, cli.command)
     })
 }
@@ -306,9 +307,11 @@ fn dispatch(
 }
 
 /// Run `command`, then stop the ssh master of each host it touched that no
-/// workspace is bound to (plan-ssh-recovery rule 12), also when it failed.
-/// So a failed `activate` or `attach`, or `sessions --remote`, leaves no
-/// master behind. Hosts the command did not touch keep their masters.
+/// workspace is bound to and no window is marked with (plan-ssh-recovery
+/// rule 12; PLAN-terminal-here decision 5), also when it failed. So a
+/// failed `activate` or `attach`, or `sessions --remote`, leaves no master
+/// behind, while a window that still shows a shell of a host, bound or not,
+/// keeps its connection. Hosts the command did not touch keep their masters.
 ///
 /// The stop runs after the command's last remote command, and under the
 /// state lock, so no concurrent command binds the host between the check and
@@ -317,10 +320,11 @@ fn dispatch(
 fn with_unused_masters_stopped<T>(
     store: &StateStore,
     masters: &TrackedMasters,
+    sway: &dyn Sway,
     command: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let result = command();
-    match (result, stop_unused_masters(store, masters)) {
+    match (result, stop_unused_masters(store, masters, sway)) {
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(stop_err)) => Err(stop_err),
         (Err(err), Ok(())) => Err(err),
@@ -331,16 +335,32 @@ fn with_unused_masters_stopped<T>(
     }
 }
 
-/// Stop the masters of the touched hosts that no binding uses.
-fn stop_unused_masters(store: &StateStore, masters: &TrackedMasters) -> Result<()> {
+/// Stop the masters of the touched hosts that no binding uses and no
+/// window is marked with. The Sway tree is read only when a touched host is
+/// unbound.
+fn stop_unused_masters(
+    store: &StateStore,
+    masters: &TrackedMasters,
+    sway: &dyn Sway,
+) -> Result<()> {
     let touched = masters.touched_hosts();
     if touched.is_empty() {
         return Ok(());
     }
     let lock = store.lock()?;
-    for remote in touched {
-        let host = Host::Ssh(remote.clone());
-        if lock.state().bindings().all(|(_, b)| b.host() != &host) {
+    let unbound: Vec<RemoteHost> = touched
+        .into_iter()
+        .filter(|remote| {
+            let host = Host::Ssh(remote.clone());
+            lock.state().bindings().all(|(_, b)| b.host() != &host)
+        })
+        .collect();
+    if unbound.is_empty() {
+        return Ok(());
+    }
+    let marked = window::hosts_with_windows(&sway.get_tree()?);
+    for remote in unbound {
+        if !marked.contains(&Host::Ssh(remote.clone())) {
             masters.stop(&remote)?;
         }
     }

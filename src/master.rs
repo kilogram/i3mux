@@ -362,7 +362,8 @@ impl Masters for DirectSsh {
 /// Wraps the [`Masters`] of one i3mux command and remembers each host whose
 /// master the command asked to start, whether it started, ran already, or
 /// failed. When the command ends, its caller stops the masters of those
-/// hosts that no workspace uses, and of no other host.
+/// hosts that no workspace uses and no window is marked with, and of no
+/// other host.
 pub struct TrackedMasters {
     inner: Box<dyn Masters + Send + Sync>,
     touched: Mutex<Vec<RemoteHost>>,
