@@ -704,6 +704,63 @@ fn detach_and_attach_keep_the_window_command() {
     );
 }
 
+/// A word of a window command a user might write: spaces, both quotes,
+/// `$`, backslashes, globs, non-ASCII text, an empty word, and the
+/// placeholders, alone or inside other text.
+fn window_word() -> impl proptest::strategy::Strategy<Value = String> {
+    use proptest::prelude::*;
+    prop_oneof![
+        "[a-z/._-]{1,8}",
+        Just(String::new()),
+        Just("a b".to_owned()),
+        Just("it's".to_owned()),
+        Just("say \"hi\"".to_owned()),
+        Just("$HOME \\n *".to_owned()),
+        Just("grüße – ✓".to_owned()),
+        Just("{session}".to_owned()),
+        Just("{shell}".to_owned()),
+        Just("--name={session}/{shell}".to_owned()),
+        Just("{x} {SHELL} {shell".to_owned()),
+    ]
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+    /// PLAN-terminal-here decision 2 over any command line a shell would
+    /// quote: the window command round-trips through state.json, through
+    /// `detach` (the saved layout) and `attach`, word for word, and every
+    /// window runs exactly its words with the names put in.
+    #[test]
+    fn a_window_command_with_quotes_and_spaces_round_trips_intact(
+        program in "[a-z][a-z-]{0,7}",
+        rest in proptest::collection::vec(window_word(), 0..6),
+    ) {
+        let mut words = vec![program];
+        words.extend(rest);
+        let text = shell_words::join(&words);
+        let world = World::new(Host::Local);
+        world.bind_with("4", "ws4", &text);
+        let reloaded = world.store.load().unwrap().get("4").cloned().unwrap();
+        proptest::prop_assert_eq!(reloaded.window_command().unwrap().as_str(), text.as_str());
+        world.host.add_shell("ws4-001", true);
+        world.sway.open_marked("4", &world.mark("ws4-001"));
+        world.host.state.lock().unwrap().detach_lag = 0;
+        detach(&world.ports(), "4", 0).unwrap();
+        world.host.state.lock().unwrap().shells.clear();
+
+        attach(&world.ports(), &Host::Local, "4", Some(name("ws4")), false).unwrap();
+
+        let binding = world.store.load().unwrap().get("4").cloned().unwrap();
+        proptest::prop_assert_eq!(binding.window_command().unwrap().as_str(), text.as_str());
+        let expected: Vec<String> = words
+            .iter()
+            .map(|w| w.replace("{session}", "ws4").replace("{shell}", "ws4-001"))
+            .collect();
+        proptest::prop_assert_eq!(world.launches(), vec![WindowCommand::Custom(expected)]);
+    }
+}
+
 /// `open` shows a shell that another program made through the window
 /// command of the workspace bound to its session; the shell is not made
 /// again.
@@ -1112,6 +1169,102 @@ fn here_on_an_unreachable_host_binds_and_marks_nothing() {
 
     assert!(world.store.load().unwrap().get("4").is_none());
     assert!(world.sway.commands().is_empty());
+}
+
+/// Concurrency (plan rule 4 for `here`): eight terminals in one unbound
+/// workspace run `here` at once. The workspace is bound once; each
+/// terminal gets its own new shell and exactly one i3mux mark; no shell
+/// is shown twice.
+#[test]
+fn concurrent_heres_bind_once_and_never_share_a_shell() {
+    let world = World::new(Host::Local);
+    let ids: Vec<u64> = (0..8)
+        .map(|n| world.sway.open_titled("4", "foot", &format!("nonce-{n}")))
+        .collect();
+    let ports = world.ports();
+
+    let titles: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let ports = &ports;
+                scope.spawn(move || here(ports, *id, &HereRequest::default()).unwrap().title)
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut titles = titles;
+    titles.sort();
+    let expected: Vec<String> = (1..=8).map(|n| format!("i3mux:local:ws4-{n:03}")).collect();
+    assert_eq!(titles, expected);
+    assert_eq!(world.window_numbers("ws4"), [1, 2, 3, 4, 5, 6, 7, 8]);
+    let tree = world.sway.get_tree().unwrap();
+    for id in ids {
+        assert_eq!(window::marks_of(&tree, id).len(), 1, "window {id}");
+    }
+    let state = world.store.load().unwrap();
+    assert_eq!(state.bindings().count(), 1);
+    assert_eq!(state.get("4").unwrap().session(), &name("ws4"));
+}
+
+/// Concurrency: `here` races `i3mux terminal` in one bound workspace with
+/// an orphan shell. The orphan goes to exactly one of them, and every
+/// window shows its own shell.
+#[test]
+fn here_racing_terminal_never_picks_the_same_shell() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-003", false); // an orphan
+    let ids: Vec<u64> = (0..4)
+        .map(|n| world.sway.open_titled("4", "foot", &format!("nonce-{n}")))
+        .collect();
+    let ports = world.ports();
+
+    let names: Vec<u32> = std::thread::scope(|scope| {
+        let heres: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let ports = &ports;
+                scope.spawn(move || here(ports, *id, &HereRequest::default()).unwrap().title)
+            })
+            .collect();
+        let terminals: Vec<_> = (0..4)
+            .map(|_| {
+                let ports = &ports;
+                scope.spawn(move || {
+                    open_terminal(ports, "4", &TerminalRequest::default())
+                        .unwrap()
+                        .name()
+                        .number()
+                })
+            })
+            .collect();
+        let mut numbers: Vec<u32> = heres
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap()
+                    .rsplit('-')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        numbers.extend(terminals.into_iter().map(|h| h.join().unwrap()));
+        numbers
+    });
+
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 8, "a shell was picked twice: {names:?}");
+    assert!(
+        sorted.contains(&3),
+        "the orphan was not reattached: {names:?}"
+    );
+    assert_eq!(world.window_numbers("ws4").len(), 8);
 }
 
 // ------------------------------------------------------------- activate
