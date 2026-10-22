@@ -160,7 +160,8 @@ fn remote_shell_survives_its_window_closing() -> Result<()> {
 /// `terminal --no-hold`: the window closes as soon as its shell ends, with
 /// no "Press Enter" pause, like tmux's `remain-on-exit off`; the shell is
 /// gone too. Without it, a window whose shell fails stays open with a hint
-/// (plan rule 10).
+/// (plan rule 10). The shell fails once `~/end` exists on its host, so the
+/// test sees the window first, however loaded the machine is.
 #[rstest]
 #[case::local(Session::Local)]
 #[case::remote(Session::Remote)]
@@ -168,12 +169,14 @@ fn a_no_hold_window_closes_when_its_shell_ends(#[case] session: Session) -> Resu
     let env = TestEnvironment::new()?;
     env.activate(session, WS)?;
 
-    env.i3mux()
-        .terminal("--no-hold -e 'sh -c \"sleep 3; exit 3\"'")?;
+    env.i3mux().terminal(
+        r#"--no-hold -e 'sh -c "while [ ! -e $HOME/end ]; do sleep 0.2; done; exit 3"'"#,
+    )?;
     assert_eq!(
         env.marks(WS)?,
         [session.mark(NAME, 1), session.mark(NAME, 2)]
     );
+    env.write_host_file(session, "end", "")?;
 
     wait_until("the no-hold window closes with its shell", || {
         Ok(env.marks(WS)? == [session.mark(NAME, 1)])
