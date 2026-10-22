@@ -110,6 +110,14 @@ impl TestEnvironment {
         })
     }
 
+    /// The title of the window with `app_id`, on any workspace.
+    pub fn window_title(&self, app_id: &str) -> Result<Option<String>> {
+        let tree = self.tree()?;
+        Ok(find_node(&tree, &|n| n["app_id"].as_str() == Some(app_id))
+            .and_then(|n| n["name"].as_str())
+            .map(str::to_owned))
+    }
+
     /// The i3mux marks on workspace `number`, sorted.
     pub fn marks(&self, number: u32) -> Result<Vec<String>> {
         let mut marks: Vec<String> = self

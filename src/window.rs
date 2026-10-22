@@ -142,6 +142,44 @@ pub fn session_terminals(tree: &Value, host: &Host, session: &SessionName) -> Ve
         .collect()
 }
 
+/// The container id of the window whose title is `title`: the terminal that
+/// set it (PLAN-terminal-here decision 1).
+#[must_use]
+pub fn find_by_title(tree: &Value, title: &str) -> Option<u64> {
+    descendants(tree)
+        .into_iter()
+        .find(|n| {
+            matches!(
+                n.get("type").and_then(Value::as_str),
+                Some("con" | "floating_con")
+            ) && n.get("name").and_then(Value::as_str) == Some(title)
+        })
+        .and_then(node_id)
+}
+
+/// The workspace node that holds the node `con_id`.
+#[must_use]
+pub fn workspace_containing(tree: &Value, con_id: u64) -> Option<&Value> {
+    descendants(tree).into_iter().find(|n| {
+        n.get("type").and_then(Value::as_str) == Some("workspace")
+            && descendants(n).iter().any(|d| node_id(d) == Some(con_id))
+    })
+}
+
+/// Every i3mux mark on the node `con_id`.
+#[must_use]
+pub fn marks_of(tree: &Value, con_id: u64) -> Vec<Mark> {
+    descendants(tree)
+        .into_iter()
+        .find(|n| node_id(n) == Some(con_id))
+        .and_then(|n| n.get("marks")?.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(Mark::parse)
+        .collect()
+}
+
 /// The container id of an unmarked window whose `app_id` is `app_id`.
 #[must_use]
 pub fn find_by_app_id(tree: &Value, app_id: &str) -> Option<u64> {
@@ -250,6 +288,31 @@ mod tests {
 
     fn mark(host: &Host, session_name: &str, n: u32) -> Mark {
         Mark::new(host.clone(), TerminalName::new(&session(session_name), n))
+    }
+
+    /// PLAN-terminal-here decision 1: a window is found by its title, in a
+    /// tabbed container or floating too; its workspace is the one that holds
+    /// it, and its i3mux marks are all of its marks that parse.
+    #[test]
+    fn a_window_is_found_by_its_title_and_its_workspace_by_the_window() {
+        let mut tree = real_tree();
+        assert_eq!(find_by_title(&tree, "firefox window"), Some(263));
+        assert_eq!(
+            find_by_title(&tree, "md.obsidian.Obsidian window"),
+            Some(7),
+            "floating"
+        );
+        assert_eq!(find_by_title(&tree, "no such title"), None);
+        assert_eq!(find_by_title(&tree, "q"), None, "a workspace is no window");
+        let tabbed = workspace_containing(&tree, 1001).unwrap();
+        assert_eq!(tabbed["name"], "3");
+        assert_eq!(workspace_containing(&tree, 5).unwrap()["name"], "q");
+        assert!(workspace_containing(&tree, 424_242).is_none());
+        let m = mark(&Host::Local, "ws3", 2);
+        add_mark(&mut tree, 1001, &m.to_string());
+        add_mark(&mut tree, 1001, "user-mark");
+        assert_eq!(marks_of(&tree, 1001), [m]);
+        assert!(marks_of(&tree, 263).is_empty());
     }
 
     #[test]

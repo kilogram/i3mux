@@ -104,6 +104,16 @@ pub trait Launcher {
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Result<()>;
+
+    /// The argv that a window runs to show `command`: the wrapper with
+    /// `title` and `options`, or a window command as it is. `spawn` runs it
+    /// in a new terminal, and `terminal --here` execs it.
+    fn program_argv(
+        &self,
+        title: &str,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Vec<String>;
 }
 
 /// How an emulator takes the app id and the command.
@@ -208,18 +218,27 @@ impl Launcher for TerminalLauncher {
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Result<()> {
-        let argv = match command {
-            WindowCommand::Custom(argv) => argv.clone(),
-            WindowCommand::Plain(_) | WindowCommand::Remote(_) => {
-                wrapper_argv(&self.wrapper, title, command, options)
-            }
-        };
+        let argv = self.program_argv(title, command, options);
         spawn_detached(&window_argv(
             &self.program,
             Some(app_id),
             Some(title),
             &argv,
         ))
+    }
+
+    fn program_argv(
+        &self,
+        title: &str,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Vec<String> {
+        match command {
+            WindowCommand::Custom(argv) => argv.clone(),
+            WindowCommand::Plain(_) | WindowCommand::Remote(_) => {
+                wrapper_argv(&self.wrapper, title, command, options)
+            }
+        }
     }
 }
 

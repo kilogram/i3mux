@@ -39,6 +39,7 @@ i3mux terminal                    # another shell (reattaches an orphan first)
 i3mux terminal --new              # always a fresh shell
 i3mux terminal -e htop            # run a command in a fresh persistent shell
 i3mux terminal --no-hold -e make  # close the window as soon as its shell ends
+exec i3mux terminal --here        # this terminal becomes a window of the workspace's session
 i3mux detach                      # save the layout, close the windows, keep the shells
 i3mux attach --session ws3        # restore the layout and reattach every shell
 i3mux attach --remote dev-box --session ws3 --rebind-only  # move ws3's binding to dev-box, touch no window
@@ -113,6 +114,48 @@ i3mux activate --window-command 'my-window --shell {shell}'
   another host, and `terminal --here` reads the host from the binding.
 - `detach` saves the command with the layout, `attach` binds with it
   again, and `i3mux status` shows it.
+
+## Join a session from any terminal
+
+`i3mux terminal --here` makes the terminal it runs in a window of its
+workspace's session. No window opens. Type it in the shell of any
+terminal:
+
+```bash
+exec i3mux terminal --here                      # a shell of this workspace's session, here
+i3mux terminal --here --remote dev-box -e htop  # bind an unbound workspace to dev-box first
+i3mux terminal --here --shell ws3-002           # attach that existing shell here
+```
+
+- i3mux sets the terminal's title to a unique text and finds the Sway
+  window with that title. So it finds the right window when another
+  window has the focus, or when one terminal process has many windows.
+  The terminal must let programs set its title (OSC 0); i3mux waits 5 s
+  for the title, then gives up. Afterwards the terminal gets its own
+  title back, if it has a title stack (XTWINOPS 22 and 23).
+- i3mux then marks the window as the window of a shell, and runs that
+  shell's attach in place of itself (exec). It picks the shell as
+  `i3mux terminal` does: an orphan, or a new one. `-e`, `--new`,
+  `--force` and `--no-hold` work as they do for `terminal`. In a
+  workspace with a window command, the terminal runs that command
+  instead, as every window of the workspace does.
+- An unbound workspace is bound first: to `--remote HOST`, or else to
+  this machine, with the default session name and the
+  `--window-command`, if one is given.
+- i3mux refuses a workspace bound to another host than `--remote`, or
+  with another window command than `--window-command`. It exits with
+  status 1 and changes nothing, so a script can do something else.
+- `--shell NAME` attaches the existing shell NAME of the workspace's
+  session, on the binding's host, and ignores the window command. It
+  never makes a shell: it refuses a shell that does not exist, and one
+  that another client has, unless `--force`. If the host's shpool daemon
+  was replaced, the window does not start a new shell of that name.
+- When the shell ends or is detached, the program that ran i3mux goes on.
+  Without `--no-hold`, a shell that fails or ends within 2 s shows the
+  hint first. With it, the program goes on at once, with the shell's exit
+  status. The window keeps its mark until it closes, so `detach` closes
+  it with the other windows. With `exec`, the terminal closes when the
+  shell ends.
 
 ## Move a binding to another host
 

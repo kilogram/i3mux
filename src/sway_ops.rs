@@ -56,6 +56,29 @@ pub fn wait_for_window_and_mark(sway: &dyn Sway, mark: &Mark) -> Result<u64> {
     )
 }
 
+/// Wait for the window whose title is `title`, which the terminal of this
+/// process just set (PLAN-terminal-here decision 1). Returns its container
+/// id.
+///
+/// # Errors
+/// If no window takes the title within a few seconds, or Sway fails.
+pub fn wait_for_title(sway: &dyn Sway, title: &str) -> Result<u64> {
+    let attempts = WINDOW_WAIT.as_millis() / WINDOW_POLL.as_millis();
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(WINDOW_POLL);
+        }
+        if let Some(con_id) = window::find_by_title(&sway.get_tree()?, title) {
+            return Ok(con_id);
+        }
+    }
+    bail!(
+        "this terminal's window did not take the title i3mux set within {} s; \
+         'i3mux terminal --here' needs a terminal that lets programs set its title",
+        WINDOW_WAIT.as_secs()
+    )
+}
+
 /// Close every window of `session` on `host`, on any workspace, with one
 /// Sway command. Returns the terminals whose windows it closed.
 ///
@@ -94,6 +117,8 @@ pub mod testing {
         next_id: u64,
         /// (workspace name, container id, app id, marks)
         windows: Vec<(String, u64, String, Vec<String>)>,
+        /// Window titles, by container id.
+        titles: std::collections::BTreeMap<u64, String>,
         commands: Vec<String>,
     }
 
@@ -106,6 +131,18 @@ pub mod testing {
             state
                 .windows
                 .push((workspace.into(), id, app_id.into(), Vec::new()));
+            id
+        }
+
+        /// Open a window with `app_id` and the title `title` on `workspace`;
+        /// return its id.
+        pub fn open_titled(&self, workspace: &str, app_id: &str, title: &str) -> u64 {
+            let id = self.open(workspace, app_id);
+            self.state
+                .lock()
+                .unwrap()
+                .titles
+                .insert(id, title.to_owned());
             id
         }
 
@@ -148,10 +185,13 @@ pub mod testing {
                         .map(|(_, id, app_id, marks)| {
                             json!({"id": id, "type": "con", "layout": "none",
                                    "app_id": app_id, "marks": marks,
+                                   "name": state.titles.get(id),
                                    "nodes": [], "floating_nodes": []})
                         })
                         .collect();
-                    json!({"id": 50, "type": "workspace", "name": ws, "layout": "splith",
+                    let num = ws.parse::<i32>().unwrap_or(-1);
+                    json!({"id": 50, "type": "workspace", "name": ws, "num": num,
+                           "focused": false, "layout": "splith",
                            "marks": [], "nodes": windows, "floating_nodes": []})
                 })
                 .collect();

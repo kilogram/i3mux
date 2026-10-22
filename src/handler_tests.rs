@@ -345,6 +345,17 @@ impl Launcher for FakeLauncher {
         self.sway.open(&self.workspace, app_id);
         Ok(())
     }
+
+    fn program_argv(
+        &self,
+        title: &str,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Vec<String> {
+        let mut argv = vec![format!("{options:?}"), title.to_owned()];
+        argv.extend_from_slice(command.argv());
+        argv
+    }
 }
 
 /// One test world: a state store in a temp dir, a fake Sway, a fake host
@@ -818,6 +829,288 @@ fn rebind_refuses_a_session_bound_nowhere_or_twice() {
             .starts_with("Session 'ws4' is bound in workspaces 4 and 5"),
         "{err}"
     );
+    assert!(world.sway.commands().is_empty());
+}
+
+// ------------------------------------------------------- terminal --here
+
+/// The terminal `here` runs in: a window titled "nonce" on `workspace`,
+/// next to another terminal that has focus, as when the user switched
+/// windows while `here` started.
+fn here_terminal(world: &World, workspace: &str) -> u64 {
+    let id = world.sway.open_titled(workspace, "foot", "nonce");
+    world.sway.open_titled(workspace, "foot", "other");
+    id
+}
+
+/// What `FakeLauncher::program_argv` returns for `options`, `title` and
+/// `command`.
+fn here_exec(options: WrapperOptions, title: &str, command: &[String]) -> HereExec {
+    let mut argv = vec![format!("{options:?}"), title.to_owned()];
+    argv.extend_from_slice(command);
+    HereExec {
+        title: title.to_owned(),
+        argv,
+    }
+}
+
+/// PLAN-terminal-here decision 1: in an unbound workspace, `here` binds it
+/// to this machine and its default session, marks the terminal it runs in
+/// (found by its id, not focus), and runs the wrapper's attach of a new
+/// shell there. It opens no window.
+#[test]
+fn here_binds_an_unbound_workspace_and_marks_its_own_window() {
+    let world = World::new(Host::Local);
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        terminal: TerminalRequest {
+            no_hold: true,
+            ..TerminalRequest::default()
+        },
+        ..HereRequest::default()
+    };
+
+    let exec = world.finish(|ports| here(ports, id, &request)).unwrap();
+
+    let binding = world.store.load().unwrap().get("4").cloned().unwrap();
+    assert_eq!(binding, WorkspaceState::new(Host::Local, name("ws4")));
+    assert_eq!(
+        world.sway.commands(),
+        [window::mark_command(id, &world.mark("ws4-001"))]
+    );
+    let attach = mux::attach_argv(&world.host, &t("ws4", 1), false, None);
+    let options = WrapperOptions {
+        no_hold: true,
+        attach_only: false,
+    };
+    assert_eq!(exec, here_exec(options, "i3mux:local:ws4-001", &attach));
+    assert!(world.launches().is_empty(), "no window opens");
+}
+
+/// `--remote` binds an unbound workspace to that host. The window goes
+/// through the host's master, which stays after the command because the
+/// binding names the host.
+#[test]
+fn here_with_remote_binds_an_unbound_workspace_to_that_host() {
+    let world = World::new(deepthought());
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        host: Some(deepthought()),
+        ..HereRequest::default()
+    };
+
+    world.finish(|ports| here(ports, id, &request)).unwrap();
+
+    let binding = world.store.load().unwrap().get("4").cloned().unwrap();
+    assert_eq!(binding.host(), &deepthought());
+    assert!(world.fakes.running(&dt()), "{:?}", world.fakes.events());
+    assert_eq!(
+        world.sway.commands(),
+        [window::mark_command(id, &world.mark("ws4-001"))]
+    );
+}
+
+/// A workspace bound to another host than `--remote`, or with another
+/// window command, is refused before anything changes: no host is asked
+/// (the world's host factory knows only the bound host), nothing is marked
+/// and the binding stays.
+#[test]
+fn here_refuses_a_workspace_bound_otherwise_before_changing_anything() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    let id = here_terminal(&world, "4");
+    let before = world.store.load().unwrap();
+    let other_host = HereRequest {
+        host: Some(deepthought()),
+        ..HereRequest::default()
+    };
+    let other_command = HereRequest {
+        window_command: Some(template("v {shell}")),
+        ..HereRequest::default()
+    };
+
+    let err = here(&world.ports(), id, &other_host).unwrap_err();
+    assert!(
+        matches!(command_error(&err), CommandError::BoundToOtherHost { .. }),
+        "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Workspace 4 is bound to session 'ws4' on local, not deepthought; nothing changed"
+    );
+    let err = here(&world.ports(), id, &other_command).unwrap_err();
+    assert!(
+        matches!(command_error(&err), CommandError::OtherWindowCommand(_)),
+        "{err}"
+    );
+
+    assert!(world.sway.commands().is_empty());
+    assert_eq!(world.store.load().unwrap(), before);
+    assert!(world.created().is_empty());
+}
+
+/// The same `--remote` and window command as the binding's are no
+/// conflict: `here` joins the bound session.
+#[test]
+fn here_joins_a_workspace_bound_as_asked() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    world.host.add_shell("ws4-001", true);
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        host: Some(Host::Local),
+        window_command: Some(template("w {shell}")),
+        ..HereRequest::default()
+    };
+
+    let exec = here(&world.ports(), id, &request).unwrap();
+
+    assert_eq!(exec.title, "i3mux:local:ws4-002");
+}
+
+/// PLAN-terminal-here decision 2: without `--shell`, `here` runs the
+/// binding's window command, after it made the new shell (with `-e`'s
+/// command), so the window command can attach it.
+#[test]
+fn here_runs_the_window_command_and_makes_a_new_shell_first() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {session} {shell}");
+    world.host.add_shell("ws4-001", false);
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        terminal: TerminalRequest {
+            command: Some("htop".into()),
+            ..TerminalRequest::default()
+        },
+        ..HereRequest::default()
+    };
+
+    let exec = here(&world.ports(), id, &request).unwrap();
+
+    assert_eq!(
+        world.created(),
+        [("ws4-002".to_owned(), Some("htop".into()))]
+    );
+    let window = ["w".to_owned(), "ws4".into(), "ws4-002".into()];
+    assert_eq!(
+        exec,
+        here_exec(WrapperOptions::default(), "i3mux:local:ws4-002", &window)
+    );
+}
+
+/// `--shell` attaches that shell through the wrapper, which never starts a
+/// new one (`attach_only`); the window command is not run and no shell is
+/// made.
+#[test]
+fn here_shell_attaches_that_shell_without_the_window_command() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    world.host.add_shell("ws4-003", false);
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        shell: Some(t("ws4", 3)),
+        ..HereRequest::default()
+    };
+
+    let exec = here(&world.ports(), id, &request).unwrap();
+
+    assert!(world.created().is_empty());
+    let attach = mux::attach_argv(&world.host, &t("ws4", 3), false, None);
+    let options = WrapperOptions {
+        no_hold: false,
+        attach_only: true,
+    };
+    assert_eq!(exec, here_exec(options, "i3mux:local:ws4-003", &attach));
+    assert_eq!(
+        world.sway.commands(),
+        [window::mark_command(id, &world.mark("ws4-003"))]
+    );
+}
+
+/// `--shell` never makes a shell (PLAN-terminal-here finding 3). It
+/// refuses a missing shell, a shell of another session, and a shell
+/// attached elsewhere unless `--force`, before anything changes.
+#[test]
+fn here_shell_refuses_a_missing_foreign_or_attached_shell() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-001", true);
+    world.host.add_shell("ws5-001", false);
+    let id = here_terminal(&world, "4");
+    let shell = |terminal: TerminalName, force: bool| HereRequest {
+        shell: Some(terminal),
+        terminal: TerminalRequest {
+            force,
+            ..TerminalRequest::default()
+        },
+        ..HereRequest::default()
+    };
+
+    let missing = here(&world.ports(), id, &shell(t("ws4", 2), false)).unwrap_err();
+    let foreign = here(&world.ports(), id, &shell(t("ws5", 1), false)).unwrap_err();
+    let attached = here(&world.ports(), id, &shell(t("ws4", 1), false)).unwrap_err();
+
+    assert!(
+        matches!(command_error(&missing), CommandError::NoSuchShell { .. }),
+        "{missing}"
+    );
+    assert!(
+        matches!(
+            command_error(&foreign),
+            CommandError::ShellOfOtherSession { .. }
+        ),
+        "{foreign}"
+    );
+    assert!(
+        matches!(command_error(&attached), CommandError::AlreadyAttached(_)),
+        "{attached}"
+    );
+    assert!(world.sway.commands().is_empty());
+    assert!(world.created().is_empty());
+
+    let exec = here(&world.ports(), id, &shell(t("ws4", 1), true)).unwrap();
+    assert_eq!(exec.title, "i3mux:local:ws4-001");
+}
+
+/// The window keeps one i3mux mark: `here` in a window that is already
+/// marked with its shell sends nothing, and in one marked with another
+/// shell it replaces that mark.
+#[test]
+fn here_replaces_the_windows_other_i3mux_mark() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-001", false);
+    world.host.add_shell("ws4-002", false);
+    let id = world.sway.open_marked("4", &world.mark("ws4-001"));
+    let shell = |n| HereRequest {
+        shell: Some(t("ws4", n)),
+        ..HereRequest::default()
+    };
+
+    here(&world.ports(), id, &shell(1)).unwrap();
+    assert!(world.sway.commands().is_empty(), "already marked");
+
+    here(&world.ports(), id, &shell(2)).unwrap();
+    assert_eq!(
+        world.sway.commands(),
+        [
+            window::unmark_command(id, &world.mark("ws4-001")),
+            window::mark_command(id, &world.mark("ws4-002")),
+        ]
+    );
+    assert_eq!(world.window_numbers("ws4"), [2]);
+}
+
+/// An unreachable host binds and marks nothing.
+#[test]
+fn here_on_an_unreachable_host_binds_and_marks_nothing() {
+    let world = World::new(Host::Local);
+    world.host.state.lock().unwrap().unreachable = true;
+    let id = here_terminal(&world, "4");
+
+    here(&world.ports(), id, &HereRequest::default()).unwrap_err();
+
+    assert!(world.store.load().unwrap().get("4").is_none());
     assert!(world.sway.commands().is_empty());
 }
 
@@ -1796,6 +2089,33 @@ fn rebind_only_needs_a_session_and_takes_no_force() {
     assert!(parse(&["--rebind-only", "--remote", "h"]).is_err());
     assert!(parse(&["--rebind-only", "--session", "s", "--force"]).is_err());
     assert!(parse(&["--rebind-only", "--remote", "h", "--session", "s"]).is_ok());
+}
+
+/// `--shell`, `--remote` and `--window-command` belong to `--here`, and
+/// `--shell` (attach only) takes no `-e` and no `--new`.
+#[test]
+fn here_options_need_here_and_shell_takes_no_new_shell() {
+    let parse = |args: &[&str]| Cli::try_parse_from([&["i3mux", "terminal"], args].concat());
+    for alone in [
+        ["--shell", "ws4-001"],
+        ["--remote", "h"],
+        ["--window-command", "w"],
+    ] {
+        assert!(parse(&alone).is_err(), "{alone:?}");
+    }
+    assert!(parse(&["--here", "--shell", "ws4-001", "-e", "htop"]).is_err());
+    assert!(parse(&["--here", "--shell", "ws4-001", "--new"]).is_err());
+    assert!(parse(&[
+        "--here",
+        "-r",
+        "h",
+        "--shell",
+        "ws4-001",
+        "--force",
+        "--no-hold"
+    ])
+    .is_ok());
+    assert!(parse(&["--here", "--window-command", "w {shell}", "-e", "htop"]).is_ok());
 }
 
 #[test]

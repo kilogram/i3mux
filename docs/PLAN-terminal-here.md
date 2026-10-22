@@ -49,7 +49,16 @@ opening its own windows:
      binding's session. It ignores the window command, and the wrapper does
      not start a new shell when the daemon was replaced (exit 75).
    - A terminal whose title does not change within 5 s is refused: the
-     emulator must let programs set the title.
+     emulator must let programs set the title. i3mux saves the terminal's
+     title on the title stack first (XTWINOPS 22) and restores it (23) on
+     success and on refusal. foot and alacritty restore it.
+   - The new shell (for a window command) or the host's master (for the
+     wrapper) comes before the binding and the mark. So a host that fails
+     there leaves nothing bound or marked.
+   - When the shell ends, the program that ran i3mux goes on with the
+     shell's exit status. The window keeps its mark until it closes. A
+     user who wants the terminal to close types `exec i3mux terminal
+     --here`.
 2. **Window command.** A string, split into words like a shell does, with no
    shell. In each word `{session}` becomes the session name and `{shell}`
    the shell name. No `{host}`: a rebind changes the host, so a window that

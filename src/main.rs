@@ -109,6 +109,24 @@ enum CliCommand {
         /// the shell's exit status, instead of keeping it open with a hint
         #[arg(long)]
         no_hold: bool,
+        /// Make the terminal this command runs in a window of its
+        /// workspace's session, instead of opening one: mark it, then run
+        /// the shell (or the window command) in it
+        #[arg(long)]
+        here: bool,
+        /// With --here: attach this existing shell of the session, {session}-{NNN};
+        /// it never starts one, and the window command does not run
+        #[arg(long, value_name = "NAME", requires = "here", conflicts_with_all = ["exec", "new"])]
+        shell: Option<String>,
+        /// With --here: the host of the session; an unbound workspace is bound
+        /// to it, and a workspace bound to another host is refused
+        /// [default: the binding's host, or this machine]
+        #[arg(short, long, requires = "here")]
+        remote: Option<String>,
+        /// With --here: the window command of an unbound workspace's new binding
+        /// (see activate); a workspace bound with another one is refused
+        #[arg(long, value_name = "CMD", requires = "here")]
+        window_command: Option<String>,
     },
     /// Save the focused workspace's layout on the session's host and close its windows
     Detach,
@@ -219,6 +237,29 @@ enum CommandError {
     #[error("No workspace is bound to session '{0}'; nothing to rebind")]
     NothingToRebind(SessionName),
     #[error(
+        "Workspace {workspace} is bound to session '{session}' on {bound}, not {asked}; \
+         nothing changed"
+    )]
+    BoundToOtherHost {
+        workspace: String,
+        session: SessionName,
+        bound: Host,
+        asked: Host,
+    },
+    #[error("Workspace {0} is bound with another window command; nothing changed")]
+    OtherWindowCommand(String),
+    #[error(
+        "Shell {shell} is not a shell of session '{session}', which workspace {workspace} \
+         is bound to"
+    )]
+    ShellOfOtherSession {
+        shell: TerminalName,
+        session: SessionName,
+        workspace: String,
+    },
+    #[error("This terminal's window is on no workspace")]
+    NoWorkspace,
+    #[error(
         "Session '{session}' is bound in workspaces {workspaces} (on different hosts); \
          rebind needs one: end the other with 'i3mux kill --remote HOST --session {session}'"
     )]
@@ -256,7 +297,17 @@ fn main() -> ExitCode {
     }
 }
 
-/// Wire the real ports, run the command, then stop the masters it left unused.
+/// How a command ends: with an exit status, or (`terminal --here`) by
+/// running another program in this process.
+#[derive(Debug)]
+enum Outcome {
+    Exit(ExitCode),
+    Exec(HereExec),
+}
+
+/// Wire the real ports, run the command, then stop the masters it left
+/// unused. Only then does `terminal --here` exec its window's program, so
+/// nothing of i3mux runs after the stop.
 fn run(cli: Cli) -> Result<ExitCode> {
     let wm = Wm::connect()?;
     let store = StateStore::from_env()?;
@@ -291,12 +342,87 @@ fn run(cli: Cli) -> Result<ExitCode> {
         },
         disconnect_wait: DISCONNECT_WAIT,
     };
-    with_unused_masters_stopped(&store, &masters, &wm, || {
+    let outcome = with_unused_masters_stopped(&store, &masters, &wm, || {
         dispatch(&ports, &wm, &launcher, cli.command)
-    })
+    })?;
+    match outcome {
+        Outcome::Exit(code) => Ok(code),
+        Outcome::Exec(here) => Err(exec_here(&here)),
+    }
+}
+
+/// Run `here`'s program in this process, in place of i3mux: set this
+/// terminal's title, then exec. Returns only on failure.
+fn exec_here(here: &HereExec) -> anyhow::Error {
+    use std::os::unix::process::CommandExt as _;
+    if let Err(err) = set_terminal_title(&here.title) {
+        return err;
+    }
+    let Some((program, args)) = here.argv.split_first() else {
+        return anyhow::anyhow!("i3mux bug: an empty window command");
+    };
+    let err = std::process::Command::new(program).args(args).exec();
+    anyhow::Error::new(err).context(format!("cannot run {program}"))
+}
+
+/// XTWINOPS: save the terminal's title on its title stack.
+const TITLE_PUSH: &str = "\x1b[22;0t";
+/// XTWINOPS: restore the title saved last.
+const TITLE_POP: &str = "\x1b[23;0t";
+
+/// Set the title of the terminal of this process (OSC 0).
+fn set_terminal_title(title: &str) -> Result<()> {
+    write_tty(&format!("\x1b]0;{title}\x07"))
+}
+
+/// Write `text` to the terminal of this process (`/dev/tty`).
+fn write_tty(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut tty = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .context(
+            "'i3mux terminal --here' runs in a terminal, and this process has none (/dev/tty)",
+        )?;
+    tty.write_all(text.as_bytes())
+        .and_then(|()| tty.flush())
+        .context("cannot write to /dev/tty")
 }
 
 fn dispatch(
+    ports: &Ports,
+    wm: &Wm,
+    launcher: &TerminalLauncher,
+    command: CliCommand,
+) -> Result<Outcome> {
+    if let CliCommand::Terminal {
+        exec,
+        new,
+        force,
+        no_hold,
+        here: true,
+        shell,
+        remote,
+        window_command,
+    } = command
+    {
+        let request = HereRequest {
+            host: remote.map(RemoteHost::new).transpose()?.map(Host::Ssh),
+            shell: shell.map(|s| s.parse()).transpose()?,
+            terminal: TerminalRequest {
+                command: exec,
+                new,
+                force,
+                no_hold,
+            },
+            window_command: window_command.map(WindowTemplate::new).transpose()?,
+        };
+        return cmd_terminal_here(ports, &request).map(Outcome::Exec);
+    }
+    dispatch_exit(ports, wm, launcher, command).map(Outcome::Exit)
+}
+
+fn dispatch_exit(
     ports: &Ports,
     wm: &Wm,
     launcher: &TerminalLauncher,
@@ -313,6 +439,7 @@ fn dispatch(
             new,
             force,
             no_hold,
+            ..
         } => {
             let request = TerminalRequest {
                 command: exec,
@@ -490,6 +617,28 @@ fn cmd_terminal(
         ports.log.debug(|| describe_choice(&choice));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `terminal --here`: set a nonce title on this terminal, find the window
+/// that took it, and make it a window of its workspace's session. The
+/// terminal's own title comes back afterwards (the title stack), also when
+/// `here` refuses.
+fn cmd_terminal_here(ports: &Ports, request: &HereRequest) -> Result<HereExec> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let nonce = format!("i3mux-here-{}-{nanos}", std::process::id());
+    write_tty(TITLE_PUSH)?;
+    set_terminal_title(&nonce)?;
+    let found =
+        sway_ops::wait_for_title(ports.sway, &nonce).and_then(|id| here(ports, id, request));
+    let popped = write_tty(TITLE_POP);
+    let here = found?;
+    popped?;
+    ports
+        .log
+        .debug(|| format!("running here: {}", shell_words::join(&here.argv)));
+    Ok(here)
 }
 
 fn cmd_detach(ports: &Ports, wm: &Wm) -> Result<ExitCode> {
@@ -706,6 +855,37 @@ fn activate(
     Ok((session, choice))
 }
 
+/// The shells of `binding`'s session on its host.
+fn session_shells(exec: &dyn HostExec, binding: &WorkspaceState) -> Result<Vec<Shell>> {
+    Ok(mux::list(exec)?
+        .into_iter()
+        .filter(|s| s.name().session() == binding.session())
+        .collect())
+}
+
+/// The shell a new window of `binding` shows (plan rule 4): the lowest
+/// orphan, or a new number. A shell with a window in `tree` is never
+/// chosen again, nor one attached elsewhere unless `request.force`.
+fn pick_terminal(
+    tree: &Value,
+    binding: &WorkspaceState,
+    shells: &[Shell],
+    request: &TerminalRequest,
+) -> Choice {
+    let mut in_use = window::session_terminals(tree, binding.host(), binding.session());
+    if !request.force {
+        in_use.extend(
+            shells
+                .iter()
+                .filter(|s| s.is_attached())
+                .map(|s| s.name().clone()),
+        );
+    }
+    let alive: Vec<TerminalName> = shells.iter().map(|s| s.name().clone()).collect();
+    let force_new = request.new || request.command.is_some();
+    mux::choose_terminal(binding.session(), &alive, &in_use, force_new)
+}
+
 /// Open one window of the session bound to `workspace` (plan rule 4).
 ///
 /// Under the state lock: list the host's shells, read the marked windows,
@@ -720,23 +900,8 @@ fn open_terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> R
         .cloned()
         .ok_or_else(|| CommandError::Unbound(workspace.to_owned()))?;
     let host = (ports.hosts)(binding.host());
-    let shells: Vec<Shell> = mux::list(host.as_ref())?
-        .into_iter()
-        .filter(|s| s.name().session() == binding.session())
-        .collect();
-    let mut in_use =
-        window::session_terminals(&ports.sway.get_tree()?, binding.host(), binding.session());
-    if !request.force {
-        in_use.extend(
-            shells
-                .iter()
-                .filter(|s| s.is_attached())
-                .map(|s| s.name().clone()),
-        );
-    }
-    let alive: Vec<TerminalName> = shells.iter().map(|s| s.name().clone()).collect();
-    let force_new = request.new || request.command.is_some();
-    let choice = mux::choose_terminal(binding.session(), &alive, &in_use, force_new);
+    let shells = session_shells(host.as_ref(), &binding)?;
+    let choice = pick_terminal(&ports.sway.get_tree()?, &binding, &shells, request);
     open_window(
         ports,
         host.as_ref(),
@@ -754,6 +919,157 @@ fn open_terminal(ports: &Ports, workspace: &str, request: &TerminalRequest) -> R
     )?;
     drop(lock);
     Ok(choice)
+}
+
+/// A terminal to make a window of its workspace's session (`terminal
+/// --here`, PLAN-terminal-here decision 1).
+#[derive(Debug, Default)]
+struct HereRequest {
+    /// `--remote`: the host. An unbound workspace is bound to it, and a
+    /// workspace bound to another host is refused. `None`: the binding's
+    /// host, or this machine for an unbound workspace.
+    host: Option<Host>,
+    /// `--shell`: attach this existing shell, without the window command.
+    shell: Option<TerminalName>,
+    /// `-e`, `--new`, `--force`, `--no-hold`.
+    terminal: TerminalRequest,
+    /// `--window-command`: the window command of the binding it makes.
+    window_command: Option<WindowTemplate>,
+}
+
+/// What `terminal --here` runs in its terminal, in place of i3mux.
+#[derive(Debug, PartialEq, Eq)]
+struct HereExec {
+    /// The terminal's title: `i3mux:{host}:{shell}`.
+    title: String,
+    argv: Vec<String>,
+}
+
+/// Make window `con_id`, the terminal of this process, a window of its
+/// workspace's session, and say what to run in it (PLAN-terminal-here
+/// decision 1).
+///
+/// Every refusal comes before anything changes, so a caller can fall back:
+/// a workspace bound to another host than `request.host`, or with another
+/// window command; a `--shell` of another session, missing, or attached
+/// elsewhere (without `force`); an unreachable host. Then, under the state
+/// lock, it makes a new shell for the window command, or starts the
+/// host's master for the wrapper. Only then does it bind an unbound
+/// workspace and mark the window with its shell, replacing any other i3mux
+/// mark the window had. What it returns runs the wrapper (with
+/// `--attach-only` for `--shell`), or the window command.
+fn here(ports: &Ports, con_id: u64, request: &HereRequest) -> Result<HereExec> {
+    let mut lock = ports.store.lock()?;
+    let tree = ports.sway.get_tree()?;
+    let node = window::workspace_containing(&tree, con_id).ok_or(CommandError::NoWorkspace)?;
+    let workspace: WorkspaceInfo = serde_json::from_value(node.clone())
+        .context("cannot read the workspace of this terminal's window")?;
+    let name = workspace.name().to_owned();
+    let bound = lock.state().get(&name).cloned();
+    let binding = match &bound {
+        Some(bound) => here_fits(&name, bound, request).map(|()| bound.clone())?,
+        None => WorkspaceState::new(
+            request.host.clone().unwrap_or(Host::Local),
+            default_session(&workspace)?,
+        )
+        .with_window_command(request.window_command.clone()),
+    };
+    let exec = (ports.hosts)(binding.host());
+    let shells = session_shells(exec.as_ref(), &binding)?;
+    let choice = match &request.shell {
+        Some(shell) => {
+            here_shell(&name, &binding, &shells, shell, request.terminal.force)?;
+            Choice::Reattach(shell.clone())
+        }
+        None => pick_terminal(&tree, &binding, &shells, &request.terminal),
+    };
+    let spec = WindowSpec {
+        force: request.terminal.force,
+        command: request.terminal.command.as_deref(),
+        options: WrapperOptions {
+            no_hold: request.terminal.no_hold,
+            attach_only: request.shell.is_some(),
+        },
+        template: binding.window_command().filter(|_| request.shell.is_none()),
+        exists: !matches!(choice, Choice::Create(_)),
+    };
+    let window = window_program(ports, exec.as_ref(), choice.name(), &spec)?;
+    if bound.is_none() {
+        lock.state_mut().bind(&name, binding.clone())?;
+        lock.commit()?;
+    }
+    let mark = Mark::new(binding.host().clone(), choice.name().clone());
+    remark(ports, &tree, con_id, &mark)?;
+    let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
+    let argv = ports.launcher.program_argv(&title, &window, spec.options);
+    Ok(HereExec { title, argv })
+}
+
+/// Refuse `terminal --here` in a workspace bound other than `request`
+/// asks: to another host, or with another window command.
+fn here_fits(workspace: &str, bound: &WorkspaceState, request: &HereRequest) -> Result<()> {
+    if let Some(asked) = request.host.as_ref().filter(|h| *h != bound.host()) {
+        return Err(CommandError::BoundToOtherHost {
+            workspace: workspace.to_owned(),
+            session: bound.session().clone(),
+            bound: bound.host().clone(),
+            asked: asked.clone(),
+        }
+        .into());
+    }
+    if request
+        .window_command
+        .as_ref()
+        .is_some_and(|w| Some(w) != bound.window_command())
+    {
+        return Err(CommandError::OtherWindowCommand(workspace.to_owned()).into());
+    }
+    Ok(())
+}
+
+/// Give window `con_id` the one i3mux mark `mark`: any other i3mux mark
+/// it has goes, so the window counts for one shell only.
+fn remark(ports: &Ports, tree: &Value, con_id: u64, mark: &Mark) -> Result<()> {
+    let marks = window::marks_of(tree, con_id);
+    for old in marks.iter().filter(|m| *m != mark) {
+        ports.sway.run(&window::unmark_command(con_id, old))?;
+    }
+    if !marks.contains(mark) {
+        ports.sway.run(&window::mark_command(con_id, mark))?;
+    }
+    Ok(())
+}
+
+/// Check `--here --shell shell`: a live shell of `binding`'s session, not
+/// attached elsewhere unless `force`. It is never made (PLAN-terminal-here
+/// finding 3).
+fn here_shell(
+    workspace: &str,
+    binding: &WorkspaceState,
+    shells: &[Shell],
+    shell: &TerminalName,
+    force: bool,
+) -> Result<()> {
+    if shell.session() != binding.session() {
+        return Err(CommandError::ShellOfOtherSession {
+            shell: shell.clone(),
+            session: binding.session().clone(),
+            workspace: workspace.to_owned(),
+        }
+        .into());
+    }
+    let found =
+        shells
+            .iter()
+            .find(|s| s.name() == shell)
+            .ok_or_else(|| CommandError::NoSuchShell {
+                terminal: shell.clone(),
+                host: binding.host().clone(),
+            })?;
+    if found.is_attached() && !force {
+        return Err(CommandError::AlreadyAttached(shell.clone()).into());
+    }
+    Ok(())
 }
 
 /// How a window shows its shell.
@@ -781,15 +1097,7 @@ fn open_window(
     spec: &WindowSpec,
 ) -> Result<u64> {
     let mark = Mark::new(host.host().clone(), terminal.clone());
-    let window = match spec.template {
-        Some(template) => {
-            if !spec.exists {
-                mux::create(host, terminal, spec.command)?;
-            }
-            WindowCommand::Custom(template.argv(terminal))
-        }
-        None => window_command(ports, host, terminal, spec.force, spec.command)?,
-    };
+    let window = window_program(ports, host, terminal, spec)?;
     ports
         .log
         .debug(|| format!("opening {mark}: {}", shell_words::join(window.argv())));
@@ -800,7 +1108,26 @@ fn open_window(
     sway_ops::wait_for_window_and_mark(ports.sway, &mark)
 }
 
-/// What the window of `terminal` runs. A remote window goes through its
+/// What the window of `terminal` runs: the binding's window command, for
+/// which i3mux makes a missing shell first, or else the wrapper's attach.
+fn window_program(
+    ports: &Ports,
+    host: &dyn HostExec,
+    terminal: &TerminalName,
+    spec: &WindowSpec,
+) -> Result<WindowCommand> {
+    match spec.template {
+        Some(template) => {
+            if !spec.exists {
+                mux::create(host, terminal, spec.command)?;
+            }
+            Ok(WindowCommand::Custom(template.argv(terminal)))
+        }
+        None => window_command(ports, host, terminal, spec.force, spec.command),
+    }
+}
+
+/// The wrapper's attach of `terminal`. A remote window goes through its
 /// host's ssh master, which this starts first (plan-ssh-recovery rule 1),
 /// and gets the `--force` argv that it reattaches with after a dropped
 /// connection (rule 8).
