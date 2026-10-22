@@ -33,6 +33,9 @@ struct HostState {
     detach_calls: Vec<Vec<String>>,
     /// Every shell made with `shpool attach -b`: its name and `-c` command.
     created: Vec<(String, Option<String>)>,
+    /// Make `shpool attach -b` fail, as a host whose shpool cannot start a
+    /// shell.
+    fail_create: bool,
 }
 
 impl HostState {
@@ -147,6 +150,9 @@ impl HostExec for FakeHost {
         }
         if let Some(at) = argv.iter().position(|a| a == "attach") {
             if argv.get(at + 1).is_some_and(|a| a == "-b") {
+                if state.fail_create {
+                    return Err(self.failure("shpool: cannot start the shell"));
+                }
                 let name = argv.last().cloned().unwrap_or_default();
                 let tail = &argv[at..];
                 let cmd = tail
@@ -1265,6 +1271,55 @@ fn here_racing_terminal_never_picks_the_same_shell() {
         "the orphan was not reattached: {names:?}"
     );
     assert_eq!(world.window_numbers("ws4").len(), 8);
+}
+
+/// PLAN-terminal-here decision 1: the new shell of a window command comes
+/// before the binding and the mark. A host that cannot make it leaves the
+/// workspace unbound and the terminal unmarked.
+#[test]
+fn here_whose_new_shell_fails_binds_and_marks_nothing() {
+    let world = World::new(Host::Local);
+    world.host.state.lock().unwrap().fail_create = true;
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        window_command: Some(template("w {shell}")),
+        ..HereRequest::default()
+    };
+
+    here(&world.ports(), id, &request).unwrap_err();
+
+    assert!(world.store.load().unwrap().get("4").is_none(), "bound");
+    assert!(world.sway.commands().is_empty(), "marked");
+}
+
+/// PLAN-terminal-here decision 3 from a remote host: a rebind away from
+/// it contacts it not at all (no master started or stopped), even with
+/// its windows still attached; their marks move, their shells stay.
+#[test]
+fn rebind_away_from_a_remote_host_never_contacts_it() {
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-001", true);
+    world.sway.open_marked("4", &world.mark("ws4-001"));
+
+    let rebound = rebind(&world.ports(), &Host::Local, &name("ws4")).unwrap();
+
+    assert_eq!(rebound.from, Some(deepthought()));
+    assert!(
+        world.fakes.events().is_empty(),
+        "{:?}",
+        world.fakes.events()
+    );
+    assert_eq!(
+        world.host.shells(),
+        BTreeMap::from([("ws4-001".to_owned(), true)])
+    );
+    assert!(world.host.state.lock().unwrap().detach_calls.is_empty());
+    let tree = world.sway.get_tree().unwrap();
+    assert_eq!(
+        window::session_terminals(&tree, &Host::Local, &name("ws4")),
+        [t("ws4", 1)]
+    );
 }
 
 // ------------------------------------------------------------- activate
