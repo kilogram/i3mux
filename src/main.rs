@@ -261,7 +261,8 @@ enum CommandError {
     OtherWindowCommand(String),
     #[error(
         "Shell {shell} is not a shell of session '{session}', which workspace {workspace} \
-         is bound to"
+         shows; move this window to the workspace of session '{}'",
+        .shell.session()
     )]
     ShellOfOtherSession {
         shell: TerminalName,

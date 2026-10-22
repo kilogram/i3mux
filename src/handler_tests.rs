@@ -1165,6 +1165,12 @@ fn here_shell_refuses_a_missing_foreign_or_attached_shell() {
     assert_eq!(failure_status(&missing), EXIT_NO_SHELL);
     assert_eq!(failure_status(&foreign), 1);
     assert!(
+        foreign
+            .to_string()
+            .ends_with("; move this window to the workspace of session 'ws5'"),
+        "a window moved to another workspace is told where it belongs: {foreign}"
+    );
+    assert!(
         matches!(
             command_error(&foreign),
             CommandError::ShellOfOtherSession { .. }
