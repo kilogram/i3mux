@@ -197,6 +197,26 @@ impl TerminalLauncher {
         Ok(Self { program, wrapper })
     }
 
+    /// The terminal's argv for a window with `app_id`. A window of the
+    /// binding's window command gets no title flag: alacritty and kitty
+    /// lock a title given on their command line, and the window command
+    /// may run `terminal --here`, which finds its window by a title it sets
+    /// (PLAN-terminal-here). i3mux finds the window by its app id.
+    fn terminal_argv(
+        &self,
+        app_id: &str,
+        title: &str,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Vec<String> {
+        let argv = self.program_argv(title, command, options);
+        let title = match command {
+            WindowCommand::Custom(_) => None,
+            WindowCommand::Plain(_) | WindowCommand::Remote(_) => Some(title),
+        };
+        window_argv(&self.program, Some(app_id), title, &argv)
+    }
+
     /// Start a plain terminal (no i3mux) that runs `cmd` with `sh -c`, or
     /// the user's shell.
     ///
@@ -218,13 +238,7 @@ impl Launcher for TerminalLauncher {
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Result<()> {
-        let argv = self.program_argv(title, command, options);
-        spawn_detached(&window_argv(
-            &self.program,
-            Some(app_id),
-            Some(title),
-            &argv,
-        ))
+        spawn_detached(&self.terminal_argv(app_id, title, command, options))
     }
 
     fn program_argv(
@@ -348,6 +362,35 @@ mod tests {
         assert_eq!(
             window_argv("wezterm", Some("id"), None, &cmd)[..4],
             strings(&["wezterm", "--app-id", "id", "-e"])
+        );
+    }
+
+    /// alacritty ignores the titles programs set once `-T` names one, so
+    /// `terminal --here` in a window command's window could not find its
+    /// window (found by handoff's done-when test, real alacritty).
+    #[test]
+    fn a_window_commands_window_gets_no_title_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = TerminalLauncher::install("alacritty".into(), dir.path()).unwrap();
+        let custom = WindowCommand::Custom(strings(&["handoff", "window", "ws3", "ws3-002"]));
+        assert_eq!(
+            launcher.terminal_argv("id", "t", &custom, WrapperOptions::default()),
+            strings(&[
+                "alacritty",
+                "--class",
+                "id",
+                "-e",
+                "handoff",
+                "window",
+                "ws3",
+                "ws3-002"
+            ])
+        );
+        let plain = WindowCommand::Plain(strings(&["shpool"]));
+        let argv = launcher.terminal_argv("id", "t", &plain, WrapperOptions::default());
+        assert_eq!(
+            argv[..5],
+            strings(&["alacritty", "--class", "id", "-T", "t"])
         );
     }
 

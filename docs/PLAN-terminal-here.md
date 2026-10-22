@@ -65,6 +65,10 @@ opening its own windows:
      --here`.
    - i3mux sets no title of its own. The wrapper sets
      `i3mux:{host}:{shell}`. A window command keeps the terminal's title.
+   - A window that i3mux opens for a window command gets no title flag
+     (`-T`). alacritty and kitty lock a title given on their command
+     line, so `terminal --here` in that window could not set its title.
+     i3mux finds the window by its app id.
    - When the exec fails (a window command that does not exist), i3mux
      undoes its changes, then exits 1. Marks it added go, and marks it
      removed come back. The binding it made goes, and the shell it made
