@@ -79,3 +79,33 @@ fn every_window_runs_the_window_command(#[case] session: Session) -> Result<()> 
     );
     Ok(())
 }
+
+/// The window command the README suggests, `i3mux terminal --here --shell
+/// {shell}`, attaches the shell that i3mux made for the window: i3mux runs
+/// the command only once the `attach -b` client left the new shell.
+#[rstest]
+#[case::local(Session::Local)]
+#[case::remote(Session::Remote)]
+fn a_window_command_attaches_its_shell_in_place(#[case] session: Session) -> Result<()> {
+    let env = TestEnvironment::new()?;
+    env.focus_workspace(WS)?;
+    env.i3mux()
+        .run(&format!(
+            "activate{} --window-command {}",
+            session.remote_flag(),
+            shell_words::quote("i3mux terminal --here --shell {shell} --no-hold")
+        ))?
+        .ok()?;
+    env.i3mux().terminal("")?;
+
+    wait_until("both windows attached their shells", || {
+        let shells = env.shells(session)?;
+        Ok(shells.len() == 2 && shells.iter().all(|s| s.attached))
+    })?;
+    assert_eq!(
+        env.marks(WS)?,
+        [session.mark(NAME, 1), session.mark(NAME, 2)]
+    );
+    assert_eq!(env.windows(WS)?.len(), 2, "no window opened twice");
+    Ok(())
+}

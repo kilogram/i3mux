@@ -106,8 +106,8 @@ i3mux activate --window-command 'my-window --shell {shell}'
   workspace. The window keeps its mark, so `detach`, `kill`, `sessions`
   and `status` count it as one of the session's windows.
 - i3mux makes a new shell first, without attaching it (`shpool attach
-  -b`, with the `-e` command if one is given). The command attaches the
-  shell itself, for example with `i3mux terminal --here --shell {shell}`
+  -b`, with the `-e` command if one is given), and runs the command once
+  no client shows the shell. The command attaches the shell itself, for example with `i3mux terminal --here --shell {shell}`
   (see "Join a session from any terminal"), which ignores the window
   command. When the command ends, the window ends: there is no hint.
 - There is no `{host}`: `attach --rebind-only` can move the binding to

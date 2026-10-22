@@ -36,6 +36,9 @@ struct HostState {
     /// Make `shpool attach -b` fail with this error, as a host whose shpool
     /// cannot start a shell.
     fail_create: Option<String>,
+    /// Like shpool, a shell that `attach -b` made lists as attached for
+    /// this many `list` calls, while its client leaves.
+    create_lag: usize,
 }
 
 impl HostState {
@@ -159,6 +162,11 @@ impl HostExec for FakeHost {
                     .iter()
                     .position(|a| a == "-c")
                     .and_then(|c| tail.get(c + 1).cloned());
+                if !state.shells.contains_key(&name) && state.create_lag > 0 {
+                    let lag = state.create_lag;
+                    state.shells.insert(name.clone(), true);
+                    state.detaching.insert(name.clone(), lag - 1);
+                }
                 state.shells.entry(name.clone()).or_insert(false);
                 state.created.push((name, cmd));
             }
@@ -1059,6 +1067,32 @@ fn here_runs_the_window_command_and_makes_a_new_shell_first() {
         (exec.title, exec.argv),
         here_exec(WrapperOptions::default(), "i3mux:local:ws4-002", &window)
     );
+}
+
+/// A window command that attaches its shell (`i3mux terminal --here
+/// --shell {shell}`) finds it free: shpool lists a shell that `attach -b`
+/// made as attached for a moment, and i3mux returns from making it only
+/// once no client shows it. Without the wait, `--here --shell` in the
+/// window refuses the shell as attached elsewhere.
+#[test]
+fn a_window_command_can_attach_the_shell_i3mux_made_for_it() {
+    let world = World::new(Host::Local);
+    world.host.state.lock().unwrap().create_lag = 3;
+    world.bind_with("4", "ws4", "i3mux terminal --here --shell {shell}");
+    let first = world.sway.open_titled("4", "foot", "first");
+
+    here(&world.ports(), first, &HereRequest::default()).unwrap();
+    // The window command's own `--here --shell`, in the window i3mux
+    // just marked.
+    let attach = HereRequest {
+        shell: Some(t("ws4", 1)),
+        ..HereRequest::default()
+    };
+
+    let exec = here(&world.ports(), first, &attach).unwrap();
+
+    assert_eq!(world.created(), [("ws4-001".to_owned(), None)]);
+    assert_eq!(exec.title, "i3mux:local:ws4-001");
 }
 
 /// `--shell` attaches that shell through the wrapper, which never starts a

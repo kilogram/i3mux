@@ -80,7 +80,9 @@ opening its own windows:
    --window-command`). `detach` saves it with the layout and `attach`
    restores it. `terminal`, `attach` and `open` run it in every window they
    open. i3mux makes a missing shell first (`shpool attach -b`), so the
-   command can attach it. The window keeps its mark.
+   command can attach it. It runs the command only once no client shows
+   the shell: shpool lists a new shell as attached for up to 250 ms. The
+   window keeps its mark.
 3. **Rebind only** (`attach --remote NEW --session S --rebind-only`). It
    moves the one binding of session S to NEW and re-marks the windows of S
    that show another host. It contacts no host and starts no master. A

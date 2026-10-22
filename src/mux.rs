@@ -25,6 +25,8 @@
 //!   unreachable host as an error (plan rule 11).
 //! - [`choose_terminal`] is pure (plan rule 4).
 
+use std::time::{Duration, Instant};
+
 use serde::Deserialize;
 
 use crate::host::{HostError, HostExec};
@@ -253,23 +255,46 @@ pub fn attach_argv(
     host.attach_argv(&shpool_argv(&args))
 }
 
+/// How long [`create`] waits for the client of `attach -b` to leave the
+/// new shell.
+const FREE_WAIT: Duration = Duration::from_secs(5);
+const FREE_POLL: Duration = Duration::from_millis(50);
+
 /// Make shell `name` on `host` without attaching it: `shpool attach -b`,
 /// running `cmd` (split by shpool with shell-words rules) instead of the
 /// login shell if given. The caller knows the shell does not exist: on an
 /// existing name, shpool would attach that shell and ignore `cmd`.
 ///
+/// It returns once no client shows the shell (bounded by [`FREE_WAIT`]).
+/// shpool lists a new shell as attached while the `attach -b` client
+/// leaves it, for up to a quarter of a second. A window command that
+/// attaches the shell meanwhile would be refused as attached elsewhere.
+/// Once `attach -b` made the shell, a failed listing only ends the wait.
+///
 /// # Errors
-/// As [`list`].
+/// As [`list`], for the `attach -b` itself.
 pub fn create(host: &dyn HostExec, name: &TerminalName, cmd: Option<&str>) -> Result<(), MuxError> {
-    let name = name.to_string();
+    let shown = name.to_string();
     let mut args = vec!["attach", "-b"];
     if let Some(cmd) = cmd {
         args.extend(["-c", cmd]);
     }
-    args.push(&name);
+    args.push(&shown);
     host.run(&shpool_argv(&args), None)
-        .map(drop)
-        .map_err(|err| classify(host.host(), err))
+        .map_err(|err| classify(host.host(), err))?;
+    let deadline = Instant::now() + FREE_WAIT;
+    while Instant::now() < deadline {
+        let attached = list(host).is_ok_and(|shells| {
+            shells
+                .iter()
+                .any(|shell| shell.name() == name && shell.is_attached())
+        });
+        if !attached {
+            break;
+        }
+        std::thread::sleep(FREE_POLL);
+    }
+    Ok(())
 }
 
 /// Kill the given shells. Shells that are already gone are not an error.
