@@ -58,6 +58,14 @@ const EXIT_CHOOSE: u8 = 2;
 /// Exit status of `status` when the focused workspace is not bound.
 const EXIT_UNBOUND: u8 = 3;
 
+/// Exit status of any command refused because the shell it names does
+/// not exist on its host (README, "Exit status").
+const EXIT_NO_SHELL: u8 = 4;
+
+/// Exit status of any command refused because no workspace is bound to
+/// the session it names (README, "Exit status").
+const EXIT_NO_BINDING: u8 = 5;
+
 /// How long `detach` waits for closed windows' shells to lose their clients.
 const DISCONNECT_WAIT: Duration = Duration::from_secs(5);
 const DISCONNECT_POLL: Duration = Duration::from_millis(100);
@@ -295,8 +303,19 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             eprintln!("i3mux: {err:#}");
-            ExitCode::FAILURE
+            ExitCode::from(failure_status(&err))
         }
+    }
+}
+
+/// The exit status of a command that failed with `err`: a missing shell
+/// and a missing binding have their own, so a caller can branch on them
+/// without reading the message; any other failure is 1.
+fn failure_status(err: &anyhow::Error) -> u8 {
+    match err.chain().find_map(|e| e.downcast_ref::<CommandError>()) {
+        Some(CommandError::NoSuchShell { .. }) => EXIT_NO_SHELL,
+        Some(CommandError::NotBound { .. } | CommandError::NothingToRebind(_)) => EXIT_NO_BINDING,
+        _ => 1,
     }
 }
 

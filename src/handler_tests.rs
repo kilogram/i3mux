@@ -887,6 +887,12 @@ fn rebind_refuses_a_session_bound_nowhere_or_twice() {
         command_error(&err),
         CommandError::NothingToRebind(_)
     ));
+    // Its own exit status: no binding (README, "Exit status").
+    assert_eq!(failure_status(&err), EXIT_NO_BINDING);
+    assert_eq!(
+        failure_status(&err.context("while rebinding")),
+        EXIT_NO_BINDING
+    );
 
     world.bind("4", "ws4");
     let elsewhere = WorkspaceState::new(deepthought(), name("ws4"));
@@ -900,6 +906,7 @@ fn rebind_refuses_a_session_bound_nowhere_or_twice() {
             .starts_with("Session 'ws4' is bound in workspaces 4 and 5"),
         "{err}"
     );
+    assert_eq!(failure_status(&err), 1, "any other refusal");
     assert!(world.sway.commands().is_empty());
 }
 
@@ -1154,6 +1161,9 @@ fn here_shell_refuses_a_missing_foreign_or_attached_shell() {
         matches!(command_error(&missing), CommandError::NoSuchShell { .. }),
         "{missing}"
     );
+    // Its own exit status: no shell (README, "Exit status").
+    assert_eq!(failure_status(&missing), EXIT_NO_SHELL);
+    assert_eq!(failure_status(&foreign), 1);
     assert!(
         matches!(
             command_error(&foreign),
@@ -1929,6 +1939,7 @@ fn open_of_a_session_bound_nowhere_is_refused_without_asking_the_host() {
         "No workspace is bound to session 'ws9' on deepthought; run 'i3mux activate --remote \
          deepthought --session ws9' in the workspace that should show it"
     );
+    assert_eq!(failure_status(&err), EXIT_NO_BINDING);
     assert!(
         world.fakes.events().is_empty(),
         "{:?}",

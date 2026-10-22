@@ -253,6 +253,21 @@ bounded output spool and replays it on reattach without the alternate screen.
 Measurements and the full design are in
 [docs/PLAN-sway-shpool.md](docs/PLAN-sway-shpool.md).
 
+## Exit status
+
+| Status | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Any other failure; the last line of stderr starts with `i3mux:` |
+| 2 | `attach`: several sessions fit and none was named |
+| 3 | `status`: the focused workspace is not bound |
+| 4 | The shell the command names does not exist on its host |
+| 5 | No workspace is bound to the session the command names |
+
+Statuses 4 and 5 let a program branch without reading the message: a
+window command can end when its shell is gone, and a mover can treat a
+rebind of an unbound session as nothing to do.
+
 ## Development
 
 ```bash
