@@ -1137,6 +1137,35 @@ fn here_shell_attaches_that_shell_without_the_window_command() {
 /// `--shell` never makes a shell (PLAN-terminal-here finding 3). It
 /// refuses a missing shell, a shell of another session, and a shell
 /// attached elsewhere unless `--force`, before anything changes.
+/// A window that kg moved to another workspace keeps its shell: `here
+/// --shell` takes the binding of the shell's own session, wherever the
+/// window is now, attaches on that binding's host, and changes no binding.
+#[test]
+fn here_shell_follows_its_own_session_from_another_workspace() {
+    let world = World::new(Host::Local);
+    world.bind("3", "ws3");
+    world.host.add_shell("ws3-001", false);
+    let id = here_terminal(&world, "5");
+    let request = HereRequest {
+        shell: Some(t("ws3", 1)),
+        terminal: TerminalRequest {
+            no_hold: true,
+            ..TerminalRequest::default()
+        },
+        ..HereRequest::default()
+    };
+
+    let exec = here(&world.ports(), id, &request).unwrap();
+
+    assert_eq!(exec.title, "i3mux:local:ws3-001");
+    let state = world.store.load().unwrap();
+    assert!(state.get("5").is_none(), "workspace 5 was bound");
+    assert_eq!(
+        state.get("3").map(|b| b.session().to_string()).as_deref(),
+        Some("ws3")
+    );
+}
+
 #[test]
 fn here_shell_refuses_a_missing_foreign_or_attached_shell() {
     let world = World::new(Host::Local);

@@ -122,8 +122,9 @@ enum CliCommand {
         /// the shell (or the window command) in it
         #[arg(long)]
         here: bool,
-        /// With --here: attach this existing shell of the session, {session}-{NNN};
-        /// it never starts one, and the window command does not run. A shell
+        /// With --here: attach this existing shell, {session}-{NNN}, where its own
+        /// session is bound (a window moved to another workspace keeps it); it
+        /// never starts one, and the window command does not run. A shell
         /// that another window shows needs --force, which moves it here
         #[arg(long, value_name = "NAME", requires = "here", conflicts_with_all = ["exec", "new"])]
         shell: Option<String>,
@@ -1014,8 +1015,23 @@ fn here(ports: &Ports, con_id: u64, request: &HereRequest) -> Result<HereExec> {
     let node = window::workspace_containing(&tree, con_id).ok_or(CommandError::NoWorkspace)?;
     let workspace: WorkspaceInfo = serde_json::from_value(node.clone())
         .context("cannot read the workspace of this terminal's window")?;
-    let name = workspace.name().to_owned();
-    let bound = lock.state().get(&name).cloned();
+    // With --shell, the shell's own session decides the binding: a window
+    // that kg moved to another workspace keeps its shell, and no binding
+    // changes. A session bound nowhere falls back to the window's
+    // workspace.
+    let of_session = request.shell.as_ref().and_then(|shell| {
+        lock.state()
+            .bindings()
+            .find(|(_, b)| b.session() == shell.session())
+            .map(|(ws, b)| (ws.to_owned(), b.clone()))
+    });
+    let (name, bound) = if let Some((ws, binding)) = of_session {
+        (ws, Some(binding))
+    } else {
+        let name = workspace.name().to_owned();
+        let bound = lock.state().get(&name).cloned();
+        (name, bound)
+    };
     let binding = match &bound {
         Some(bound) => here_fits(&name, bound, request).map(|()| bound.clone())?,
         None => WorkspaceState::new(

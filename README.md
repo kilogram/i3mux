@@ -130,6 +130,11 @@ i3mux terminal --here --remote dev-box -e htop  # bind an unbound workspace to d
 i3mux terminal --here --shell ws3-002           # attach that existing shell here
 ```
 
+- With `--shell`, the shell's own session decides the host: a window
+  that you moved to another workspace still attaches its shell, where
+  its session is bound. A session bound nowhere takes the window's
+  workspace, as without `--shell`.
+
 - i3mux sets the terminal's title to a unique text and finds the Sway
   window with that title. So it finds the right window when another
   window has the focus, or when one terminal process has many windows.
