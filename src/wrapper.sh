@@ -25,6 +25,12 @@
 #   exit 75   The remote shpool daemon was replaced. Run ARGV once more,
 #             which starts a new shell in this window.
 #
+# It never runs ARGV on a terminal with 0 rows or 0 columns, or on one that
+# is gone (a character device that is no terminal any more): shpool panics
+# on an attach at that size, and the shell can never be attached again
+# (shell-pool/shpool#445). It exits instead, after one line. It sets no
+# SIGHUP trap: a hung-up window ends it at once, also while ARGV runs.
+#
 # bash, not sh: the landing page refreshes once a second while it waits for
 # a key, which needs `read -t`, and REATTACH needs an array.
 set -u
@@ -52,6 +58,31 @@ argv=("$@")
 
 say() { printf '[i3mux] %s\n' "$*"; }
 clear_screen() { printf '\033[H\033[2J'; }
+
+# Whether stdin is a terminal with rows and columns, within a second (a new
+# window may draw late). Not a terminal and no character device (a pipe):
+# there is no size to wait for.
+has_size() {
+    local rows cols tries=10
+    if ! [ -t 0 ]; then
+        ! [ -c /dev/stdin ]
+        return
+    fi
+    while [ "$tries" -gt 0 ]; do
+        read -r rows cols < <(stty size 2>/dev/null) || return 1
+        [ "${rows:-0}" -gt 0 ] && [ "${cols:-0}" -gt 0 ] && return 0
+        sleep 0.1
+        tries=$((tries - 1))
+    done
+    return 1
+}
+
+# Exit, after one line, unless the terminal has a size (see the header).
+need_size() {
+    has_size && return 0
+    say "This terminal has no size (0 rows or 0 columns), or is gone: $title is not attached."
+    exit 1
+}
 
 # Read the properties of UNIT into active, sub, inv, restarts, next_delay
 # and changed (a unix time).
@@ -145,6 +176,7 @@ printf '\033]0;%s\007' "$title"
 replaced=
 while :; do
     start=$(date +%s)
+    need_size
     if [ -z "$remote" ]; then
         "${argv[@]}"
         status=$?

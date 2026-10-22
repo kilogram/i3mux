@@ -87,7 +87,10 @@ Closing a window never kills a shell. Only `exit` in the shell or
 window stays open with a hint until you press Enter: the shell may be
 attached from another terminal. `i3mux terminal --no-hold` opens a window
 that closes as soon as its shell ends or is detached, with the shell's
-exit status, like tmux's `remain-on-exit off`.
+exit status, like tmux's `remain-on-exit off`. A window never attaches
+its shell while its terminal has 0 rows or 0 columns, or is gone: shpool
+0.11.5 panics on such an attach, and the shell can never be attached again
+(shell-pool/shpool#445). The window says so and closes.
 
 ## Window commands
 

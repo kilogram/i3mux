@@ -636,6 +636,82 @@ exit 0
         assert!(text.contains("Press Enter"), "{text}");
     }
 
+    /// shell-pool/shpool#445: an attach at 0 rows or 0 columns panics
+    /// shpool's shell-to-client thread, and the shell can never be attached
+    /// again. On a terminal of that size the wrapper runs nothing and
+    /// exits, after one line.
+    #[test]
+    fn wrapper_never_attaches_on_a_terminal_with_no_size() {
+        use nix::pty::{openpty, Winsize};
+        let world = WrapperWorld::new();
+        let size = Winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = openpty(&size, None).unwrap();
+        let command = WindowCommand::Plain(attach("plain", "sleep 30"));
+        let out = Command::new("bash")
+            .args(wrapper_argv(&world.wrapper, "t", &command, world.options))
+            .env("FAKE", world.dir.path().join("fake"))
+            .stdin(std::fs::File::from(pty.slave))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        drop(pty.master);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+        assert_eq!(world.read("runs"), "", "it attached at 0x0");
+        assert!(
+            text(&out.stdout).contains("This terminal has no size"),
+            "{}",
+            text(&out.stdout)
+        );
+    }
+
+    /// A hung-up window ends the wrapper at once, also while its attach
+    /// runs: it sets no SIGHUP trap, which bash would run only after the
+    /// attach ended.
+    #[test]
+    fn wrapper_ends_at_once_on_sighup() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        let world = WrapperWorld::new();
+        let command = WindowCommand::Plain(attach("plain", "sleep 30"));
+        let mut child = Command::new("bash")
+            .args(wrapper_argv(&world.wrapper, "t", &command, world.options))
+            .env("FAKE", world.dir.path().join("fake"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while world.read("runs").is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the attach never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = child.id().to_string();
+        Command::new("kill").args(["-HUP", &pid]).status().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // The attach's sleep, in the wrapper's group.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status();
+        let _ = child.wait();
+        assert_eq!(status.and_then(|s| s.signal()), Some(1), "{status:?}");
+    }
+
     #[test]
     fn wrapper_closes_quietly_after_a_long_successful_run() {
         let world = WrapperWorld::new();
