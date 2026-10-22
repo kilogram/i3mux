@@ -132,7 +132,9 @@ i3mux terminal --here --shell ws3-002           # attach that existing shell her
   window has the focus, or when one terminal process has many windows.
   The terminal must let programs set its title (OSC 0); i3mux waits 5 s
   for the title, then gives up. Afterwards the terminal gets its own
-  title back, if it has a title stack (XTWINOPS 22 and 23).
+  title back, if it has a title stack (XTWINOPS 22 and 23). i3mux sets
+  no other title: the attach sets `i3mux:{host}:{shell}`, and a window
+  command keeps the terminal's title.
 - i3mux then marks the window as the window of a shell, and runs that
   shell's attach in place of itself (exec). It picks the shell as
   `i3mux terminal` does: an orphan, or a new one. `-e`, `--new`,
@@ -143,13 +145,22 @@ i3mux terminal --here --shell ws3-002           # attach that existing shell her
   this machine, with the default session name and the
   `--window-command`, if one is given.
 - i3mux refuses a workspace bound to another host than `--remote`, or
-  with another window command than `--window-command`. It exits with
-  status 1 and changes nothing, so a script can do something else.
+  with another window command than `--window-command` (compared word by
+  word). It exits with status 1 and changes nothing, so a script can do
+  something else.
 - `--shell NAME` attaches the existing shell NAME of the workspace's
   session, on the binding's host, and ignores the window command. It
-  never makes a shell: it refuses a shell that does not exist, and one
-  that another client has, unless `--force`. If the host's shpool daemon
-  was replaced, the window does not start a new shell of that name.
+  never makes a shell: it refuses a shell that does not exist. Unless
+  `--force` is given, it also refuses a shell that another window shows
+  or another client has. With `--force`, the other window loses the
+  shell's mark, so a shell never has two windows. In the window that
+  already shows the shell, `--shell` needs no `--force`. If the host's
+  shpool daemon was replaced, the window does not start a new shell of
+  that name.
+- If the attach or the window command cannot run, i3mux undoes what it
+  did and exits with status 1: the window gets back the marks it had,
+  the binding that i3mux made goes, and the shell that it made for the
+  window command ends.
 - When the shell ends or is detached, the program that ran i3mux goes on.
   Without `--no-hold`, a shell that fails or ends within 2 s shows the
   hint first. With it, the program goes on at once, with the shell's exit

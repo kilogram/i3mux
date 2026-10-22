@@ -44,10 +44,14 @@ opening its own windows:
      or this machine for an unbound workspace.
    - A workspace bound to another host than `--remote` is refused before
      anything changes: exit 1, and the message names both hosts. So is a
-     `--window-command` other than the binding's.
+     `--window-command` with other words than the binding's.
    - `--shell NAME` attaches NAME, which must exist and belong to the
      binding's session. It ignores the window command, and the wrapper does
      not start a new shell when the daemon was replaced (exit 75).
+   - `--shell NAME` refuses a shell that another window carries, without
+     `--force`, even when no client is attached. With `--force`, the other
+     window loses the mark. The window that carries the mark already is
+     never refused.
    - A terminal whose title does not change within 5 s is refused: the
      emulator must let programs set the title. i3mux saves the terminal's
      title on the title stack first (XTWINOPS 22) and restores it (23) on
@@ -59,6 +63,15 @@ opening its own windows:
      shell's exit status. The window keeps its mark until it closes. A
      user who wants the terminal to close types `exec i3mux terminal
      --here`.
+   - i3mux sets no title of its own. The wrapper sets
+     `i3mux:{host}:{shell}`. A window command keeps the terminal's title.
+   - When the exec fails (a window command that does not exist), i3mux
+     undoes its changes, then exits 1. Marks it added go, and marks it
+     removed come back. The binding it made goes, and the shell it made
+     for the window command ends.
+   - Open window: a crash or kill between the mark and the exec leaves the
+     window marked, and the workspace bound. The next `--here` in that
+     window replaces the mark. `detach` closes the window.
 2. **Window command.** A string, split into words like a shell does, with no
    shell. In each word `{session}` becomes the session name and `{shell}`
    the shell name. No `{host}`: a rebind changes the host, so a window that

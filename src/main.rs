@@ -115,7 +115,8 @@ enum CliCommand {
         #[arg(long)]
         here: bool,
         /// With --here: attach this existing shell of the session, {session}-{NNN};
-        /// it never starts one, and the window command does not run
+        /// it never starts one, and the window command does not run. A shell
+        /// that another window shows needs --force, which moves it here
         #[arg(long, value_name = "NAME", requires = "here", conflicts_with_all = ["exec", "new"])]
         shell: Option<String>,
         /// With --here: the host of the session; an unbound workspace is bound
@@ -228,6 +229,8 @@ enum CommandError {
         "Session '{0}' is already attached from another terminal or host; use --force to take over"
     )]
     AlreadyAttached(TerminalName),
+    #[error("Shell {0} already has a window; use --force to move it to this terminal")]
+    ShownElsewhere(TerminalName),
     #[error("No saved session '{session}' on {host}; run 'i3mux sessions' to list sessions")]
     NoSavedSession { session: SessionName, host: Host },
     #[error("No saved sessions on {0} that are not already bound here")]
@@ -302,7 +305,7 @@ fn main() -> ExitCode {
 #[derive(Debug)]
 enum Outcome {
     Exit(ExitCode),
-    Exec(HereExec),
+    Exec(Box<HereExec>),
 }
 
 /// Wire the real ports, run the command, then stop the masters it left
@@ -345,24 +348,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let outcome = with_unused_masters_stopped(&store, &masters, &wm, || {
         dispatch(&ports, &wm, &launcher, cli.command)
     })?;
-    match outcome {
-        Outcome::Exit(code) => Ok(code),
-        Outcome::Exec(here) => Err(exec_here(&here)),
-    }
+    let here = match outcome {
+        Outcome::Exit(code) => return Ok(code),
+        Outcome::Exec(here) => here,
+    };
+    let failed = exec_program(&here.argv);
+    let undone =
+        with_unused_masters_stopped(&store, &masters, &wm, || undo_here(&ports, &here.changes));
+    Err(match undone {
+        Ok(()) => anyhow::anyhow!("{failed:#}; i3mux undid its changes"),
+        Err(err) => anyhow::anyhow!("{failed:#}; undoing i3mux's changes failed: {err:#}"),
+    })
 }
 
-/// Run `here`'s program in this process, in place of i3mux: set this
-/// terminal's title, then exec. Returns only on failure.
-fn exec_here(here: &HereExec) -> anyhow::Error {
+/// Run `argv` in this process, in place of i3mux. Returns only on failure.
+fn exec_program(argv: &[String]) -> anyhow::Error {
     use std::os::unix::process::CommandExt as _;
-    if let Err(err) = set_terminal_title(&here.title) {
-        return err;
-    }
-    let Some((program, args)) = here.argv.split_first() else {
+    let Some((program, arguments)) = argv.split_first() else {
         return anyhow::anyhow!("i3mux bug: an empty window command");
     };
-    let err = std::process::Command::new(program).args(args).exec();
-    anyhow::Error::new(err).context(format!("cannot run {program}"))
+    let err = std::process::Command::new(program).args(arguments).exec();
+    anyhow::Error::new(err).context(format!("cannot run '{program}' in this terminal"))
 }
 
 /// XTWINOPS: save the terminal's title on its title stack.
@@ -417,7 +423,7 @@ fn dispatch(
             },
             window_command: window_command.map(WindowTemplate::new).transpose()?,
         };
-        return cmd_terminal_here(ports, &request).map(Outcome::Exec);
+        return cmd_terminal_here(ports, &request).map(|here| Outcome::Exec(Box::new(here)));
     }
     dispatch_exit(ports, wm, launcher, command).map(Outcome::Exit)
 }
@@ -940,9 +946,31 @@ struct HereRequest {
 /// What `terminal --here` runs in its terminal, in place of i3mux.
 #[derive(Debug, PartialEq, Eq)]
 struct HereExec {
-    /// The terminal's title: `i3mux:{host}:{shell}`.
+    /// `i3mux:{host}:{shell}`: the title the wrapper sets. i3mux sets no
+    /// title itself, so a window command keeps the terminal's own.
     title: String,
     argv: Vec<String>,
+    /// What `here` changed, for [`undo_here`] when the exec fails.
+    changes: HereChanges,
+}
+
+/// What `here` changed in the state, on the host and in Sway.
+#[derive(Debug, PartialEq, Eq)]
+struct HereChanges {
+    workspace: String,
+    /// The binding `here` made; `None` when the workspace was bound before.
+    bound: Option<WorkspaceState>,
+    /// The shell `here` made for the window command, on its host.
+    made: Option<(Host, TerminalName)>,
+    marks: MarkChanges,
+}
+
+/// The i3mux marks a command added to and removed from windows, by
+/// container id.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MarkChanges {
+    added: Vec<(u64, Mark)>,
+    removed: Vec<(u64, Mark)>,
 }
 
 /// Make window `con_id`, the terminal of this process, a window of its
@@ -951,13 +979,15 @@ struct HereExec {
 ///
 /// Every refusal comes before anything changes, so a caller can fall back:
 /// a workspace bound to another host than `request.host`, or with another
-/// window command; a `--shell` of another session, missing, or attached
-/// elsewhere (without `force`); an unreachable host. Then, under the state
-/// lock, it makes a new shell for the window command, or starts the
-/// host's master for the wrapper. Only then does it bind an unbound
-/// workspace and mark the window with its shell, replacing any other i3mux
-/// mark the window had. What it returns runs the wrapper (with
-/// `--attach-only` for `--shell`), or the window command.
+/// window command; a `--shell` of another session, missing, or shown in
+/// another window or attached elsewhere (both without `force`); an
+/// unreachable host. Then, under the state lock, it makes a new shell for
+/// the window command, or starts the host's master for the wrapper. Only
+/// then does it bind an unbound workspace and mark the window with its
+/// shell, replacing any other i3mux mark the window had. With `force`, the
+/// other window of a `--shell` loses its mark. What it returns runs the
+/// wrapper (with `--attach-only` for `--shell`), or the window command,
+/// and says what changed, so that [`undo_here`] can undo it.
 fn here(ports: &Ports, con_id: u64, request: &HereRequest) -> Result<HereExec> {
     let mut lock = ports.store.lock()?;
     let tree = ports.sway.get_tree()?;
@@ -976,12 +1006,25 @@ fn here(ports: &Ports, con_id: u64, request: &HereRequest) -> Result<HereExec> {
     };
     let exec = (ports.hosts)(binding.host());
     let shells = session_shells(exec.as_ref(), &binding)?;
-    let choice = match &request.shell {
+    let (choice, elsewhere) = match &request.shell {
         Some(shell) => {
-            here_shell(&name, &binding, &shells, shell, request.terminal.force)?;
-            Choice::Reattach(shell.clone())
+            let mark = Mark::new(binding.host().clone(), shell.clone());
+            let elsewhere = other_windows_with(&tree, con_id, &mark);
+            let shown = !elsewhere.is_empty();
+            here_shell(
+                &name,
+                &binding,
+                &shells,
+                shell,
+                shown,
+                request.terminal.force,
+            )?;
+            (Choice::Reattach(shell.clone()), elsewhere)
         }
-        None => pick_terminal(&tree, &binding, &shells, &request.terminal),
+        None => (
+            pick_terminal(&tree, &binding, &shells, &request.terminal),
+            Vec::new(),
+        ),
     };
     let spec = WindowSpec {
         force: request.terminal.force,
@@ -994,15 +1037,71 @@ fn here(ports: &Ports, con_id: u64, request: &HereRequest) -> Result<HereExec> {
         exists: !matches!(choice, Choice::Create(_)),
     };
     let window = window_program(ports, exec.as_ref(), choice.name(), &spec)?;
+    let made = (spec.template.is_some() && !spec.exists)
+        .then(|| (binding.host().clone(), choice.name().clone()));
     if bound.is_none() {
         lock.state_mut().bind(&name, binding.clone())?;
         lock.commit()?;
     }
     let mark = Mark::new(binding.host().clone(), choice.name().clone());
-    remark(ports, &tree, con_id, &mark)?;
+    let marks = remark(ports, &tree, con_id, &mark, &elsewhere)?;
     let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
     let argv = ports.launcher.program_argv(&title, &window, spec.options);
-    Ok(HereExec { title, argv })
+    let changes = HereChanges {
+        workspace: name,
+        bound: bound.is_none().then_some(binding),
+        made,
+        marks,
+    };
+    Ok(HereExec {
+        title,
+        argv,
+        changes,
+    })
+}
+
+/// Undo what `here` changed, after its exec failed: the marks it added go
+/// and the ones it removed come back, on windows that still exist; the
+/// shell it made ends; the binding it made goes, if no other command
+/// changed it since.
+///
+/// The shell ends even though shpool may list it as attached: a shell made
+/// with `attach -b` lists so for a moment. Nothing else attached it: until
+/// this runs, under the state lock, its mark keeps every i3mux command
+/// from picking it.
+fn undo_here(ports: &Ports, changes: &HereChanges) -> Result<()> {
+    let mut lock = ports.store.lock()?;
+    let tree = ports.sway.get_tree()?;
+    for (id, mark) in &changes.marks.added {
+        if window::marks_of(&tree, *id).contains(mark) {
+            ports.sway.run(&window::unmark_command(*id, mark))?;
+        }
+    }
+    for (id, mark) in &changes.marks.removed {
+        let exists = window::workspace_containing(&tree, *id).is_some();
+        if exists && !window::marks_of(&tree, *id).contains(mark) {
+            ports.sway.run(&window::mark_command(*id, mark))?;
+        }
+    }
+    if let Some((host, shell)) = &changes.made {
+        mux::kill((ports.hosts)(host).as_ref(), std::slice::from_ref(shell))?;
+    }
+    if let Some(bound) = &changes.bound {
+        if lock.state().get(&changes.workspace) == Some(bound) {
+            lock.state_mut().unbind(&changes.workspace);
+            lock.commit()?;
+        }
+    }
+    Ok(())
+}
+
+/// The windows other than `con_id` that carry `mark`.
+fn other_windows_with(tree: &Value, con_id: u64, mark: &Mark) -> Vec<u64> {
+    window::i3mux_windows_in(tree)
+        .into_iter()
+        .filter(|(id, m)| *id != con_id && m == mark)
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Refuse `terminal --here` in a workspace bound other than `request`
@@ -1017,37 +1116,55 @@ fn here_fits(workspace: &str, bound: &WorkspaceState, request: &HereRequest) -> 
         }
         .into());
     }
-    if request
-        .window_command
-        .as_ref()
-        .is_some_and(|w| Some(w) != bound.window_command())
-    {
+    let same = |asked: &WindowTemplate| bound.window_command().is_some_and(|w| w.same_words(asked));
+    if request.window_command.as_ref().is_some_and(|w| !same(w)) {
         return Err(CommandError::OtherWindowCommand(workspace.to_owned()).into());
     }
     Ok(())
 }
 
 /// Give window `con_id` the one i3mux mark `mark`: any other i3mux mark
-/// it has goes, so the window counts for one shell only.
-fn remark(ports: &Ports, tree: &Value, con_id: u64, mark: &Mark) -> Result<()> {
+/// it has goes, so the window counts for one shell only, and the windows
+/// `take_from` lose `mark`, so the shell has one window only.
+fn remark(
+    ports: &Ports,
+    tree: &Value,
+    con_id: u64,
+    mark: &Mark,
+    take_from: &[u64],
+) -> Result<MarkChanges> {
     let marks = window::marks_of(tree, con_id);
-    for old in marks.iter().filter(|m| *m != mark) {
-        ports.sway.run(&window::unmark_command(con_id, old))?;
-    }
+    let mut changes = MarkChanges::default();
+    changes.removed.extend(
+        marks
+            .iter()
+            .filter(|m| *m != mark)
+            .map(|m| (con_id, m.clone())),
+    );
+    changes
+        .removed
+        .extend(take_from.iter().map(|id| (*id, mark.clone())));
     if !marks.contains(mark) {
-        ports.sway.run(&window::mark_command(con_id, mark))?;
+        changes.added.push((con_id, mark.clone()));
     }
-    Ok(())
+    for (id, old) in &changes.removed {
+        ports.sway.run(&window::unmark_command(*id, old))?;
+    }
+    for (id, new) in &changes.added {
+        ports.sway.run(&window::mark_command(*id, new))?;
+    }
+    Ok(changes)
 }
 
 /// Check `--here --shell shell`: a live shell of `binding`'s session, not
-/// attached elsewhere unless `force`. It is never made (PLAN-terminal-here
-/// finding 3).
+/// `shown` in another window and not attached elsewhere, unless `force`.
+/// It is never made (PLAN-terminal-here finding 3).
 fn here_shell(
     workspace: &str,
     binding: &WorkspaceState,
     shells: &[Shell],
     shell: &TerminalName,
+    shown: bool,
     force: bool,
 ) -> Result<()> {
     if shell.session() != binding.session() {
@@ -1066,6 +1183,9 @@ fn here_shell(
                 terminal: shell.clone(),
                 host: binding.host().clone(),
             })?;
+    if shown && !force {
+        return Err(CommandError::ShownElsewhere(shell.clone()).into());
+    }
     if found.is_attached() && !force {
         return Err(CommandError::AlreadyAttached(shell.clone()).into());
     }

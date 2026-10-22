@@ -906,15 +906,12 @@ fn here_terminal(world: &World, workspace: &str) -> u64 {
     id
 }
 
-/// What `FakeLauncher::program_argv` returns for `options`, `title` and
-/// `command`.
-fn here_exec(options: WrapperOptions, title: &str, command: &[String]) -> HereExec {
+/// The title and the argv of a `HereExec`, as `FakeLauncher::program_argv`
+/// makes the argv from `options`, `title` and `command`.
+fn here_exec(options: WrapperOptions, title: &str, command: &[String]) -> (String, Vec<String>) {
     let mut argv = vec![format!("{options:?}"), title.to_owned()];
     argv.extend_from_slice(command);
-    HereExec {
-        title: title.to_owned(),
-        argv,
-    }
+    (title.to_owned(), argv)
 }
 
 /// PLAN-terminal-here decision 1: in an unbound workspace, `here` binds it
@@ -946,7 +943,10 @@ fn here_binds_an_unbound_workspace_and_marks_its_own_window() {
         no_hold: true,
         attach_only: false,
     };
-    assert_eq!(exec, here_exec(options, "i3mux:local:ws4-001", &attach));
+    assert_eq!(
+        (exec.title, exec.argv),
+        here_exec(options, "i3mux:local:ws4-001", &attach)
+    );
     assert!(world.launches().is_empty(), "no window opens");
 }
 
@@ -1056,7 +1056,7 @@ fn here_runs_the_window_command_and_makes_a_new_shell_first() {
     );
     let window = ["w".to_owned(), "ws4".into(), "ws4-002".into()];
     assert_eq!(
-        exec,
+        (exec.title, exec.argv),
         here_exec(WrapperOptions::default(), "i3mux:local:ws4-002", &window)
     );
 }
@@ -1083,7 +1083,10 @@ fn here_shell_attaches_that_shell_without_the_window_command() {
         no_hold: false,
         attach_only: true,
     };
-    assert_eq!(exec, here_exec(options, "i3mux:local:ws4-003", &attach));
+    assert_eq!(
+        (exec.title, exec.argv),
+        here_exec(options, "i3mux:local:ws4-003", &attach)
+    );
     assert_eq!(
         world.sway.commands(),
         [window::mark_command(id, &world.mark("ws4-003"))]
@@ -1175,6 +1178,179 @@ fn here_on_an_unreachable_host_binds_and_marks_nothing() {
 
     assert!(world.store.load().unwrap().get("4").is_none());
     assert!(world.sway.commands().is_empty());
+}
+
+/// The windows that carry `terminal`'s mark, by container id.
+fn windows_of(world: &World, terminal: &str) -> Vec<u64> {
+    let mark = world.mark(terminal);
+    window::i3mux_windows_in(&world.sway.get_tree().unwrap())
+        .into_iter()
+        .filter(|(_, m)| *m == mark)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// `--shell` never gives a shell a second window: a shell that another
+/// window carries is refused before anything changes, even when no client
+/// is attached (that window lost its client, or shows a landing page).
+#[test]
+fn here_shell_never_gives_a_shell_a_second_window() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-001", false);
+    let a = world.sway.open_marked("4", &world.mark("ws4-001"));
+    let b = world.sway.open_titled("4", "foot", "nonce");
+    let request = HereRequest {
+        shell: Some(t("ws4", 1)),
+        ..HereRequest::default()
+    };
+
+    let err = here(&world.ports(), b, &request).unwrap_err();
+
+    assert!(
+        matches!(command_error(&err), CommandError::ShownElsewhere(_)),
+        "{err}"
+    );
+    assert_eq!(windows_of(&world, "ws4-001"), [a]);
+    assert!(world.sway.commands().is_empty());
+}
+
+/// With `--force`, the shell's mark moves: the other window loses it, so
+/// the shell still has one window.
+#[test]
+fn here_shell_with_force_moves_the_mark_from_the_other_window() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-001", true);
+    let a = world.sway.open_marked("4", &world.mark("ws4-001"));
+    let b = world.sway.open_titled("4", "foot", "nonce");
+    let request = HereRequest {
+        shell: Some(t("ws4", 1)),
+        terminal: TerminalRequest {
+            force: true,
+            ..TerminalRequest::default()
+        },
+        ..HereRequest::default()
+    };
+
+    here(&world.ports(), b, &request).unwrap();
+
+    assert_eq!(windows_of(&world, "ws4-001"), [b]);
+    assert!(marks_of_window(&world, a).is_empty());
+}
+
+/// The window that already carries the shell's mark is not "another
+/// window": `--shell` in it is never refused and needs no `--force`, also
+/// when the binding moved to another host since (`attach --rebind-only`
+/// re-marked the window).
+#[test]
+fn here_shell_in_the_window_that_has_the_mark_needs_no_force() {
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-001", false);
+    let id = world.sway.open_marked("4", &world.mark("ws4-001"));
+    let request = HereRequest {
+        host: Some(deepthought()),
+        shell: Some(t("ws4", 1)),
+        ..HereRequest::default()
+    };
+
+    let exec = here(&world.ports(), id, &request).unwrap();
+
+    assert_eq!(exec.changes.marks, MarkChanges::default());
+    assert!(world.sway.commands().is_empty());
+}
+
+/// Every i3mux mark on window `id`.
+fn marks_of_window(world: &World, id: u64) -> Vec<Mark> {
+    window::marks_of(&world.sway.get_tree().unwrap(), id)
+}
+
+/// A failed exec: `undo_here` takes back what `here` did in an unbound
+/// workspace with a window command. The binding goes, the window loses its
+/// mark, and the shell `here` made ends.
+#[test]
+fn undo_after_a_failed_exec_takes_back_the_binding_the_mark_and_the_shell() {
+    let world = World::new(Host::Local);
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        window_command: Some(template("no-such-program {shell}")),
+        ..HereRequest::default()
+    };
+    let exec = here(&world.ports(), id, &request).unwrap();
+    assert_eq!(world.created(), [("ws4-001".to_owned(), None)]);
+
+    undo_here(&world.ports(), &exec.changes).unwrap();
+
+    assert!(world.store.load().unwrap().get("4").is_none());
+    assert!(marks_of_window(&world, id).is_empty());
+    assert!(world.host.shells().is_empty(), "{:?}", world.host.shells());
+}
+
+/// In a bound workspace, the undo keeps the binding and the shells it did
+/// not make, and gives every window back the marks it had: the old mark of
+/// this window, and the mark `--force` took from the other window.
+#[test]
+fn undo_after_a_failed_exec_gives_every_window_its_marks_back() {
+    let world = World::new(Host::Local);
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-001", false);
+    world.host.add_shell("ws4-002", false);
+    let a = world.sway.open_marked("4", &world.mark("ws4-001"));
+    let b = world.sway.open_marked("4", &world.mark("ws4-002"));
+    let request = HereRequest {
+        shell: Some(t("ws4", 1)),
+        terminal: TerminalRequest {
+            force: true,
+            ..TerminalRequest::default()
+        },
+        ..HereRequest::default()
+    };
+    let before = world.store.load().unwrap();
+    let exec = here(&world.ports(), b, &request).unwrap();
+    assert_eq!(windows_of(&world, "ws4-001"), [b]);
+
+    undo_here(&world.ports(), &exec.changes).unwrap();
+
+    assert_eq!(world.store.load().unwrap(), before);
+    assert_eq!(marks_of_window(&world, a), [world.mark("ws4-001")]);
+    assert_eq!(marks_of_window(&world, b), [world.mark("ws4-002")]);
+    assert_eq!(world.host.shells().len(), 2);
+}
+
+/// The undo of a remote `here` leaves no ssh master behind: the binding it
+/// made goes, so the host is unused again.
+#[test]
+fn undo_after_a_failed_exec_stops_the_master_it_left_unused() {
+    let world = World::new(deepthought());
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        host: Some(deepthought()),
+        ..HereRequest::default()
+    };
+    let exec = world.finish(|ports| here(ports, id, &request)).unwrap();
+    assert!(world.fakes.running(&dt()));
+
+    world
+        .finish(|ports| undo_here(ports, &exec.changes))
+        .unwrap();
+
+    assert!(!world.fakes.running(&dt()), "{:?}", world.fakes.events());
+}
+
+/// Window commands are compared by their words: other spacing or quoting
+/// of the same words is the binding's command, not another one.
+#[test]
+fn here_compares_window_commands_by_their_words() {
+    let world = World::new(Host::Local);
+    world.bind_with("4", "ws4", "w {shell}");
+    let id = here_terminal(&world, "4");
+    let request = HereRequest {
+        window_command: Some(template("w   '{shell}'")),
+        ..HereRequest::default()
+    };
+
+    here(&world.ports(), id, &request).unwrap();
 }
 
 /// Concurrency (plan rule 4 for `here`): eight terminals in one unbound

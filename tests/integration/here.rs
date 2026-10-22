@@ -114,3 +114,38 @@ fn a_workspace_bound_to_another_host_is_refused() -> Result<()> {
     assert!(!title.starts_with("i3mux-here-"), "{title}");
     Ok(())
 }
+
+/// A window command whose program cannot run: the exec fails, and i3mux
+/// undoes what it did before it exits 1. The terminal keeps no mark and
+/// gets its own title back, the workspace is unbound again, and the shell
+/// that i3mux made for the command is gone. The terminal's script goes on.
+#[test]
+fn a_window_command_that_cannot_run_leaves_nothing_changed() -> Result<()> {
+    let env = TestEnvironment::new()?;
+    env.focus_workspace(WS)?;
+    launch_here_terminal(&env, "here", "--window-command 'no-such-program {shell}'")?;
+    env.write_host_file(Session::Local, "go-here", "")?;
+
+    wait_until("i3mux exits", || {
+        Ok(env.host_file(Session::Local, "exit-here")?.is_some())
+    })?;
+    let err = env
+        .host_file(Session::Local, "err-here")?
+        .unwrap_or_default();
+    assert_eq!(
+        env.host_file(Session::Local, "exit-here")?.as_deref(),
+        Some("1\n"),
+        "{err}"
+    );
+    assert!(
+        err.contains("cannot run 'no-such-program' in this terminal")
+            && err.contains("i3mux undid its changes"),
+        "{err}"
+    );
+    assert_eq!(env.marks(WS)?, Vec::<String>::new());
+    let title = env.window_title("here")?.unwrap_or_default();
+    assert!(!title.starts_with("i3mux"), "{title}");
+    env.i3mux().run("status")?.failed_with(3)?;
+    assert_eq!(env.shells(Session::Local)?, []);
+    Ok(())
+}

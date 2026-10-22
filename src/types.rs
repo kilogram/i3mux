@@ -302,6 +302,14 @@ impl WindowTemplate {
         &self.text
     }
 
+    /// Whether `other` has the same words, so that it gives every window
+    /// the same argv: `w  {shell}` and `w '{shell}'` are the same as
+    /// `w {shell}`.
+    #[must_use]
+    pub fn same_words(&self, other: &Self) -> bool {
+        self.words == other.words
+    }
+
     /// The argv of the window of `shell`.
     #[must_use]
     pub fn argv(&self, shell: &TerminalName) -> Vec<String> {
