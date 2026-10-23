@@ -20,8 +20,13 @@ It replaces `attach --rebind-only`, which moved only the binding.
 2. **Refusals first.** Before it changes anything, i3mux refuses:
    - a NEW that has a saved layout of S, or a binding of S in another
      workspace (it would overwrite a different session);
-   - a session with a pending cleanup to another host than NEW;
+   - a session with a pending cleanup of a third host, neither NEW nor
+     the host it is bound to;
    - a host that does not answer.
+
+   A migration to the host of a pending cleanup cancels that cleanup. It
+   keeps that host's shells (decision 4). The new pending cleanup names
+   the host that the session leaves.
 3. **It says what will happen.** One line on stderr first, for example
    `i3mux: moving ws3 from s0nny-box to dev-box: 1 of 2 shells starts
    again there as a login shell in ~; programs running on s0nny-box end.`
@@ -39,18 +44,21 @@ It replaces `attach --rebind-only`, which moved only the binding.
    to NEW re-marks the windows and runs step 6. If S is on NEW with no
    cleanup, it prints `ws3 is already on dev-box` and exits 0.
 8. **A pending cleanup is visible and is never lost.** `sessions` and
-   `status` show it, with the command that finishes it. `detach`, `kill`
-   and another `--migrate` of S run the cleanup first. If the old host
-   does not answer, they refuse and say so.
-9. **Windows follow.** Whenever a wrapper's attach ends, for any exit
-   status, the wrapper first runs `i3mux reattach --shell N --from HOST`,
-   a hidden command:
-   - If the session is bound to another host that has N, it prints
-     `[i3mux] ws3 moved to dev-box. Attaching ws3-001.`, then execs the
-     wrapper for that host.
-   - Otherwise it exits with a status, and the wrapper takes today's path
-     (ssh recovery, a replaced daemon, the hint, or `--no-hold`).
-   It reads the binding, not the window, so it needs no title.
+   `status` show it, with the command that finishes it. `detach` and
+   `kill` run the cleanup first. If the old host does not answer, they
+   refuse and say so.
+9. **Windows follow.** The wrapper runs `i3mux reattach --shell N --from
+   HOST`, a hidden command, before every run of its attach after the
+   first. That is after every end, for any exit status, and again after
+   ssh recovery, before REATTACH. It reads the binding, not the window,
+   so it needs no title. It never execs:
+   - Bound to another host that has N: it prints `[i3mux] ws3 moved to
+     dev-box. Attaching ws3-001.` and the new wrapper argv, and exits 0.
+     The wrapper execs that argv.
+   - Bound to another host that does not answer: a distinct status. The
+     wrapper waits for that host, and never attaches on its old host.
+   - Otherwise: a third status. The wrapper takes today's path (ssh
+     recovery, a replaced daemon, the hint, or `--no-hold`).
 10. **Window commands are their own.** Decision 9 does not change a window
     that runs a window command. That command decides, as before.
 
@@ -79,6 +87,9 @@ It replaces `attach --rebind-only`, which moved only the binding.
   that a rerun reaches the same end state.
 - The pending cleanup is its own field of the binding, a sum type, not a
   flag.
+- Rule 3 in the wrapper: a test with a fake ssh that exits 75, then 255,
+  after a migration. `reattach` runs first each time, and the old host
+  gets no attach.
 - Rule 4: a container test migrates a session with two windows, one with a
   running job, and checks that both windows show NEW's shells.
 
