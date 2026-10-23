@@ -36,6 +36,8 @@ struct HostState {
     /// Make `shpool attach -b` fail with this error, as a host whose shpool
     /// cannot start a shell.
     fail_create: Option<String>,
+    /// Shells that `shpool attach -b` makes, but that end at once.
+    vanishing: Vec<String>,
     /// Like shpool, a shell that `attach -b` made lists as attached for
     /// this many `list` calls, while its client leaves.
     create_lag: usize,
@@ -167,7 +169,9 @@ impl HostExec for FakeHost {
                     state.shells.insert(name.clone(), true);
                     state.detaching.insert(name.clone(), lag - 1);
                 }
-                state.shells.entry(name.clone()).or_insert(false);
+                if !state.vanishing.contains(&name) {
+                    state.shells.entry(name.clone()).or_insert(false);
+                }
                 state.created.push((name, cmd));
             }
         }
@@ -805,103 +809,706 @@ fn status_names_the_window_command() {
     );
 }
 
-// --------------------------------------------------------------- rebind
+// -------------------------------------------------------------- migrate
 
-/// PLAN-terminal-here decision 3: `attach --rebind-only` moves the binding
-/// and re-marks the session's windows. It keeps the session and the window
-/// command, contacts no host (the world's host factory knows only the old
-/// host), starts no master, and opens, closes and attaches nothing.
+/// Stops every host and Sway operation from some point on, as if i3mux
+/// died there. Counts the operations that ran.
+#[derive(Default)]
+struct Cut {
+    /// How many more operations may run; `None`: all of them.
+    left: Mutex<Option<usize>>,
+    ran: Mutex<usize>,
+}
+
+impl Cut {
+    fn at(&self, operations: Option<usize>) {
+        *self.left.lock().unwrap() = operations;
+    }
+
+    fn ran(&self) -> usize {
+        *self.ran.lock().unwrap()
+    }
+
+    /// Whether the next operation runs.
+    fn pass(&self) -> bool {
+        let mut left = self.left.lock().unwrap();
+        match *left {
+            Some(0) => return false,
+            Some(n) => *left = Some(n - 1),
+            None => {}
+        }
+        *self.ran.lock().unwrap() += 1;
+        true
+    }
+}
+
+/// A [`FakeHost`] behind a [`Cut`].
+struct CutHost {
+    inner: FakeHost,
+    cut: Arc<Cut>,
+}
+
+impl CutHost {
+    fn pass(&self) -> Result<(), HostError> {
+        if self.cut.pass() {
+            return Ok(());
+        }
+        Err(HostError::Unreachable {
+            host: RemoteHost::new("cut").unwrap(),
+            detail: "i3mux was cut here".into(),
+        })
+    }
+}
+
+impl HostExec for CutHost {
+    fn host(&self) -> &Host {
+        self.inner.host()
+    }
+    fn run(&self, argv: &[String], stdin: Option<&str>) -> Result<String, HostError> {
+        self.pass()?;
+        self.inner.run(argv, stdin)
+    }
+    fn attach_argv(&self, argv: &[String]) -> Vec<String> {
+        self.inner.attach_argv(argv)
+    }
+    fn write_file_atomic(&self, path: &str, content: &str) -> Result<(), HostError> {
+        self.pass()?;
+        self.inner.write_file_atomic(path, content)
+    }
+    fn read_file(&self, path: &str) -> Result<Option<String>, HostError> {
+        self.pass()?;
+        self.inner.read_file(path)
+    }
+    fn list_dir(&self, dir: &str) -> Result<Vec<String>, HostError> {
+        self.pass()?;
+        self.inner.list_dir(dir)
+    }
+    fn remove_file(&self, path: &str) -> Result<bool, HostError> {
+        self.pass()?;
+        self.inner.remove_file(path)
+    }
+}
+
+/// The fake Sway behind a [`Cut`].
+struct CutSway {
+    inner: Arc<FakeSway>,
+    cut: Arc<Cut>,
+}
+
+impl Sway for CutSway {
+    fn get_tree(&self) -> Result<Value> {
+        anyhow::ensure!(self.cut.pass(), "i3mux was cut here");
+        self.inner.get_tree()
+    }
+    fn run(&self, command: &str) -> Result<()> {
+        anyhow::ensure!(self.cut.pass(), "i3mux was cut here");
+        self.inner.run(command)
+    }
+}
+
+/// A world for moves. Session ws4 is bound to workspace 4 on this machine
+/// (the old host). Its shells 001 and 002 have windows there, next to
+/// Firefox; 003 is an orphan; its layout is saved; session ws5 has a shell
+/// and a layout too. The new host, deepthought, already has ws4-002 (made
+/// by another program) and ws9-001. Every host and Sway operation passes
+/// `cut`.
+struct Moving {
+    world: World,
+    new: FakeHost,
+    cut: Arc<Cut>,
+    sway: CutSway,
+    hosts: Box<HostFactory>,
+}
+
+impl Moving {
+    fn new() -> Self {
+        let world = World::new(Host::Local);
+        world.bind("4", "ws4");
+        for (shell, attached) in [
+            ("ws4-001", true),
+            ("ws4-002", true),
+            ("ws4-003", false),
+            ("ws5-001", false),
+        ] {
+            world.host.add_shell(shell, attached);
+        }
+        world.sway.open_marked("4", &world.mark("ws4-001"));
+        world.sway.open_marked("4", &world.mark("ws4-002"));
+        world.sway.open("4", "firefox");
+        world.save_layout("ws4", &[1, 2]);
+        world.save_layout("ws5", &[1]);
+        let new = FakeHost::new(deepthought(), world.masters.clone());
+        new.add_shell("ws4-002", false);
+        new.add_shell("ws9-001", false);
+        let cut = Arc::new(Cut::default());
+        let sway = CutSway {
+            inner: Arc::clone(&world.sway),
+            cut: Arc::clone(&cut),
+        };
+        let (old, new_host, factory_cut) = (world.host.clone(), new.clone(), Arc::clone(&cut));
+        let hosts: Box<HostFactory> = Box::new(move |h: &Host| -> Box<dyn HostExec> {
+            let inner = if h == old.host() {
+                old.clone()
+            } else {
+                assert_eq!(h, new_host.host(), "unexpected host {h}");
+                new_host.clone()
+            };
+            Box::new(CutHost {
+                inner,
+                cut: Arc::clone(&factory_cut),
+            })
+        });
+        Self {
+            world,
+            new,
+            cut,
+            sway,
+            hosts,
+        }
+    }
+
+    fn ports(&self) -> Ports<'_> {
+        Ports {
+            sway: &self.sway,
+            hosts: self.hosts.as_ref(),
+            ..self.world.ports()
+        }
+    }
+
+    /// `attach --migrate` of ws4 to `to`, and the previews it announced.
+    fn migrate(&self, to: &Host) -> (Result<Migration>, Vec<Preview>) {
+        let mut previews = Vec::new();
+        let moved = migrate(&self.ports(), to, &name("ws4"), &mut |p: &Preview| {
+            previews.push(p.clone());
+        });
+        (moved, previews)
+    }
+
+    /// What a move may change, to compare runs.
+    fn end_state(&self) -> EndState {
+        let state = self.world.store.load().unwrap();
+        let tree = self.world.sway.get_tree().unwrap();
+        let mut marks: Vec<String> = window::i3mux_windows_in(&tree)
+            .into_iter()
+            .flat_map(|(id, _)| window::marks_of(&tree, id))
+            .map(|mark| mark.to_string())
+            .collect();
+        marks.sort();
+        let files = |host: &FakeHost| host.state.lock().unwrap().files.clone();
+        let shells = |host: &FakeHost| host.shells().into_keys().collect();
+        EndState {
+            binding: state.get("4").map(|b| {
+                let cleanup = b.cleanup().map(|c| c.host().clone());
+                (b.host().clone(), cleanup)
+            }),
+            marks,
+            windows: self.world.sway.window_count(),
+            old_shells: shells(&self.world.host),
+            new_shells: shells(&self.new),
+            old_files: files(&self.world.host),
+            new_files: files(&self.new),
+        }
+    }
+
+    fn created_on_new(&self) -> Vec<(String, Option<String>)> {
+        self.new.state.lock().unwrap().created.clone()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EndState {
+    /// The host of ws4's binding, and of its pending cleanup.
+    binding: Option<(Host, Option<Host>)>,
+    /// Every i3mux mark on every window, sorted.
+    marks: Vec<String>,
+    windows: usize,
+    old_shells: Vec<String>,
+    new_shells: Vec<String>,
+    old_files: BTreeMap<String, String>,
+    new_files: BTreeMap<String, String>,
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// Where a whole move of [`Moving`] ends: ws4 is on deepthought with no
+/// pending cleanup, its windows say so, and none of its shells or its
+/// layout is left on this machine (rules 2 and 3).
+fn moved_end() -> EndState {
+    let mut old_files = Moving::new().world.host.state.lock().unwrap().files.clone();
+    let layout = old_files.remove(SAVED_WS4).unwrap();
+    EndState {
+        binding: Some((deepthought(), None)),
+        marks: strings(&["_i3mux:deepthought:ws4-001", "_i3mux:deepthought:ws4-002"]),
+        windows: 3,
+        old_shells: strings(&["ws5-001"]),
+        new_shells: strings(&["ws4-001", "ws4-002", "ws4-003", "ws9-001"]),
+        old_files,
+        new_files: BTreeMap::from([(SAVED_WS4.to_owned(), layout)]),
+    }
+}
+
+/// PLAN-migrate decisions 3 to 6: the move says what will happen first,
+/// keeps the shell that the new host has, makes the missing ones there as
+/// login shells (no command), moves the binding, re-marks the windows,
+/// copies the layout, and ends the session on the old host. No window
+/// opens or closes, and other sessions are left alone.
 #[test]
-fn rebind_moves_the_binding_and_re_marks_the_windows_only() {
-    let world = World::new(Host::Local);
-    world.bind_with("4", "ws4", "w {shell}");
-    world.sway.open_marked("4", &world.mark("ws4-001"));
-    world.sway.open_marked("4", &world.mark("ws4-002"));
-    world.sway.open("4", "firefox");
+fn migrate_moves_a_session_and_its_windows_to_the_new_host() {
+    let moving = Moving::new();
 
-    let rebound = world
-        .finish(|ports| rebind(ports, &deepthought(), &name("ws4")))
-        .unwrap();
+    let (moved, previews) = moving.migrate(&deepthought());
 
     assert_eq!(
-        rebound,
-        Rebound {
-            workspace: "4".into(),
-            from: Some(Host::Local),
-            remarked: 2
+        moved.unwrap(),
+        Migration::Moved {
+            from: Host::Local,
+            done: MoveDone {
+                shells: 3,
+                started: 2,
+                remarked: 2,
+                ended: 3
+            }
         }
     );
-    let binding = world.store.load().unwrap().get("4").cloned().unwrap();
-    assert_eq!(binding.host(), &deepthought());
-    assert_eq!(binding.session(), &name("ws4"));
-    assert_eq!(binding.window_command().unwrap().as_str(), "w {shell}");
-    let tree = world.sway.get_tree().unwrap();
     assert_eq!(
-        window::session_terminals(&tree, &deepthought(), &name("ws4")),
-        [t("ws4", 1), t("ws4", 2)]
+        previews.iter().map(format_preview).collect::<Vec<_>>(),
+        [
+            "moving ws4 from local to deepthought: 2 of 3 shells start again there as login \
+          shells in ~; programs running on local end."
+        ]
     );
-    assert!(window::session_terminals(&tree, &Host::Local, &name("ws4")).is_empty());
-    assert_eq!(world.sway.window_count(), 3, "nothing opened or closed");
-    assert!(world.launches().is_empty());
+    assert_eq!(moving.end_state(), moved_end());
+    assert_eq!(
+        moving.created_on_new(),
+        [("ws4-001".to_owned(), None), ("ws4-003".to_owned(), None)],
+        "ws4-002 is kept"
+    );
+    assert!(moving.world.launches().is_empty());
+}
+
+/// The preview's wording for one shell, and for a rerun.
+#[test]
+fn a_move_says_what_will_happen() {
+    let one = Preview::Move {
+        session: name("ws3"),
+        from: Host::Ssh(RemoteHost::new("s0nny-box").unwrap()),
+        to: Host::Ssh(RemoteHost::new("dev-box").unwrap()),
+        missing: 1,
+        shells: 2,
+    };
+    assert_eq!(
+        format_preview(&one),
+        "moving ws3 from s0nny-box to dev-box: 1 of 2 shells starts again there as a login \
+         shell in ~; programs running on s0nny-box end."
+    );
+    let finish = Preview::Finish {
+        session: name("ws3"),
+        from: Host::Local,
+        to: deepthought(),
+    };
+    assert_eq!(
+        format_preview(&finish),
+        "finishing the move of ws3 from local to deepthought: programs running on local end."
+    );
+}
+
+/// PLAN-migrate rules 1 to 3 (Enforcement): cut the move after each host
+/// and Sway operation, then run it again. Every rerun reaches the end of
+/// a whole move. Before the binding moves, only shells on the new host
+/// have changed; once it moved, every shell of the session on the old host
+/// exists on the new one.
+#[test]
+fn a_move_cut_at_any_step_then_run_again_reaches_the_same_end() {
+    let whole = Moving::new();
+    whole.migrate(&deepthought()).0.unwrap();
+    let operations = whole.cut.ran();
+    assert!(operations > 10, "{operations}");
+    let start = Moving::new().end_state();
+
+    for cut_at in 0..operations {
+        let moving = Moving::new();
+        moving.cut.at(Some(cut_at));
+        let (cut_run, _) = moving.migrate(&deepthought());
+        assert!(cut_run.is_err(), "cut at {cut_at} of {operations}");
+        moving.cut.at(None);
+        let cut = moving.end_state();
+        match &cut.binding {
+            Some((host, None)) if *host == Host::Local => {
+                assert_eq!(
+                    EndState {
+                        new_shells: start.new_shells.clone(),
+                        ..cut
+                    },
+                    start,
+                    "rule 1, cut at {cut_at}"
+                );
+            }
+            Some((host, Some(left))) if *host == deepthought() && *left == Host::Local => {
+                for shell in ["ws4-001", "ws4-002", "ws4-003"] {
+                    assert!(
+                        cut.new_shells.iter().any(|s| s == shell),
+                        "rule 2, cut at {cut_at}: {shell}"
+                    );
+                }
+            }
+            other => panic!("cut at {cut_at}: binding {other:?}"),
+        }
+
+        let (rerun, _) = moving.migrate(&deepthought());
+
+        rerun.unwrap();
+        assert_eq!(moving.end_state(), moved_end(), "cut at {cut_at}");
+    }
+}
+
+/// PLAN-migrate decision 7: once the move is done, another one prints
+/// that the session is there and changes nothing.
+#[test]
+fn a_move_to_where_the_session_is_changes_nothing() {
+    let moving = Moving::new();
+    moving.migrate(&deepthought()).0.unwrap();
+    let commands = moving.world.sway.commands().len();
+
+    let (again, previews) = moving.migrate(&deepthought());
+
+    assert_eq!(again.unwrap(), Migration::AlreadyThere);
+    assert!(previews.is_empty());
+    assert_eq!(moving.end_state(), moved_end());
+    assert_eq!(moving.world.sway.commands().len(), commands);
+}
+
+/// PLAN-migrate decision 7: a rerun of a move whose cleanup is pending
+/// re-marks the windows left with the old host and runs the cleanup.
+#[test]
+fn a_rerun_finishes_a_move_with_a_pending_cleanup() {
+    let moving = Moving::new();
+    moving.new.add_shell("ws4-001", false);
+    moving.new.add_shell("ws4-003", false);
+    moving
+        .world
+        .store
+        .with_lock(|s| Ok(s.migrate("4", &deepthought())?))
+        .unwrap();
+
+    let (finished, previews) = moving.migrate(&deepthought());
+
+    assert_eq!(
+        finished.unwrap(),
+        Migration::Finished {
+            from: Host::Local,
+            done: MoveDone {
+                remarked: 2,
+                ended: 3,
+                ..MoveDone::default()
+            }
+        }
+    );
+    assert!(matches!(previews.as_slice(), [Preview::Finish { .. }]));
+    assert_eq!(moving.end_state(), moved_end());
+    assert!(moving.created_on_new().is_empty());
+}
+
+/// PLAN-migrate decision 2: a move to the host of a pending cleanup cancels
+/// that cleanup and keeps that host's shells; the new cleanup names the
+/// host the session leaves, and runs.
+#[test]
+fn a_move_back_cancels_the_cleanup_and_keeps_that_hosts_shells() {
+    let moving = Moving::new();
+    for shell in ["ws4-001", "ws4-003", "ws4-004"] {
+        moving.new.add_shell(shell, false);
+    }
+    moving
+        .world
+        .store
+        .with_lock(|s| Ok(s.migrate("4", &deepthought())?))
+        .unwrap();
+    let (old_shells, old_files) = (
+        moving.world.host.shells(),
+        moving.world.host.state.lock().unwrap().files.clone(),
+    );
+
+    let (back, _) = moving.migrate(&Host::Local);
+
+    assert_eq!(
+        back.unwrap(),
+        Migration::Moved {
+            from: deepthought(),
+            done: MoveDone {
+                shells: 4,
+                started: 1,
+                remarked: 0,
+                ended: 4
+            }
+        }
+    );
+    let end = moving.end_state();
+    assert_eq!(end.binding, Some((Host::Local, None)));
+    assert_eq!(end.new_shells, ["ws9-001"]);
+    let created = moving.world.host.state.lock().unwrap().created.clone();
+    assert_eq!(
+        created,
+        [("ws4-004".to_owned(), None)],
+        "001 to 003 are kept"
+    );
+    let mut expected = old_shells;
+    expected.insert("ws4-004".to_owned(), false);
+    assert_eq!(moving.world.host.shells(), expected);
+    assert_eq!(
+        moving.world.host.state.lock().unwrap().files,
+        old_files,
+        "this machine keeps its layout; deepthought had none to copy"
+    );
+    assert_eq!(
+        end.marks,
+        ["_i3mux:local:ws4-001", "_i3mux:local:ws4-002"],
+        "the windows never left"
+    );
+}
+
+/// Run `migrate` on `moving` and check that it is refused with nothing
+/// changed: no preview, no shell made, the same end state.
+fn refused(moving: &Moving, to: &Host) -> anyhow::Error {
+    let before = moving.end_state();
+    let (moved, previews) = moving.migrate(to);
+    let err = moved.unwrap_err();
+    assert!(previews.is_empty(), "{err:#}");
+    assert!(moving.created_on_new().is_empty(), "{err:#}");
+    assert_eq!(moving.end_state(), before, "{err:#}");
+    err
+}
+
+/// PLAN-migrate decision 2: a new host with a saved layout of the session,
+/// or a binding of it in another workspace, would be overwritten.
+#[test]
+fn a_move_that_would_overwrite_another_session_is_refused() {
+    let saved = Moving::new();
+    let layout = saved.world.host.file(SAVED_WS4).unwrap();
+    saved
+        .new
+        .state
+        .lock()
+        .unwrap()
+        .files
+        .insert(SAVED_WS4.to_owned(), layout);
+    let err = refused(&saved, &deepthought());
     assert!(
-        world.fakes.events().is_empty(),
-        "no master started or stopped"
+        matches!(command_error(&err), CommandError::MoveTargetSaved { .. }),
+        "{err:#}"
+    );
+    assert!(
+        err.to_string()
+            .contains("run 'i3mux kill --remote deepthought --session ws4'"),
+        "{err}"
+    );
+
+    let bound = Moving::new();
+    let other = WorkspaceState::new(deepthought(), name("ws4"));
+    bound
+        .world
+        .store
+        .with_lock(|s| Ok(s.bind("5", other)?))
+        .unwrap();
+    let err = refused(&bound, &deepthought());
+    assert!(
+        matches!(command_error(&err), CommandError::MoveTargetBound { workspace, .. } if workspace == "5"),
+        "{err:#}"
     );
 }
 
-/// A second run changes nothing, and a run cut after the binding moved
-/// re-marks the windows left behind.
+/// PLAN-migrate decision 2: a pending cleanup of a third host would be
+/// lost. The refusal names the command that finishes it.
 #[test]
-fn rebind_again_finishes_a_cut_run_and_changes_nothing_else() {
-    let world = World::new(Host::Local);
-    world.bind("4", "ws4");
-    rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap();
-    let left = world.sway.open_marked("4", &world.mark("ws4-003"));
-    let before = world.sway.commands().len();
+fn a_move_with_a_cleanup_of_a_third_host_is_refused() {
+    let moving = Moving::new();
+    moving
+        .world
+        .store
+        .with_lock(|s| Ok(s.migrate("4", &deepthought())?))
+        .unwrap();
+    let third = Host::Ssh(RemoteHost::new("third").unwrap());
 
-    let again = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap();
+    let err = refused(&moving, &third);
 
-    assert_eq!(again.from, None);
-    assert_eq!(again.remarked, 1);
-    assert_eq!(world.sway.commands().len(), before + 2);
-    let third = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap();
-    assert_eq!((third.from, third.remarked), (None, 0));
-    assert_eq!(world.sway.commands().len(), before + 2, "nothing more");
-    let tree = world.sway.get_tree().unwrap();
-    assert!(window::i3mux_windows_in(&tree)
-        .iter()
-        .any(|(id, mark)| *id == left && mark.host() == &deepthought()));
+    assert!(
+        matches!(command_error(&err), CommandError::MoveUnfinished { .. }),
+        "{err:#}"
+    );
+    assert!(
+        err.to_string()
+            .contains("'i3mux attach --remote deepthought --session ws4 --migrate'"),
+        "{err}"
+    );
+}
+
+/// PLAN-migrate decision 2: either host not answering refuses the move.
+#[test]
+fn a_move_with_a_host_that_does_not_answer_is_refused() {
+    for silent in [Host::Local, deepthought()] {
+        let moving = Moving::new();
+        let host = if silent == Host::Local {
+            &moving.world.host
+        } else {
+            &moving.new
+        };
+        host.state.lock().unwrap().unreachable = true;
+        let before = moving.end_state();
+        let (moved, previews) = moving.migrate(&deepthought());
+        host.state.lock().unwrap().unreachable = false;
+        let err = moved.unwrap_err();
+        assert!(previews.is_empty(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("did not move, and nothing changed"),
+            "{err:#}"
+        );
+        assert_eq!(moving.end_state(), before, "{err:#}");
+    }
 }
 
 #[test]
-fn rebind_refuses_a_session_bound_nowhere_or_twice() {
+fn a_move_of_a_session_bound_nowhere_or_twice_is_refused() {
     let world = World::new(Host::Local);
-    let err = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap_err();
+    let mut ignore = |_: &Preview| {};
+    let err = migrate(&world.ports(), &deepthought(), &name("ws4"), &mut ignore).unwrap_err();
     assert!(matches!(
         command_error(&err),
-        CommandError::NothingToRebind(_)
+        CommandError::NothingToMove(_)
     ));
     // Its own exit status: no binding (README, "Exit status").
     assert_eq!(failure_status(&err), EXIT_NO_BINDING);
-    assert_eq!(
-        failure_status(&err.context("while rebinding")),
-        EXIT_NO_BINDING
-    );
 
     world.bind("4", "ws4");
-    let elsewhere = WorkspaceState::new(deepthought(), name("ws4"));
-    world
-        .store
-        .with_lock(|s| Ok(s.bind("5", elsewhere)?))
-        .unwrap();
-    let err = rebind(&world.ports(), &deepthought(), &name("ws4")).unwrap_err();
+    let third = WorkspaceState::new(Host::Ssh(RemoteHost::new("third").unwrap()), name("ws4"));
+    world.store.with_lock(|s| Ok(s.bind("5", third)?)).unwrap();
+    let err = migrate(&world.ports(), &deepthought(), &name("ws4"), &mut ignore).unwrap_err();
     assert!(
         err.to_string()
             .starts_with("Session 'ws4' is bound in workspaces 4 and 5"),
         "{err}"
     );
     assert_eq!(failure_status(&err), 1, "any other refusal");
-    assert!(world.sway.commands().is_empty());
+}
+
+/// PLAN-migrate decision 4 and rule 1: a shell that does not start on the
+/// new host ends the shells this move made there, and nothing else
+/// changes. The shell that the new host had stays.
+#[test]
+fn a_shell_that_does_not_start_ends_the_ones_made_and_changes_nothing_else() {
+    let moving = Moving::new();
+    moving.new.state.lock().unwrap().vanishing = vec!["ws4-003".to_owned()];
+    let before = moving.end_state();
+
+    let err = moving.migrate(&deepthought()).0.unwrap_err();
+
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("Shell ws4-003 did not start on deepthought"),
+        "{text}"
+    );
+    // ws4-001 and ws4-003, whose `attach -b` worked before it ended.
+    assert!(text.contains("ended the 2 shells it made there"), "{text}");
+    assert_eq!(moving.end_state(), before);
+
+    let failing = Moving::new();
+    failing.new.state.lock().unwrap().fail_create = Some("shpool: no".into());
+    let before = failing.end_state();
+    let err = failing.migrate(&deepthought()).0.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("cannot start shell ws4-001"),
+        "{err:#}"
+    );
+    assert_eq!(failing.end_state(), before);
+}
+
+/// A move whose binding has been moved by `LocalState::migrate` and whose
+/// windows show the new host: the state after a cut right after step 5.
+fn moved_with_pending_cleanup() -> Moving {
+    let moving = Moving::new();
+    moving.new.add_shell("ws4-001", true);
+    moving.new.add_shell("ws4-003", false);
+    moving
+        .world
+        .store
+        .with_lock(|s| Ok(s.migrate("4", &deepthought())?))
+        .unwrap();
+    let request = Move {
+        workspace: "4",
+        session: &name("ws4"),
+        from: &Host::Local,
+        to: &deepthought(),
+    };
+    remark_session(&moving.ports(), &request).unwrap();
+    moving
+}
+
+/// PLAN-migrate decision 8: `detach` and `kill` run a pending cleanup
+/// first: the old host's shells and layout of the session end.
+#[test]
+fn detach_and_kill_run_a_pending_cleanup_first() {
+    let detaching = moved_with_pending_cleanup();
+    detach(&detaching.ports(), "4", 0).unwrap();
+    let end = detaching.end_state();
+    assert_eq!(end.binding, None);
+    assert_eq!(end.old_shells, ["ws5-001"]);
+    assert!(!end.old_files.contains_key(SAVED_WS4));
+    assert!(
+        end.new_files.contains_key(SAVED_WS4),
+        "detach saved it there"
+    );
+
+    let killing = moved_with_pending_cleanup();
+    kill(&killing.ports(), &deepthought(), &name("ws4")).unwrap();
+    let end = killing.end_state();
+    assert_eq!(end.binding, None);
+    assert_eq!(end.old_shells, ["ws5-001"]);
+    assert_eq!(end.new_shells, ["ws9-001"]);
+    assert!(!end.old_files.contains_key(SAVED_WS4));
+    assert!(!end.new_files.contains_key(SAVED_WS4));
+}
+
+/// PLAN-migrate decision 8: with the old host silent, `detach` and `kill`
+/// refuse, and the binding keeps its pending cleanup.
+#[test]
+fn detach_and_kill_refuse_while_the_old_host_of_a_cleanup_does_not_answer() {
+    for command in ["detach", "kill"] {
+        let moving = moved_with_pending_cleanup();
+        moving.world.host.state.lock().unwrap().unreachable = true;
+        let before = moving.end_state();
+
+        let err = match command {
+            "detach" => detach(&moving.ports(), "4", 0).map(drop),
+            _ => kill(&moving.ports(), &deepthought(), &name("ws4")).map(drop),
+        }
+        .unwrap_err();
+
+        assert!(
+            matches!(command_error(&err), CommandError::CleanupUnanswered { .. }),
+            "{command}: {err:#}"
+        );
+        assert_eq!(moving.end_state(), before, "{command}");
+    }
+}
+
+/// PLAN-migrate decision 8: `sessions` and `status` show a pending cleanup
+/// with the command that finishes it.
+#[test]
+fn sessions_and_status_show_a_pending_cleanup_and_how_to_finish_it() {
+    let moving = moved_with_pending_cleanup();
+    let finish = "shells on local not ended yet: \
+                  run 'i3mux attach --remote deepthought --session ws4 --migrate'";
+
+    let rows = sessions(&moving.ports(), &deepthought()).unwrap();
+    let report = status(&moving.ports(), "4").unwrap().unwrap();
+
+    assert_eq!(
+        format_rows(&rows)[0],
+        format!("ws4  (deepthought)  workspace 4, 2 windows, 1 orphan, {finish}")
+    );
+    assert_eq!(
+        format_status(&report)[0],
+        format!("ws4  (deepthought)  workspace 4, 2 windows, {finish}")
+    );
 }
 
 // ------------------------------------------------------------- reattach
@@ -1446,7 +2053,7 @@ fn here_shell_with_force_moves_the_mark_from_the_other_window() {
 
 /// The window that already carries the shell's mark is not "another
 /// window": `--shell` in it is never refused and needs no `--force`, also
-/// when the binding moved to another host since (`attach --rebind-only`
+/// when the binding moved to another host since (`attach --migrate`
 /// re-marked the window).
 #[test]
 fn here_shell_in_the_window_that_has_the_mark_needs_no_force() {
@@ -1673,29 +2280,30 @@ fn here_whose_new_shell_fails_binds_and_marks_nothing() {
     assert!(world.sway.commands().is_empty(), "marked");
 }
 
-/// PLAN-terminal-here decision 3 from a remote host: a rebind away from
-/// it contacts it not at all (no master started or stopped), even with
-/// its windows still attached; their marks move, their shells stay.
+/// A move away from a remote host ends the session's shells there, then
+/// stops the host's ssh master: no binding uses it and no window is
+/// marked with it (plan-ssh-recovery rule 12). Nothing runs there after.
 #[test]
-fn rebind_away_from_a_remote_host_never_contacts_it() {
+fn a_move_away_from_a_remote_host_stops_its_master() {
     let world = World::new(deepthought());
     world.bind("4", "ws4");
     world.host.add_shell("ws4-001", true);
     world.sway.open_marked("4", &world.mark("ws4-001"));
+    let (local, hosts) = with_local_host(&world);
+    let ports = Ports {
+        hosts: hosts.as_ref(),
+        ..world.ports()
+    };
 
-    let rebound = rebind(&world.ports(), &Host::Local, &name("ws4")).unwrap();
+    with_unused_masters_stopped(&world.store, &world.masters, world.sway.as_ref(), || {
+        migrate(&ports, &Host::Local, &name("ws4"), &mut |_| {})
+    })
+    .unwrap();
 
-    assert_eq!(rebound.from, Some(deepthought()));
-    assert!(
-        world.fakes.events().is_empty(),
-        "{:?}",
-        world.fakes.events()
-    );
-    assert_eq!(
-        world.host.shells(),
-        BTreeMap::from([("ws4-001".to_owned(), true)])
-    );
-    assert!(world.host.state.lock().unwrap().detach_calls.is_empty());
+    assert!(world.host.shells().is_empty());
+    assert_eq!(local.shells().into_keys().collect::<Vec<_>>(), ["ws4-001"]);
+    assert_eq!(world.fakes.stopped(), [dt()]);
+    assert!(!world.fakes.running(&dt()), "{:?}", world.fakes.events());
     let tree = world.sway.get_tree().unwrap();
     assert_eq!(
         window::session_terminals(&tree, &Host::Local, &name("ws4")),
@@ -2282,11 +2890,13 @@ fn sessions_row_wording() {
             workspace: "4".into(),
             windows: 3,
             orphans: 1,
+            cleanup: None,
         }),
         row(RowStatus::Bound {
             workspace: "mail".into(),
             windows: 1,
             orphans: 0,
+            cleanup: None,
         }),
         row(RowStatus::Detached { saved: 1 }),
     ];
@@ -2673,12 +3283,16 @@ fn cli_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
+/// `--migrate` names its session and takes no `--force`; `--rebind-only`
+/// is gone (PLAN-migrate: it replaces it).
 #[test]
-fn rebind_only_needs_a_session_and_takes_no_force() {
+fn migrate_needs_a_session_and_takes_no_force() {
     let parse = |args: &[&str]| Cli::try_parse_from([&["i3mux", "attach"], args].concat());
-    assert!(parse(&["--rebind-only", "--remote", "h"]).is_err());
-    assert!(parse(&["--rebind-only", "--session", "s", "--force"]).is_err());
-    assert!(parse(&["--rebind-only", "--remote", "h", "--session", "s"]).is_ok());
+    assert!(parse(&["--migrate", "--remote", "h"]).is_err());
+    assert!(parse(&["--migrate", "--session", "s", "--force"]).is_err());
+    assert!(parse(&["--migrate", "--remote", "h", "--session", "s"]).is_ok());
+    assert!(parse(&["--migrate", "--session", "s"]).is_ok());
+    assert!(parse(&["--rebind-only", "--remote", "h", "--session", "s"]).is_err());
 }
 
 /// `--shell`, `--remote` and `--window-command` belong to `--here`, and

@@ -105,8 +105,10 @@ pub mod testing {
     use std::sync::Mutex;
 
     /// An in-memory Sway: one output, workspaces with flat window lists.
-    /// Understands `mark --add`, `move container to workspace` (by
-    /// `con_id`) and the `con_mark` kill; records every command.
+    /// Understands `mark --add`, `unmark`, `move container to workspace`
+    /// (by `con_id`) and the `con_mark` kill; records every command. As in
+    /// Sway, a mark is on one window at most: `mark --add` takes it from
+    /// any other window, and adds nothing to a window that has it.
     #[derive(Default)]
     pub struct FakeSway {
         state: Mutex<FakeState>,
@@ -208,14 +210,24 @@ pub mod testing {
             if let Some(rest) = command.strip_prefix("[con_id=") {
                 let (id, rest) = rest.split_once(']').ok_or_else(|| anyhow!("bad command"))?;
                 let id: u64 = id.parse()?;
+                let rest = rest.trim();
+                let added = rest
+                    .strip_prefix("mark --add ")
+                    .map(|mark| mark.trim_matches('"').to_owned());
+                if let Some(mark) = &added {
+                    for other in state.windows.iter_mut().filter(|w| w.1 != id) {
+                        other.3.retain(|m| m != mark);
+                    }
+                }
                 let window = state
                     .windows
                     .iter_mut()
                     .find(|w| w.1 == id)
                     .ok_or_else(|| anyhow!("no {id}"))?;
-                let rest = rest.trim();
-                if let Some(mark) = rest.strip_prefix("mark --add ") {
-                    window.3.push(mark.trim_matches('"').to_owned());
+                if let Some(mark) = added {
+                    if !window.3.contains(&mark) {
+                        window.3.push(mark);
+                    }
                 } else if let Some(mark) = rest.strip_prefix("unmark ") {
                     let mark = mark.trim_matches('"');
                     window.3.retain(|m| m != mark);

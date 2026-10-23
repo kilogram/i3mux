@@ -144,7 +144,7 @@ enum CliCommand {
     },
     /// Save the focused workspace's layout on the session's host and close its windows
     Detach,
-    /// Restore a saved session into the focused workspace
+    /// Restore a saved session into the focused workspace, or (--migrate) move a session to another host
     Attach {
         /// The host that runs the shells [default: this machine]
         #[arg(short, long)]
@@ -154,10 +154,12 @@ enum CliCommand {
         session: Option<String>,
         #[arg(long, help = FORCE_HELP)]
         force: bool,
-        /// Only move the binding of --session to the --remote host and
-        /// re-mark its windows: open, close and attach nothing
+        /// Move the bound session --session to the --remote host, in
+        /// whatever workspace has it, while its windows stay open: keep the
+        /// shells that host has, start the others there as login shells in
+        /// ~, then end the shells on the old host (programs there end)
         #[arg(long, requires = "session", conflicts_with = "force")]
-        rebind_only: bool,
+        migrate: bool,
     },
     /// List the sessions on a host
     Sessions {
@@ -268,8 +270,41 @@ enum CommandError {
     NoSavedSessions(Host),
     #[error("No session '{session}' on {host}")]
     NoSuchSession { session: SessionName, host: Host },
-    #[error("No workspace is bound to session '{0}'; nothing to rebind")]
-    NothingToRebind(SessionName),
+    #[error("No workspace is bound to session '{0}'; nothing to move")]
+    NothingToMove(SessionName),
+    #[error(
+        "Session '{session}' on {host} is bound to workspace {workspace} already, and a move \
+         there would overwrite it; nothing changed"
+    )]
+    MoveTargetBound {
+        session: SessionName,
+        host: Host,
+        workspace: String,
+    },
+    #[error(
+        "{host} has a saved layout of session '{session}', which a move there would overwrite; \
+         nothing changed. To end that session, run 'i3mux kill{} --session {session}'",
+        remote_flag(.host)
+    )]
+    MoveTargetSaved { session: SessionName, host: Host },
+    #[error(
+        "Session '{session}' on {bound} has not finished its move from {left}: its shells there \
+         still run. Finish it first with 'i3mux attach{} --session {session} --migrate'; \
+         nothing changed",
+        remote_flag(.bound)
+    )]
+    MoveUnfinished {
+        session: SessionName,
+        bound: Host,
+        left: Host,
+    },
+    #[error("Shell {shell} did not start on {host}")]
+    MoveShellMissing { shell: TerminalName, host: Host },
+    #[error(
+        "Session '{session}' has not finished its move from {left}, which does not answer: \
+         its shells there must end first; nothing changed"
+    )]
+    CleanupUnanswered { session: SessionName, left: Host },
     #[error(
         "Workspace {workspace} is bound to session '{session}' on {bound}, not {asked}; \
          nothing changed"
@@ -296,7 +331,7 @@ enum CommandError {
     NoWorkspace,
     #[error(
         "Session '{session}' is bound in workspaces {workspaces} (on different hosts); \
-         rebind needs one: end the other with 'i3mux kill --remote HOST --session {session}'"
+         a move needs one: end the other with 'i3mux kill --remote HOST --session {session}'"
     )]
     BoundTwice {
         session: SessionName,
@@ -338,7 +373,7 @@ fn main() -> ExitCode {
 fn failure_status(err: &anyhow::Error) -> u8 {
     match err.chain().find_map(|e| e.downcast_ref::<CommandError>()) {
         Some(CommandError::NoSuchShell { .. }) => EXIT_NO_SHELL,
-        Some(CommandError::NotBound { .. } | CommandError::NothingToRebind(_)) => EXIT_NO_BINDING,
+        Some(CommandError::NotBound { .. } | CommandError::NothingToMove(_)) => EXIT_NO_BINDING,
         _ => 1,
     }
 }
@@ -522,14 +557,14 @@ fn dispatch_exit(
             remote,
             session,
             force,
-            rebind_only: false,
+            migrate: false,
         } => cmd_attach(ports, wm, remote, session, force),
         CliCommand::Attach {
             remote,
             session,
-            rebind_only: true,
+            migrate: true,
             ..
-        } => cmd_rebind(ports, remote, session),
+        } => cmd_migrate(ports, remote, session),
         CliCommand::Sessions { remote, all } => cmd_sessions(ports, remote, all),
         CliCommand::Status => cmd_status(ports, wm),
         CliCommand::Open {
@@ -762,20 +797,64 @@ fn cmd_attach(
     }
 }
 
-fn cmd_rebind(ports: &Ports, remote: Option<String>, session: Option<String>) -> Result<ExitCode> {
+/// `attach --migrate`: the preview line goes to stderr before anything
+/// changes (PLAN-migrate decision 3), the result to stdout.
+fn cmd_migrate(ports: &Ports, remote: Option<String>, session: Option<String>) -> Result<ExitCode> {
     let host = Host::from_remote_arg(remote)?;
     let session = parse_session(session)?
-        .context("i3mux bug: clap lets --rebind-only through without --session")?;
-    let rebound = rebind(ports, &host, &session)?;
-    let moved = rebound
-        .from
-        .map_or_else(|| "already".to_owned(), |from| format!("moved from {from}"));
-    println!(
-        "✓ Workspace {}: session '{session}' {moved} on {host}; {} re-marked",
-        rebound.workspace,
-        count(rebound.remarked, "window", "windows")
-    );
+        .context("i3mux bug: clap lets --migrate through without --session")?;
+    let mut announce = |preview: &Preview| eprintln!("i3mux: {}", format_preview(preview));
+    match migrate(ports, &host, &session, &mut announce)? {
+        Migration::AlreadyThere => println!("{session} is already on {host}"),
+        Migration::Moved { from, done } => println!(
+            "✓ Moved session '{session}' from {from} to {host}: {} of {} started there; {}",
+            done.started,
+            count(done.shells, "shell", "shells"),
+            format_done(&from, &done)
+        ),
+        Migration::Finished { from, done } => println!(
+            "✓ Finished the move of session '{session}' from {from} to {host}: {}",
+            format_done(&from, &done)
+        ),
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `2 windows re-marked, 2 shells ended on s0nny-box`.
+fn format_done(from: &Host, done: &MoveDone) -> String {
+    format!(
+        "{} re-marked, {} ended on {from}",
+        count(done.remarked, "window", "windows"),
+        count(done.ended, "shell", "shells")
+    )
+}
+
+/// The line a move prints before it changes anything (PLAN-migrate
+/// decision 3).
+fn format_preview(preview: &Preview) -> String {
+    match preview {
+        Preview::Move {
+            session,
+            from,
+            to,
+            missing,
+            shells,
+        } => {
+            let starts = if *missing == 1 {
+                "starts again there as a login shell"
+            } else {
+                "start again there as login shells"
+            };
+            format!(
+                "moving {session} from {from} to {to}: {missing} of {} {starts} in ~; \
+                 programs running on {from} end.",
+                count(*shells, "shell", "shells")
+            )
+        }
+        Preview::Finish { session, from, to } => format!(
+            "finishing the move of {session} from {from} to {to}: programs running on {from} end."
+        ),
+    }
 }
 
 fn cmd_sessions(ports: &Ports, remote: Option<String>, all: bool) -> Result<ExitCode> {
@@ -1168,7 +1247,7 @@ fn undo_here(ports: &Ports, changes: &HereChanges) -> Result<()> {
     }
     if let Some(bound) = &changes.bound {
         if lock.state().get(&changes.workspace) == Some(bound) {
-            lock.state_mut().unbind(&changes.workspace);
+            lock.state_mut().unbind(&changes.workspace)?;
             lock.commit()?;
         }
     }
@@ -1551,7 +1630,8 @@ struct Detached {
 ///
 /// Plan rule 5: at least one i3mux window is required. Plan rule 7: the
 /// layout is written before any window closes, so a failed write leaves
-/// every window open.
+/// every window open. A pending cleanup runs first (PLAN-migrate decision
+/// 8): a host it cannot reach refuses the detach.
 ///
 /// Sway closes windows asynchronously, so their shpool clients can outlive
 /// the kill; an `attach` right after would then see the shells as attached
@@ -1577,11 +1657,12 @@ fn detach(ports: &Ports, workspace: &str, saved_at_unix: u64) -> Result<Detached
         })?;
     let saved = SavedSession::new(name.clone(), host.clone(), layout, saved_at_unix)?
         .with_window_command(binding.window_command().cloned());
+    finish_pending(ports, &mut lock, workspace, &binding)?;
     let exec = (ports.hosts)(host);
     session::save(exec.as_ref(), &saved)?;
     let closed = sway_ops::kill_all(ports.sway, host, name)?;
     mux::detach(exec.as_ref(), &closed)?;
-    lock.state_mut().unbind(workspace);
+    lock.state_mut().unbind(workspace)?;
     lock.commit()?;
     wait_until_disconnected(exec.as_ref(), name, &closed, ports.disconnect_wait)?;
     Ok(Detached {
@@ -1713,62 +1794,373 @@ enum Pick {
     Several(Vec<SessionName>),
 }
 
-/// What `attach --rebind-only` did.
-#[derive(Debug, PartialEq, Eq)]
-struct Rebound {
-    workspace: String,
-    /// The host the binding left; `None` if it was on the new host already.
-    from: Option<Host>,
-    /// The windows that now carry the new host in their mark.
-    remarked: usize,
+/// What a move is about to do: the line it prints first (PLAN-migrate
+/// decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Preview {
+    /// A move from `from`: `missing` of its `shells` there start again on
+    /// `to`.
+    Move {
+        session: SessionName,
+        from: Host,
+        to: Host,
+        missing: usize,
+        shells: usize,
+    },
+    /// A rerun ends the shells that an earlier move left on `from`.
+    Finish {
+        session: SessionName,
+        from: Host,
+        to: Host,
+    },
 }
 
-/// Move the binding of `session` to `host`, and re-mark the session's
-/// windows that show another host (PLAN-terminal-here decision 3).
+/// What `attach --migrate` did.
+#[derive(Debug, PartialEq, Eq)]
+enum Migration {
+    /// The session was on the host already, with no pending cleanup
+    /// (PLAN-migrate decision 7). Nothing changed.
+    AlreadyThere,
+    /// The session moved from `from` (decisions 4 to 6).
+    Moved { from: Host, done: MoveDone },
+    /// A rerun finished an earlier move from `from` (decision 7).
+    Finished { from: Host, done: MoveDone },
+}
+
+/// The counts that a move reports.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MoveDone {
+    /// The session's shells on the old host, when the move checked.
+    shells: usize,
+    /// Of those, the ones the new host lacked and got as login shells.
+    started: usize,
+    /// The windows that now carry the new host in their mark.
+    remarked: usize,
+    /// The shells of the session that ended on the old host.
+    ended: usize,
+}
+
+/// Move `session`, in whatever workspace it is bound, to host `to`, while
+/// its windows stay open (PLAN-migrate). Under the state lock from the
+/// first check to the end (decision 1).
 ///
-/// It contacts no host, starts no master, and opens, closes or attaches
-/// no window: the windows keep running what they run. Under the state lock
-/// throughout. The binding is committed first, then the windows are
-/// re-marked; a run cut in between leaves windows with the old host, and
-/// a second run re-marks them. A second run changes nothing else.
-fn rebind(ports: &Ports, host: &Host, session: &SessionName) -> Result<Rebound> {
+/// Every refusal comes before any change (decision 2). Then `announce`
+/// gets the preview, once (decision 3). Step 4 keeps the shells that `to`
+/// has and makes the missing ones as login shells in the home directory;
+/// a failure there ends the shells it made and changes nothing else. Step
+/// 5 moves the binding and records the old host as a pending cleanup, in
+/// one state write, then re-marks the windows. Step 6 ([`clean_up`]) ends
+/// the session on the old host.
+///
+/// Each step is safe to repeat, so a rerun after a cut at any point
+/// reaches the same end (decision 7): before step 5 it keeps the shells
+/// made already; after it, it re-marks the windows left and runs step 6.
+/// A move to the host of a pending cleanup cancels that cleanup and keeps
+/// that host's shells.
+fn migrate(
+    ports: &Ports,
+    to: &Host,
+    session: &SessionName,
+    announce: &mut dyn FnMut(&Preview),
+) -> Result<Migration> {
     let mut lock = ports.store.lock()?;
-    let bound: Vec<(String, Host)> = lock
-        .state()
+    let (workspace, binding) = binding_to_move(lock.state(), to, session)?;
+    let bound = binding.host();
+    let left = binding.cleanup().map(state::PendingCleanup::host);
+    if bound == to {
+        let Some(left) = left else {
+            return Ok(Migration::AlreadyThere);
+        };
+        let request = Move {
+            workspace: &workspace,
+            session,
+            from: left,
+            to,
+        };
+        return finish_move(ports, &mut lock, &request, announce);
+    }
+    if let Some(left) = left.filter(|left| *left != to) {
+        return Err(CommandError::MoveUnfinished {
+            session: session.clone(),
+            bound: bound.clone(),
+            left: left.clone(),
+        }
+        .into());
+    }
+    let request = Move {
+        workspace: &workspace,
+        session,
+        from: bound,
+        to,
+    };
+    move_session(ports, &mut lock, &request, left.is_some(), announce)
+}
+
+/// A move of the session bound to `workspace` from host `from` to `to`.
+struct Move<'a> {
+    workspace: &'a str,
+    session: &'a SessionName,
+    from: &'a Host,
+    to: &'a Host,
+}
+
+/// A rerun of a move whose cleanup of `from` is pending (PLAN-migrate
+/// decision 7): re-mark the windows left with `from`, then run step 6.
+fn finish_move(
+    ports: &Ports,
+    lock: &mut state::StateLock,
+    request: &Move,
+    announce: &mut dyn FnMut(&Preview),
+) -> Result<Migration> {
+    let (old, new) = ((ports.hosts)(request.from), (ports.hosts)(request.to));
+    answers(old.as_ref(), request.session)?;
+    answers(new.as_ref(), request.session)?;
+    announce(&Preview::Finish {
+        session: request.session.clone(),
+        from: request.from.clone(),
+        to: request.to.clone(),
+    });
+    let done = MoveDone {
+        remarked: remark_session(ports, request)?,
+        ended: clean_up(
+            lock,
+            request.workspace,
+            old.as_ref(),
+            new.as_ref(),
+            request.session,
+        )?,
+        ..MoveDone::default()
+    };
+    Ok(Migration::Finished {
+        from: request.from.clone(),
+        done,
+    })
+}
+
+/// Steps 4 to 6 of a move (PLAN-migrate decisions 4 to 6), after the
+/// refusals of the binding. `returning`: `to` is the host of a pending
+/// cleanup, so its saved layout is the session's own.
+fn move_session(
+    ports: &Ports,
+    lock: &mut state::StateLock,
+    request: &Move,
+    returning: bool,
+    announce: &mut dyn FnMut(&Preview),
+) -> Result<Migration> {
+    let (session, to) = (request.session, request.to);
+    let (old, new) = ((ports.hosts)(request.from), (ports.hosts)(to));
+    let shells: Vec<TerminalName> = answers(old.as_ref(), session)?
+        .into_iter()
+        .map(|s| s.name().clone())
+        .filter(|name| name.session() == session)
+        .collect();
+    let there = answers(new.as_ref(), session)?;
+    if !returning && session::list(new.as_ref())?.contains(session) {
+        return Err(CommandError::MoveTargetSaved {
+            session: session.clone(),
+            host: to.clone(),
+        }
+        .into());
+    }
+    let missing: Vec<TerminalName> = shells
+        .iter()
+        .filter(|name| !there.iter().any(|s| s.name() == *name))
+        .cloned()
+        .collect();
+    announce(&Preview::Move {
+        session: session.clone(),
+        from: request.from.clone(),
+        to: to.clone(),
+        missing: missing.len(),
+        shells: shells.len(),
+    });
+    make_shells(new.as_ref(), session, &shells, &missing)?;
+    lock.state_mut().migrate(request.workspace, to)?;
+    lock.commit()?;
+    let done = MoveDone {
+        shells: shells.len(),
+        started: missing.len(),
+        remarked: remark_session(ports, request)?,
+        ended: clean_up(lock, request.workspace, old.as_ref(), new.as_ref(), session)?,
+    };
+    Ok(Migration::Moved {
+        from: request.from.clone(),
+        done,
+    })
+}
+
+/// The shells of `host`, for a move of `session`: a host that does not
+/// answer refuses the move before anything changes (PLAN-migrate decision
+/// 2).
+fn answers(host: &dyn HostExec, session: &SessionName) -> Result<Vec<Shell>> {
+    mux::list(host).with_context(|| {
+        format!(
+            "session '{session}' did not move, and nothing changed: {} does not answer",
+            host.host()
+        )
+    })
+}
+
+/// The workspace and the binding of `session` that a move to `to` acts
+/// on: its one binding. A binding of the same name on `to` in another
+/// workspace is another session, which the move would overwrite
+/// (PLAN-migrate decision 2).
+fn binding_to_move(
+    state: &state::LocalState,
+    to: &Host,
+    session: &SessionName,
+) -> Result<(String, WorkspaceState)> {
+    let (on_to, elsewhere): (Vec<_>, Vec<_>) = state
         .bindings()
         .filter(|(_, b)| b.session() == session)
-        .map(|(ws, b)| (ws.to_owned(), b.host().clone()))
-        .collect();
-    let (workspace, old) = match bound.as_slice() {
-        [] => return Err(CommandError::NothingToRebind(session.clone()).into()),
-        [(workspace, old)] => (workspace.clone(), old.clone()),
-        several => {
-            let workspaces: Vec<&str> = several.iter().map(|(ws, _)| ws.as_str()).collect();
-            return Err(CommandError::BoundTwice {
+        .partition(|(_, b)| b.host() == to);
+    match (on_to.as_slice(), elsewhere.as_slice()) {
+        ([], []) => Err(CommandError::NothingToMove(session.clone()).into()),
+        ([(workspace, binding)], []) | ([], [(workspace, binding)]) => {
+            Ok(((*workspace).to_owned(), (*binding).clone()))
+        }
+        ([(workspace, _)], [_]) => Err(CommandError::MoveTargetBound {
+            session: session.clone(),
+            host: to.clone(),
+            workspace: (*workspace).to_owned(),
+        }
+        .into()),
+        (on_to, elsewhere) => {
+            let workspaces: Vec<&str> = on_to.iter().chain(elsewhere).map(|(ws, _)| *ws).collect();
+            Err(CommandError::BoundTwice {
                 session: session.clone(),
                 workspaces: workspaces.join(" and "),
             }
-            .into());
+            .into())
         }
-    };
-    if &old != host {
-        lock.state_mut().rebind(&workspace, host)?;
-        lock.commit()?;
     }
+}
+
+/// Step 4 of a move (PLAN-migrate decision 4): make each shell of
+/// `missing` on `host` as a login shell in the home directory (`shpool
+/// attach -b`, which starts it in `$HOME`), then check that every shell of
+/// `wanted` exists there. On failure, end the shells made here: nothing
+/// else has changed.
+fn make_shells(
+    host: &dyn HostExec,
+    session: &SessionName,
+    wanted: &[TerminalName],
+    missing: &[TerminalName],
+) -> Result<()> {
+    let mut made = Vec::new();
+    let Err(err) = make_and_check(host, wanted, missing, &mut made) else {
+        return Ok(());
+    };
+    let stopped = format!("the move of session '{session}' to {} stopped", host.host());
+    Err(match mux::kill(host, &made) {
+        Ok(()) => err.context(format!(
+            "{stopped}: i3mux ended the {} it made there; nothing else changed",
+            count(made.len(), "shell", "shells")
+        )),
+        Err(kill_err) => {
+            let names: Vec<String> = made.iter().map(ToString::to_string).collect();
+            err.context(format!(
+                "{stopped}, and ending the shells it made there ({}) failed: {kill_err:#}",
+                names.join(", ")
+            ))
+        }
+    })
+}
+
+/// [`make_shells`] up to its check; `made` collects each shell it made.
+fn make_and_check(
+    host: &dyn HostExec,
+    wanted: &[TerminalName],
+    missing: &[TerminalName],
+    made: &mut Vec<TerminalName>,
+) -> Result<()> {
+    for name in missing {
+        mux::create(host, name, None)
+            .with_context(|| format!("cannot start shell {name} on {}", host.host()))?;
+        made.push(name.clone());
+    }
+    let alive = mux::list(host)?;
+    if let Some(gone) = wanted
+        .iter()
+        .find(|name| !alive.iter().any(|s| s.name() == *name))
+    {
+        return Err(CommandError::MoveShellMissing {
+            shell: gone.clone(),
+            host: host.host().clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Mark every window of the session on `from` as a window of `to`, on any
+/// workspace (PLAN-migrate rule 2). The new mark comes first and the old
+/// one goes after, so a cut in between leaves the window with both, which
+/// a rerun finishes, and never with none. Returns how many windows.
+fn remark_session(ports: &Ports, request: &Move) -> Result<usize> {
     let stale: Vec<(u64, Mark)> = window::i3mux_windows_in(&ports.sway.get_tree()?)
         .into_iter()
-        .filter(|(_, mark)| mark.terminal().session() == session && mark.host() != host)
+        .filter(|(_, mark)| mark.belongs_to(request.from, request.session))
         .collect();
     for (con_id, mark) in &stale {
-        let new = Mark::new(host.clone(), mark.terminal().clone());
+        let moved = Mark::new(request.to.clone(), mark.terminal().clone());
+        ports.sway.run(&window::mark_command(*con_id, &moved))?;
         ports.sway.run(&window::unmark_command(*con_id, mark))?;
-        ports.sway.run(&window::mark_command(*con_id, &new))?;
     }
-    Ok(Rebound {
+    Ok(stale.len())
+}
+
+/// Step 6 of a move (PLAN-migrate decision 6): copy the saved layout of
+/// `session` from `old` to `new`, if `old` has one; end the session's
+/// shells on `old` (rule 3); delete its layout there; then clear the
+/// pending cleanup of `workspace`. Each part is safe to repeat, so a rerun
+/// after a cut finishes it. Returns how many shells ended.
+fn clean_up(
+    lock: &mut state::StateLock,
+    workspace: &str,
+    old: &dyn HostExec,
+    new: &dyn HostExec,
+    session: &SessionName,
+) -> Result<usize> {
+    session::copy(old, new, session)?;
+    let ended = mux::kill_session(old, session)?.len();
+    session::delete(old, session)?;
+    lock.state_mut().finish_cleanup(workspace);
+    lock.commit()?;
+    Ok(ended)
+}
+
+/// Before a command removes `binding` of `workspace` (`detach`, `kill`):
+/// run its pending cleanup, if it has one (PLAN-migrate decision 8). The
+/// old host must answer; otherwise nothing changes and the command is
+/// refused.
+fn finish_pending(
+    ports: &Ports,
+    lock: &mut state::StateLock,
+    workspace: &str,
+    binding: &WorkspaceState,
+) -> Result<()> {
+    let Some(cleanup) = binding.cleanup() else {
+        return Ok(());
+    };
+    let old = (ports.hosts)(cleanup.host());
+    if let Err(err) = mux::list(old.as_ref()) {
+        return Err(
+            anyhow::Error::new(err).context(CommandError::CleanupUnanswered {
+                session: binding.session().clone(),
+                left: cleanup.host().clone(),
+            }),
+        );
+    }
+    let new = (ports.hosts)(binding.host());
+    clean_up(
+        lock,
         workspace,
-        from: (&old != host).then_some(old),
-        remarked: stale.len(),
-    })
+        old.as_ref(),
+        new.as_ref(),
+        binding.session(),
+    )?;
+    Ok(())
 }
 
 /// The saved sessions of the host that are not bound on this machine.
@@ -1793,17 +2185,26 @@ struct Killed {
 }
 
 /// End `session` on `host`, in this order: check that the host answers,
-/// close the windows (before the shells, so no wrapper shows an error),
-/// kill the shells, delete the saved layout, remove the binding. An
-/// unreachable host therefore leaves every window open.
+/// run a pending cleanup (PLAN-migrate decision 8), close the windows
+/// (before the shells, so no wrapper shows an error), kill the shells,
+/// delete the saved layout, remove the binding. An unreachable host, or
+/// one that a pending cleanup cannot reach, therefore leaves every window
+/// open.
 fn kill(ports: &Ports, host: &Host, name: &SessionName) -> Result<Killed> {
     let exec = (ports.hosts)(host);
     let mut lock = ports.store.lock()?;
     mux::list(exec.as_ref())?;
+    let pending = lock.state().workspace_of(host, name).and_then(|ws| {
+        let binding = lock.state().get(ws)?;
+        Some((ws.to_owned(), binding.clone()))
+    });
+    if let Some((workspace, binding)) = pending {
+        finish_pending(ports, &mut lock, &workspace, &binding)?;
+    }
     let windows = sway_ops::kill_all(ports.sway, host, name)?.len();
     let shells = mux::kill_session(exec.as_ref(), name)?.len();
     let layout_deleted = session::delete(exec.as_ref(), name)?;
-    let unbound = lock.state_mut().unbind_session(host, name).is_some();
+    let unbound = lock.state_mut().unbind_session(host, name)?.is_some();
     if windows == 0 && shells == 0 && !layout_deleted && !unbound {
         return Err(CommandError::NoSuchSession {
             session: name.clone(),
@@ -1834,6 +2235,8 @@ enum RowStatus {
         workspace: String,
         windows: usize,
         orphans: usize,
+        /// The host of a pending cleanup (PLAN-migrate decision 8).
+        cleanup: Option<Host>,
     },
     /// Not bound here, but a terminal elsewhere shows at least one shell.
     AttachedElsewhere { shells: usize },
@@ -1852,11 +2255,8 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
     let shells = mux::list(exec.as_ref())?;
     let saved = session::list(exec.as_ref())?;
     let state = ports.store.load()?;
-    let bound: Vec<(&str, &SessionName)> = state
-        .bindings()
-        .filter(|(_, b)| b.host() == host)
-        .map(|(ws, b)| (ws, b.session()))
-        .collect();
+    let bound: Vec<(&str, &WorkspaceState)> =
+        state.bindings().filter(|(_, b)| b.host() == host).collect();
     let tree = if bound.is_empty() {
         None
     } else {
@@ -1867,7 +2267,7 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
         .iter()
         .map(|s| s.name().session())
         .chain(saved.iter())
-        .chain(bound.iter().map(|(_, name)| *name))
+        .chain(bound.iter().map(|(_, b)| b.session()))
         .collect();
     let mut rows = Vec::new();
     for name in names {
@@ -1875,9 +2275,11 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
             .iter()
             .filter(|s| s.name().session() == name)
             .collect();
-        let workspace = bound.iter().find(|(_, b)| *b == name).map(|(ws, _)| *ws);
-        let status = match (&tree, workspace) {
-            (Some(tree), Some(workspace)) => bound_status(tree, host, name, workspace, &alive),
+        let binding = bound.iter().find(|(_, b)| b.session() == name);
+        let status = match (&tree, binding) {
+            (Some(tree), Some((workspace, binding))) => {
+                bound_status(tree, workspace, binding, &alive)
+            }
             _ if alive.iter().any(|s| s.is_attached()) => RowStatus::AttachedElsewhere {
                 shells: alive.len(),
             },
@@ -1895,15 +2297,15 @@ fn sessions(ports: &Ports, host: &Host) -> Result<Vec<SessionRow>> {
     Ok(rows)
 }
 
-/// Windows of a session bound here, and its shells without a window.
+/// Windows of a session bound here, its shells without a window, and its
+/// pending cleanup.
 fn bound_status(
     tree: &Value,
-    host: &Host,
-    name: &SessionName,
     workspace: &str,
+    binding: &WorkspaceState,
     alive: &[&Shell],
 ) -> RowStatus {
-    let marked = window::session_terminals(tree, host, name);
+    let marked = window::session_terminals(tree, binding.host(), binding.session());
     let orphans = alive
         .iter()
         .filter(|s| !s.is_attached() && !marked.contains(s.name()))
@@ -1912,6 +2314,7 @@ fn bound_status(
         workspace: workspace.to_owned(),
         windows: marked.len(),
         orphans,
+        cleanup: binding.cleanup().map(|c| c.host().clone()),
     }
 }
 
@@ -1984,6 +2387,7 @@ fn status(ports: &Ports, workspace: &str) -> Result<Option<StatusReport>> {
                 workspace: workspace.to_owned(),
                 windows,
                 orphans: 0,
+                cleanup: binding.cleanup().map(|c| c.host().clone()),
             },
         },
         connection,
@@ -2017,7 +2421,8 @@ fn saved_status(exec: &dyn HostExec, name: &SessionName) -> Result<RowStatus> {
 
 /// `ws4  (deepthought)  workspace 4, 3 windows, 1 orphan`. The first word is
 /// the session name and the host is in parentheses; scripts/i3mux-rofi
-/// relies on both.
+/// relies on both. A pending cleanup comes last, with the command that
+/// finishes it (PLAN-migrate decision 8).
 fn format_rows(rows: &[SessionRow]) -> Vec<String> {
     let width = rows
         .iter()
@@ -2031,17 +2436,25 @@ fn format_rows(rows: &[SessionRow]) -> Vec<String> {
                     workspace,
                     windows,
                     orphans,
-                } if *orphans > 0 => format!(
-                    "workspace {workspace}, {}, {}",
-                    count(*windows, "window", "windows"),
-                    count(*orphans, "orphan", "orphans")
-                ),
-                RowStatus::Bound {
-                    workspace, windows, ..
-                } => format!(
-                    "workspace {workspace}, {}",
-                    count(*windows, "window", "windows")
-                ),
+                    cleanup,
+                } => {
+                    let mut parts = vec![
+                        format!("workspace {workspace}"),
+                        count(*windows, "window", "windows"),
+                    ];
+                    if *orphans > 0 {
+                        parts.push(count(*orphans, "orphan", "orphans"));
+                    }
+                    if let Some(left) = cleanup {
+                        parts.push(format!(
+                            "shells on {left} not ended yet: run 'i3mux attach{} --session {} \
+                             --migrate'",
+                            remote_flag(&row.host),
+                            row.name
+                        ));
+                    }
+                    parts.join(", ")
+                }
                 RowStatus::AttachedElsewhere { shells } => {
                     format!("attached elsewhere, {}", count(*shells, "shell", "shells"))
                 }

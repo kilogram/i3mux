@@ -17,6 +17,12 @@
 //!    exclusive `flock` from load to drop, across processes and threads.
 //!    Commands hold it for their whole run, so concurrent `terminal`,
 //!    `attach`, `detach` and `kill` never interleave (plan rule 4).
+//! 5. **A pending cleanup is never lost** (PLAN-migrate decision 8): a
+//!    binding whose session left a host keeps that host in its
+//!    [`PendingCleanup`] until [`LocalState::finish_cleanup`]. It never
+//!    names the binding's own host (a load checks this too), a migration
+//!    never replaces it with another, and [`LocalState::unbind`] and
+//!    [`LocalState::unbind_session`] refuse a binding that has one.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -28,8 +34,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Host, SessionName, WindowTemplate};
 
+/// The host that a migration moved a session away from, whose shells and
+/// saved layout of the session must still end (PLAN-migrate decisions 5
+/// and 6). Only [`LocalState::migrate`] makes one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCleanup {
+    host: Host,
+}
+
+impl PendingCleanup {
+    /// The host the session left.
+    #[must_use]
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+}
+
 /// What a workspace is bound to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "WorkspaceStateFields")]
 pub struct WorkspaceState {
     host: Host,
     session: SessionName,
@@ -37,6 +60,46 @@ pub struct WorkspaceState {
     /// (PLAN-terminal-here decision 2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_command: Option<WindowTemplate>,
+    /// The host a migration left, until its cleanup ends (guarantee 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup: Option<PendingCleanup>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceStateFields {
+    host: Host,
+    session: SessionName,
+    #[serde(default)]
+    window_command: Option<WindowTemplate>,
+    #[serde(default)]
+    cleanup: Option<PendingCleanup>,
+}
+
+/// A binding in `state.json` whose pending cleanup names its own host:
+/// the cleanup would end the session's live shells.
+#[derive(Debug, thiserror::Error)]
+#[error("session '{session}' on {host} has a pending cleanup of its own host")]
+pub struct CleanupOfOwnHost {
+    host: Host,
+    session: SessionName,
+}
+
+impl TryFrom<WorkspaceStateFields> for WorkspaceState {
+    type Error = CleanupOfOwnHost;
+    fn try_from(f: WorkspaceStateFields) -> Result<Self, Self::Error> {
+        if f.cleanup.as_ref().is_some_and(|c| c.host == f.host) {
+            return Err(CleanupOfOwnHost {
+                host: f.host,
+                session: f.session,
+            });
+        }
+        Ok(Self {
+            host: f.host,
+            session: f.session,
+            window_command: f.window_command,
+            cleanup: f.cleanup,
+        })
+    }
 }
 
 impl WorkspaceState {
@@ -46,7 +109,23 @@ impl WorkspaceState {
             host,
             session,
             window_command: None,
+            cleanup: None,
         }
+    }
+
+    /// The host this binding's session left, if its cleanup has not ended.
+    #[must_use]
+    pub fn cleanup(&self) -> Option<&PendingCleanup> {
+        self.cleanup.as_ref()
+    }
+
+    /// Whether `other` binds the same session on the same host, with the
+    /// same window command. A pending cleanup is the binding's history,
+    /// not what it binds.
+    fn binds_as(&self, other: &Self) -> bool {
+        self.host == other.host
+            && self.session == other.session
+            && self.window_command == other.window_command
     }
 
     /// This binding, with `window_command` as its window command.
@@ -91,6 +170,18 @@ pub enum BindError {
         host: Host,
         session: SessionName,
     },
+    #[error("workspace {0} is not bound to a session")]
+    NotBound(String),
+    #[error(
+        "the move of session '{session}' from {left} is not finished: its shells there \
+         have not ended"
+    )]
+    CleanupPending {
+        workspace: String,
+        session: SessionName,
+        /// The host of the pending cleanup.
+        left: Host,
+    },
 }
 
 /// All bindings, keyed by workspace name, as persisted to `state.json`.
@@ -101,7 +192,8 @@ pub struct LocalState {
 
 impl LocalState {
     /// Bind workspace `ws` to `binding`. Binding a workspace again to the
-    /// same session is a no-op.
+    /// same session, host and window command is a no-op, which keeps its
+    /// pending cleanup.
     ///
     /// # Errors
     /// [`BindError::SessionBoundElsewhere`] if another workspace has this
@@ -118,7 +210,7 @@ impl LocalState {
             }
         }
         match self.workspaces.get(ws) {
-            Some(current) if current == &binding => Ok(()),
+            Some(current) if current.binds_as(&binding) => Ok(()),
             Some(current) => Err(BindError::WorkspaceTaken {
                 workspace: ws.to_owned(),
                 host: current.host.clone(),
@@ -131,42 +223,78 @@ impl LocalState {
         }
     }
 
-    /// Move the binding of `ws` to `host`; its session and window command
-    /// stay (PLAN-terminal-here decision 3). Moving it to its own host, or
-    /// an unbound `ws`, changes nothing.
+    /// Move the binding of `ws` to host `to`, and record the host it
+    /// leaves as its pending cleanup (PLAN-migrate decision 5). Its session
+    /// and window command stay. A pending cleanup of `to` is cancelled: the
+    /// session goes back to the host whose shells still run (decision 2).
+    /// Moving a binding to its own host changes nothing.
     ///
     /// # Errors
-    /// [`BindError::SessionBoundElsewhere`] if another workspace has this
-    /// session on `host`.
-    pub fn rebind(&mut self, ws: &str, host: &Host) -> Result<(), BindError> {
-        let Some(current) = self.workspaces.get(ws) else {
+    /// [`BindError::NotBound`] for an unbound `ws`;
+    /// [`BindError::CleanupPending`] if a cleanup of a third host is
+    /// pending, which the move would lose; [`BindError::SessionBoundElsewhere`]
+    /// if another workspace has this session on `to`.
+    pub fn migrate(&mut self, ws: &str, to: &Host) -> Result<(), BindError> {
+        let current = self
+            .workspaces
+            .get(ws)
+            .ok_or_else(|| BindError::NotBound(ws.to_owned()))?;
+        if &current.host == to {
             return Ok(());
-        };
-        if let Some(other) = self.workspace_of(host, &current.session) {
-            if other != ws {
-                return Err(BindError::SessionBoundElsewhere {
-                    host: host.clone(),
-                    session: current.session.clone(),
-                    workspace: other.to_owned(),
-                });
-            }
+        }
+        if let Some(cleanup) = current.cleanup.as_ref().filter(|c| &c.host != to) {
+            return Err(BindError::CleanupPending {
+                workspace: ws.to_owned(),
+                session: current.session.clone(),
+                left: cleanup.host.clone(),
+            });
+        }
+        if let Some(other) = self.workspace_of(to, &current.session) {
+            return Err(BindError::SessionBoundElsewhere {
+                host: to.clone(),
+                session: current.session.clone(),
+                workspace: other.to_owned(),
+            });
         }
         if let Some(binding) = self.workspaces.get_mut(ws) {
-            binding.host = host.clone();
+            let left = std::mem::replace(&mut binding.host, to.clone());
+            binding.cleanup = Some(PendingCleanup { host: left });
         }
         Ok(())
     }
 
+    /// End the pending cleanup of `ws`, once the session's shells and saved
+    /// layout on that host are gone (PLAN-migrate decision 6). Returns it.
+    pub fn finish_cleanup(&mut self, ws: &str) -> Option<PendingCleanup> {
+        self.workspaces.get_mut(ws)?.cleanup.take()
+    }
+
     /// Remove the binding of `ws`, returning it.
-    pub fn unbind(&mut self, ws: &str) -> Option<WorkspaceState> {
-        self.workspaces.remove(ws)
+    ///
+    /// # Errors
+    /// [`BindError::CleanupPending`] if it has a pending cleanup: run the
+    /// cleanup first (guarantee 5).
+    pub fn unbind(&mut self, ws: &str) -> Result<Option<WorkspaceState>, BindError> {
+        if let Some(current) = self.workspaces.get(ws) {
+            refuse_pending(ws, current)?;
+        }
+        Ok(self.workspaces.remove(ws))
     }
 
     /// Remove the binding of (`host`, `session`), returning its workspace.
-    pub fn unbind_session(&mut self, host: &Host, session: &SessionName) -> Option<String> {
-        let ws = self.workspace_of(host, session)?.to_owned();
-        self.workspaces.remove(&ws);
-        Some(ws)
+    ///
+    /// # Errors
+    /// As [`LocalState::unbind`].
+    pub fn unbind_session(
+        &mut self,
+        host: &Host,
+        session: &SessionName,
+    ) -> Result<Option<String>, BindError> {
+        let Some(ws) = self.workspace_of(host, session).map(str::to_owned) else {
+            return Ok(None);
+        };
+        self.unbind(&ws)?;
+        Ok(Some(ws))
     }
 
     /// What `ws` is bound to.
@@ -187,6 +315,18 @@ impl LocalState {
     /// Every (workspace, binding), ordered by workspace name.
     pub fn bindings(&self) -> impl Iterator<Item = (&str, &WorkspaceState)> {
         self.workspaces.iter().map(|(ws, b)| (ws.as_str(), b))
+    }
+}
+
+/// [`BindError::CleanupPending`] if `binding` of `ws` has a pending cleanup.
+fn refuse_pending(ws: &str, binding: &WorkspaceState) -> Result<(), BindError> {
+    match &binding.cleanup {
+        Some(cleanup) => Err(BindError::CleanupPending {
+            workspace: ws.to_owned(),
+            session: binding.session.clone(),
+            left: cleanup.host.clone(),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -445,47 +585,123 @@ mod tests {
         assert_eq!(state, before);
     }
 
-    /// PLAN-terminal-here decision 3: a rebind keeps the session and the
-    /// window command, refuses a session the new host binds elsewhere, and
-    /// changes nothing for its own host or an unbound workspace.
+    fn third() -> Host {
+        Host::Ssh(RemoteHost::new("third").unwrap())
+    }
+
+    /// The pending cleanup of workspace `ws`, by its host.
+    fn cleanup_of(state: &LocalState, ws: &str) -> Option<Host> {
+        state.get(ws)?.cleanup().map(|c| c.host().clone())
+    }
+
+    /// PLAN-migrate decision 5: a migration moves the host and records the
+    /// host it leaves; the session and the window command stay. A move to
+    /// its own host changes nothing.
     #[test]
-    fn rebind_moves_only_the_host() {
+    fn migrate_moves_the_host_and_records_the_host_it_leaves() {
         let command = crate::types::WindowTemplate::new("w {shell}").unwrap();
         let mut state = LocalState::default();
-        state
-            .bind(
-                "4",
-                binding(Host::Local, "ws4").with_window_command(Some(command.clone())),
-            )
-            .unwrap();
-        state.rebind("4", &remote()).unwrap();
-        assert_eq!(
-            state.get("4"),
-            Some(&binding(remote(), "ws4").with_window_command(Some(command)))
-        );
+        let ws4 = binding(Host::Local, "ws4").with_window_command(Some(command.clone()));
+        state.bind("4", ws4).unwrap();
+
+        state.migrate("4", &remote()).unwrap();
+
+        let moved = state.get("4").unwrap();
+        assert!(moved.binds_as(&binding(remote(), "ws4").with_window_command(Some(command))));
+        assert_eq!(cleanup_of(&state, "4"), Some(Host::Local));
         let same = state.clone();
-        state.rebind("4", &remote()).unwrap();
-        state.rebind("9", &Host::Local).unwrap();
+        state.migrate("4", &remote()).unwrap();
         assert_eq!(state, same);
-        state.bind("5", binding(Host::Local, "ws4")).unwrap();
+        assert_eq!(state.finish_cleanup("4").map(|c| c.host), Some(Host::Local));
+        assert_eq!(cleanup_of(&state, "4"), None);
+        assert_eq!(state.finish_cleanup("4"), None);
+    }
+
+    /// PLAN-migrate decision 2: a move back to the host of the pending
+    /// cleanup cancels it, and the new cleanup names the host the session
+    /// leaves. A move to a third host would lose the cleanup: refused, with
+    /// nothing changed.
+    #[test]
+    fn migrate_back_cancels_the_cleanup_and_a_third_host_is_refused() {
+        let mut state = LocalState::default();
+        state.bind("4", binding(Host::Local, "ws4")).unwrap();
+        state.migrate("4", &remote()).unwrap();
+        let before = state.clone();
+
+        let refused = state.migrate("4", &third());
+
         assert!(matches!(
-            state.rebind("4", &Host::Local),
+            refused,
+            Err(BindError::CleanupPending { ref left, .. }) if *left == Host::Local
+        ));
+        assert_eq!(state, before);
+        state.migrate("4", &Host::Local).unwrap();
+        assert_eq!(state.get("4").unwrap().host(), &Host::Local);
+        assert_eq!(cleanup_of(&state, "4"), Some(remote()));
+    }
+
+    #[test]
+    fn migrate_refuses_an_unbound_workspace_or_a_session_bound_there() {
+        let mut state = LocalState::default();
+        assert!(matches!(
+            state.migrate("4", &remote()),
+            Err(BindError::NotBound(ws)) if ws == "4"
+        ));
+        state.bind("4", binding(Host::Local, "ws4")).unwrap();
+        state.bind("5", binding(remote(), "ws4")).unwrap();
+        let before = state.clone();
+        assert!(matches!(
+            state.migrate("4", &remote()),
             Err(BindError::SessionBoundElsewhere { workspace, .. }) if workspace == "5"
         ));
+        assert_eq!(state, before);
+    }
+
+    /// Guarantee 5: a binding with a pending cleanup cannot be removed
+    /// until the cleanup ends, and binding it again as it is keeps the
+    /// cleanup.
+    #[test]
+    fn a_pending_cleanup_is_never_lost() {
+        let mut state = LocalState::default();
+        state.bind("4", binding(Host::Local, "ws4")).unwrap();
+        state.migrate("4", &remote()).unwrap();
+        let ws4 = SessionName::new("ws4").unwrap();
+
+        assert!(matches!(
+            state.unbind("4"),
+            Err(BindError::CleanupPending { .. })
+        ));
+        assert!(matches!(
+            state.unbind_session(&remote(), &ws4),
+            Err(BindError::CleanupPending { .. })
+        ));
+        state.bind("4", binding(remote(), "ws4")).unwrap();
+        assert_eq!(cleanup_of(&state, "4"), Some(Host::Local));
+        state.finish_cleanup("4");
+        assert_eq!(
+            state.unbind_session(&remote(), &ws4).unwrap().as_deref(),
+            Some("4")
+        );
     }
 
     #[test]
     fn unbind_and_unbind_session() {
         let mut state = sample_state("3");
         state.bind("q", binding(Host::Local, "notes")).unwrap();
-        assert_eq!(state.unbind("3"), Some(binding(remote(), "mysession")));
-        assert_eq!(state.unbind("3"), None);
+        assert_eq!(
+            state.unbind("3").unwrap(),
+            Some(binding(remote(), "mysession"))
+        );
+        assert_eq!(state.unbind("3").unwrap(), None);
         let notes = SessionName::new("notes").unwrap();
         assert_eq!(
-            state.unbind_session(&Host::Local, &notes).as_deref(),
+            state
+                .unbind_session(&Host::Local, &notes)
+                .unwrap()
+                .as_deref(),
             Some("q")
         );
-        assert_eq!(state.unbind_session(&Host::Local, &notes), None);
+        assert_eq!(state.unbind_session(&Host::Local, &notes).unwrap(), None);
         assert_eq!(state, LocalState::default());
     }
 
@@ -507,6 +723,34 @@ mod tests {
             json,
             serde_json::json!({"workspaces": {"4": {"host": "user@host", "session": "mysession"}}})
         );
+        let mut moved = sample_state("4");
+        moved.migrate("4", &Host::Local).unwrap();
+        assert_eq!(
+            serde_json::to_value(&moved).unwrap(),
+            serde_json::json!({"workspaces": {"4": {"host": "local", "session": "mysession",
+                "cleanup": {"host": "user@host"}}}})
+        );
+    }
+
+    /// A pending cleanup round-trips through `state.json`. One that names
+    /// its binding's own host would end the session's live shells: such a
+    /// file is quarantined, as any invalid state is.
+    #[test]
+    fn a_pending_cleanup_is_saved_and_one_of_its_own_host_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let mut moved = sample_state("4");
+        moved.migrate("4", &Host::Local).unwrap();
+        store.save(&moved).unwrap();
+        assert_eq!(store.load().unwrap(), moved);
+
+        fs::write(
+            &store.path,
+            r#"{"workspaces": {"4": {"host": "local", "session": "a", "cleanup": {"host": "local"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(store.lock().unwrap().state(), &LocalState::default());
+        assert!(store.path.with_extension("json.corrupt").exists());
     }
 
     /// PLAN-terminal-here decision 2: a binding keeps its window command

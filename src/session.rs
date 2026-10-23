@@ -189,6 +189,26 @@ pub fn delete(host: &dyn HostExec, name: &SessionName) -> Result<bool, SessionEr
     Ok(host.remove_file(&path_of(name))?)
 }
 
+/// Copy the saved session `name` from `from` to `to`, byte for byte,
+/// replacing any save of it there (PLAN-migrate decision 6). The copy is
+/// not parsed, so a corrupt save moves too and never stops a move. Returns
+/// whether `from` had one.
+///
+/// # Errors
+/// [`SessionError::Host`] if either host fails; `to` then keeps what it had.
+pub fn copy(
+    from: &dyn HostExec,
+    to: &dyn HostExec,
+    name: &SessionName,
+) -> Result<bool, SessionError> {
+    let path = path_of(name);
+    let Some(json) = from.read_file(&path)? else {
+        return Ok(false);
+    };
+    to.write_file_atomic(&path, &json)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +290,26 @@ mod tests {
         let ws5 = load(&host, &name("ws5")).unwrap().unwrap();
         assert_eq!(ws4.window_command(), Some(&command));
         assert_eq!(ws5.window_command(), None);
+    }
+
+    /// A copy moves the file as it is, a corrupt one too, and a host with
+    /// none copies nothing.
+    #[test]
+    fn copy_moves_a_save_byte_for_byte() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (from, to) = (local(a.path()), local(b.path()));
+        assert!(!copy(&from, &to, &name("ws4")).unwrap());
+        assert_eq!(list(&to).unwrap(), []);
+
+        save(&from, &saved("ws4")).unwrap();
+        assert!(copy(&from, &to, &name("ws4")).unwrap());
+        assert_eq!(load(&to, &name("ws4")).unwrap(), Some(saved("ws4")));
+
+        let file = a.path().join(SESSIONS_DIR).join("ws4.json");
+        std::fs::write(&file, "{ corrupt").unwrap();
+        assert!(copy(&from, &to, &name("ws4")).unwrap());
+        let copied = b.path().join(SESSIONS_DIR).join("ws4.json");
+        assert_eq!(std::fs::read_to_string(copied).unwrap(), "{ corrupt");
     }
 
     #[test]

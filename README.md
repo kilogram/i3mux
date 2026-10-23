@@ -42,7 +42,7 @@ i3mux terminal --no-hold -e make  # close the window as soon as its shell ends
 exec i3mux terminal --here        # this terminal becomes a window of the workspace's session
 i3mux detach                      # save the layout, close the windows, keep the shells
 i3mux attach --session ws3        # restore the layout and reattach every shell
-i3mux attach --remote dev-box --session ws3 --rebind-only  # move ws3's binding to dev-box, touch no window
+i3mux attach --remote dev-box --session ws3 --migrate  # move ws3 to dev-box; its windows stay open
 i3mux sessions [--remote host]    # what exists, where, and in what state
 i3mux sessions --all              # this machine and every host a workspace is bound to
 i3mux status                      # the focused workspace's session and ssh connection (exit 3 if none)
@@ -92,12 +92,13 @@ its shell while its terminal has 0 rows or 0 columns, or is gone: shpool
 0.11.5 panics on such an attach, and the shell can never be attached again
 (shell-pool/shpool#445). The window says so and closes.
 
-A window follows its session to a new host. Each time its attach ends,
-it asks i3mux where its session is bound. If that is another host, which
-has the window's shell, the window says so and attaches the shell there.
-While that host does not answer, the window waits for it and never
-attaches on its old host. A window that runs a window command does not
-do this: its command decides.
+A window follows its session to a new host (see "Move a session to
+another host"). Each time its attach ends, it asks i3mux where its
+session is bound. If that is another host, which has the window's shell,
+the window says so and attaches the shell there. While that host does
+not answer, the window waits for it and never attaches on its old host.
+A window that runs a window command does not do this: its command
+decides.
 
 ## Window commands
 
@@ -120,7 +121,7 @@ i3mux activate --window-command 'my-window --shell {shell}'
   no client shows the shell. The command attaches the shell itself, for example with `i3mux terminal --here --shell {shell}`
   (see "Join a session from any terminal"), which ignores the window
   command. When the command ends, the window ends: there is no hint.
-- There is no `{host}`: `attach --rebind-only` can move the binding to
+- There is no `{host}`: `attach --migrate` can move the session to
   another host, and `terminal --here` reads the host from the binding.
 - `detach` saves the command with the layout, `attach` binds with it
   again, and `i3mux status` shows it.
@@ -176,24 +177,55 @@ i3mux terminal --here --shell ws3-002           # attach that existing shell her
   did and exits with status 1: the window gets back the marks it had,
   the binding that i3mux made goes, and the shell that it made for the
   window command ends.
-- When the shell ends or is detached, the program that ran i3mux goes on.
+- When the shell ends or is detached, the program that ran i3mux goes on,
+  unless the session moved to another host: then the terminal attaches
+  the shell there (see "How it works").
   Without `--no-hold`, a shell that fails or ends within 2 s shows the
   hint first. With it, the program goes on at once, with the shell's exit
   status. The window keeps its mark until it closes, so `detach` closes
   it with the other windows. With `exec`, the terminal closes when the
   shell ends.
 
-## Move a binding to another host
+## Move a session to another host
 
-`i3mux attach --remote NEW --session S --rebind-only` moves the binding
-of session S, in whatever workspace has it, to host NEW (no `--remote`:
-this machine). It re-marks the windows of S as windows of NEW, and does
-nothing else: it opens, closes and attaches no window, contacts no host,
-and starts no ssh connection. The windows keep showing what they showed.
-A program that keeps a session's shells on two hosts, and moves them
-itself, uses it to point the workspace at the new host; a window command
-that reads the binding then follows it. Running it again is harmless: it
-re-marks any window left with the old host and changes nothing else.
+```bash
+i3mux attach --remote dev-box --session ws3 --migrate
+```
+
+This moves session `ws3`, in whatever workspace has it, to `dev-box` (no
+`--remote`: this machine). Its windows stay open. Afterwards the session
+behaves as if it had always been on `dev-box`: `detach`, `attach`,
+`sessions`, `status` and `kill` find it there.
+
+- Processes do not move. For each shell of the session on the old host,
+  i3mux keeps the shell of that name that the new host has already. It
+  starts each missing shell there as a login shell in the home
+  directory. Programs that ran on the old host end.
+- Before it changes anything, i3mux says what will happen, on stderr:
+  `i3mux: moving ws3 from s0nny-box to dev-box: 1 of 2 shells starts
+  again there as a login shell in ~; programs running on s0nny-box end.`
+- It refuses, and changes nothing, if the new host has a saved layout
+  of `ws3`, or a binding of it in another workspace: that is another
+  session of that name. It also refuses if a host does not answer, or
+  if a shell does not start on the new host. Then it ends the shells it
+  made there.
+- Then it moves the binding, marks the windows with the new host,
+  copies the saved layout there, ends the session's shells on the old
+  host, and deletes the layout there. Each window then attaches its
+  shell on the new host (see "How it works"). A window that runs a
+  window command goes on running it.
+- If the move stops after the binding moved, for example because the
+  old host stopped answering, the session's shells on the old host
+  still run. `sessions` and `status` show this, with the command that
+  finishes it: the same move again. `detach` and `kill` finish it
+  first, and refuse while the old host does not answer. A move back to
+  the old host keeps its shells instead. A move to a third host is
+  refused until the first one is finished.
+- After a finished move, the same command prints `ws3 is already on
+  dev-box` and changes nothing.
+- A program that wants its own shells on the new host, such as shells
+  that run a job, makes them there first (see "Shells made by other
+  programs"). The move keeps them.
 
 ## Shells made by other programs
 
@@ -283,7 +315,7 @@ Measurements and the full design are in
 
 Statuses 4 and 5 let a program branch without reading the message: a
 window command can end when its shell is gone, and a mover can treat a
-rebind of an unbound session as nothing to do. Statuses 6 and 7 are for
+move of an unbound session as nothing to do. Statuses 6 and 7 are for
 a window's wrapper only. It runs the hidden command `i3mux reattach`
 each time its attach ends. After status 6 it waits for the new host, and
 after 7 it goes on as before.
