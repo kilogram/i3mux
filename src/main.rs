@@ -38,7 +38,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use host::{HostExec, HostRunner, RunnerConfig};
-use launch::{Launcher, RemoteAttach, TerminalLauncher, WindowCommand, WrapperOptions};
+use launch::{
+    Launcher, RemoteAttach, TerminalLauncher, WindowCommand, WrapperOptions, EXIT_FOLLOW_WAIT,
+    EXIT_STAY,
+};
 use layout::Step;
 use master::{DirectSsh, Link, MasterState, Masters, SystemdMasters, TrackedMasters};
 use mux::{Choice, Shell};
@@ -76,7 +79,8 @@ const DISCONNECT_POLL: Duration = Duration::from_millis(100);
     version,
     about = "Persistent terminal sessions for Sway workspaces",
     after_help = "Exit status: 0 success, 1 error, 2 usage error or (attach) several sessions to choose from, \
-                  3 (status) the focused workspace is not bound."
+                  3 (status) the focused workspace is not bound, 4 the shell named does not exist on its host, \
+                  5 no workspace is bound to the session named. See the README for 6 and 7."
 )]
 struct Cli {
     /// Print what i3mux does on stderr
@@ -184,6 +188,24 @@ enum CliCommand {
         /// Session to end [default: the session of the focused workspace]
         #[arg(short, long)]
         session: Option<String>,
+    },
+    /// Run by a window's wrapper: print the wrapper argv that attaches the
+    /// window's shell where its session moved (exit 0), or exit 6 (that
+    /// host does not answer) or 7 (the window stays)
+    #[command(hide = true)]
+    Reattach {
+        /// The window's shell
+        #[arg(long, value_name = "NAME")]
+        shell: String,
+        /// The host the window attaches now: 'local' or a remote host
+        #[arg(long, value_name = "HOST")]
+        from: String,
+        /// The window's wrapper option, kept after the move
+        #[arg(long)]
+        no_hold: bool,
+        /// The window's wrapper option, kept after the move
+        #[arg(long)]
+        attach_only: bool,
     },
 }
 
@@ -321,23 +343,28 @@ fn failure_status(err: &anyhow::Error) -> u8 {
     }
 }
 
-/// How a command ends: with an exit status, or (`terminal --here`) by
-/// running another program in this process.
+/// How a command ends: with an exit status, (`terminal --here`) by running
+/// another program in this process, or (`reattach`) by printing the
+/// program that the window's wrapper runs next.
 #[derive(Debug)]
 enum Outcome {
     Exit(ExitCode),
     Exec(Box<HereExec>),
+    Follow(Box<Follow>),
 }
 
 /// Wire the real ports, run the command, then stop the masters it left
-/// unused. Only then does `terminal --here` exec its window's program, so
-/// nothing of i3mux runs after the stop.
+/// unused. Only then does `terminal --here` exec its window's program, and
+/// `reattach` print its wrapper argv, so nothing of i3mux runs after the
+/// stop.
 fn run(cli: Cli) -> Result<ExitCode> {
     let wm = Wm::connect()?;
     let store = StateStore::from_env()?;
     let runtime_dir = runtime_dir()?;
     let private_dir = private_runtime_dir(&runtime_dir)?;
-    let launcher = TerminalLauncher::install(terminal_program(), &private_dir)?;
+    let i3mux = std::env::current_exe()
+        .context("cannot find the path of this i3mux program, which its windows run")?;
+    let launcher = TerminalLauncher::install(terminal_program(), i3mux, &private_dir)?;
     let inner: Box<dyn Masters + Send + Sync> = if master::systemd_user_manager_runs(&runtime_dir) {
         let auth_sock = std::env::var("SSH_AUTH_SOCK")
             .ok()
@@ -371,6 +398,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     })?;
     let here = match outcome {
         Outcome::Exit(code) => return Ok(code),
+        Outcome::Follow(follow) => return print_follow(&follow),
         Outcome::Exec(here) => here,
     };
     let failed = exec_program(&here.argv);
@@ -446,6 +474,19 @@ fn dispatch(
         };
         return cmd_terminal_here(ports, &request).map(|here| Outcome::Exec(Box::new(here)));
     }
+    if let CliCommand::Reattach {
+        shell,
+        from,
+        no_hold,
+        attach_only,
+    } = command
+    {
+        let options = WrapperOptions {
+            no_hold,
+            attach_only,
+        };
+        return cmd_reattach(ports, &shell.parse()?, &Host::from_label(&from)?, options);
+    }
     dispatch_exit(ports, wm, launcher, command).map(Outcome::Exit)
 }
 
@@ -497,6 +538,9 @@ fn dispatch_exit(
             shell,
         } => cmd_open(ports, remote, &shell, force),
         CliCommand::Kill { remote, session } => cmd_kill(ports, wm, remote, session),
+        CliCommand::Reattach { .. } => {
+            anyhow::bail!("i3mux bug: reattach reached the commands that only exit")
+        }
     }
 }
 
@@ -1081,8 +1125,8 @@ fn here(ports: &Ports, con_id: u64, request: &HereRequest) -> Result<HereExec> {
     }
     let mark = Mark::new(binding.host().clone(), choice.name().clone());
     let marks = remark(ports, &tree, con_id, &mark, &elsewhere)?;
-    let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
-    let argv = ports.launcher.program_argv(&title, &window, spec.options);
+    let title = mark.title();
+    let argv = ports.launcher.program_argv(&mark, &window, spec.options);
     let changes = HereChanges {
         workspace: name,
         bound: bound.is_none().then_some(binding),
@@ -1257,10 +1301,7 @@ fn open_window(
     ports
         .log
         .debug(|| format!("opening {mark}: {}", shell_words::join(window.argv())));
-    let title = format!("i3mux:{}:{}", mark.host(), mark.terminal());
-    ports
-        .launcher
-        .spawn(&mark.app_id(), &title, &window, spec.options)?;
+    ports.launcher.spawn(&mark, &window, spec.options)?;
     sway_ops::wait_for_window_and_mark(ports.sway, &mark)
 }
 
@@ -1304,10 +1345,130 @@ fn window_command(
             argv,
             reattach: mux::attach_argv(host, terminal, true, command),
             unit,
-            host: remote.clone(),
-            shell: terminal.clone(),
         }),
     })
+}
+
+/// Where a window goes when its attach ends (`i3mux reattach`,
+/// PLAN-migrate decision 9).
+#[derive(Debug)]
+enum Reattach {
+    /// The session moved to a host that has the window's shell: the window
+    /// runs `argv`, the wrapper's attach of the shell there.
+    Follow(Follow),
+    /// The session moved to `host`, which does not answer. The window waits
+    /// for it, and never attaches on its old host.
+    Wait { host: Host, error: anyhow::Error },
+    /// The window stays on its host: the session did not move, is bound
+    /// nowhere or twice, or moved to a host that lacks the shell.
+    Stay,
+}
+
+/// The program that the wrapper of a window that follows its session runs.
+#[derive(Debug, PartialEq, Eq)]
+struct Follow {
+    /// The window's new identity: the session's new host, the same shell.
+    mark: Mark,
+    argv: Vec<String>,
+}
+
+/// Where the window of `shell`, which attaches it on `from`, goes when its
+/// attach ends (PLAN-migrate decision 9).
+///
+/// It reads the binding, not the window, so it needs no title. The
+/// session moved when no binding of it names `from` and one binding names
+/// another host. Only then does it contact that host: to see that it has
+/// the shell, and to start its ssh master, which the window then uses. It
+/// changes nothing, so it takes no lock, and it never contacts `from`. The
+/// wrapper argv keeps the window's `options`; its attach never takes the
+/// shell from another client (no `--force`).
+fn reattach(
+    ports: &Ports,
+    shell: &TerminalName,
+    from: &Host,
+    options: WrapperOptions,
+) -> Result<Reattach> {
+    let state = ports.store.load()?;
+    let hosts: Vec<&Host> = state
+        .bindings()
+        .filter(|(_, b)| b.session() == shell.session())
+        .map(|(_, b)| b.host())
+        .collect();
+    let to = match hosts.as_slice() {
+        [to] if *to != from => (*to).clone(),
+        _ => return Ok(Reattach::Stay),
+    };
+    let exec = (ports.hosts)(&to);
+    let shells = match mux::list(exec.as_ref()) {
+        Ok(shells) => shells,
+        Err(err) => {
+            return Ok(Reattach::Wait {
+                host: to,
+                error: err.into(),
+            })
+        }
+    };
+    if !shells.iter().any(|s| s.name() == shell) {
+        return Ok(Reattach::Stay);
+    }
+    let command = match window_command(ports, exec.as_ref(), shell, false, None) {
+        Ok(command) => command,
+        Err(error) => return Ok(Reattach::Wait { host: to, error }),
+    };
+    let mark = Mark::new(to, shell.clone());
+    let argv = ports.launcher.program_argv(&mark, &command, options);
+    Ok(Reattach::Follow(Follow { mark, argv }))
+}
+
+/// `i3mux reattach`: a window that follows prints after the masters'
+/// stop ([`print_follow`]); one that waits says why on stderr.
+fn cmd_reattach(
+    ports: &Ports,
+    shell: &TerminalName,
+    from: &Host,
+    options: WrapperOptions,
+) -> Result<Outcome> {
+    Ok(match reattach(ports, shell, from, options)? {
+        Reattach::Follow(follow) => Outcome::Follow(Box::new(follow)),
+        Reattach::Wait { host, error } => {
+            eprintln!(
+                "i3mux: session '{}' moved to {host}, which does not answer: {error:#}",
+                shell.session()
+            );
+            Outcome::Exit(ExitCode::from(EXIT_FOLLOW_WAIT))
+        }
+        Reattach::Stay => Outcome::Exit(ExitCode::from(EXIT_STAY)),
+    })
+}
+
+/// Say where the window goes, on stderr, and print the argv it runs there
+/// on stdout, as NUL-terminated words: the wrapper reads them and execs
+/// them (PLAN-migrate decision 9).
+fn print_follow(follow: &Follow) -> Result<ExitCode> {
+    use std::io::Write as _;
+    let terminal = follow.mark.terminal();
+    eprintln!(
+        "[i3mux] {} moved to {}. Attaching {terminal}.",
+        terminal.session(),
+        follow.mark.host()
+    );
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&nul_terminated(&follow.argv))
+        .and_then(|()| stdout.flush())
+        .context("cannot print the argv of the window's wrapper")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Each word followed by a NUL byte: words may hold newlines (the shpool
+/// prelude does), but no NUL.
+fn nul_terminated(words: &[String]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for word in words {
+        bytes.extend_from_slice(word.as_bytes());
+        bytes.push(0);
+    }
+    bytes
 }
 
 /// What `open` did.

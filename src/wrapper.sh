@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
 # i3mux terminal wrapper. i3mux builds its command line in launch.rs:
 #
-#   wrapper.sh [--no-hold] [--attach-only] TITLE ARGV...
-#   wrapper.sh [--no-hold] [--attach-only] --remote HOST SHELL UNIT N REATTACH... TITLE ARGV...
+#   wrapper.sh [--no-hold] [--attach-only] I3MUX HOST SHELL TITLE ARGV...
+#   wrapper.sh [--no-hold] [--attach-only] I3MUX HOST SHELL --remote UNIT N REATTACH... TITLE ARGV...
 #
 # Sets the window title once and runs ARGV as given (no shell parses it).
+# ARGV attaches shell SHELL on HOST (`local`, or a remote host).
 # Keeps the window open with a hint when ARGV fails or ends within 2 s.
 # shpool refuses a second client of a shell with exit status 0, so a quick
 # end is the only sign that another terminal or host took the shell first.
 # With --no-hold it never keeps the window: it exits with ARGV's status.
 # With --attach-only, ARGV only attaches an existing shell: after exit 75
 # it does not run ARGV again, which would start a new shell of that name.
+#
+# The window follows its session to another host (docs/PLAN-migrate.md
+# decision 9). Before every rerun of its attach, and after the last end,
+# whatever the exit status, it runs `I3MUX reattach --shell SHELL --from
+# HOST`, which never execs:
+#
+#   exit 0    The session moved to a host that has SHELL. reattach printed
+#             its line on stderr and the wrapper argv for that host, as
+#             NUL-terminated words, on stdout. Exec that argv.
+#   exit 6    The session moved to a host that does not answer. Wait for
+#             it, asking again every 5 s, and never attach on HOST again.
+#   other     The window stays on HOST: go on as below.
 #
 # A remote window (--remote) attaches SHELL on HOST through the ssh master
 # that the systemd user unit UNIT runs. REATTACH is the N-word argv that
@@ -35,29 +48,65 @@
 # a key, which needs `read -t`, and REATTACH needs an array.
 set -u
 
-no_hold= attach_only=
+no_hold= attach_only= options=()
 while :; do
     case ${1-} in
         --no-hold) no_hold=1 ;;
         --attach-only) attach_only=1 ;;
         *) break ;;
     esac
+    options+=("$1")
     shift
 done
 
+i3mux=$1 host=$2 shell=$3
+shift 3
 remote=
 if [ "${1-}" = --remote ]; then
-    remote=1 host=$2 shell=$3 unit=$4
-    reattach=("${@:6:$5}")
-    shift $((5 + $5))
+    remote=1 unit=$2
+    reattach=("${@:4:$3}")
+    shift $((3 + $3))
     printf -v unit_shown '%q' "$unit"
 fi
 title=$1
 shift
 argv=("$@")
 
+# The status of `i3mux reattach` for a session that moved to a host that
+# does not answer (EXIT_FOLLOW_WAIT in launch.rs).
+follow_wait=6
+
 say() { printf '[i3mux] %s\n' "$*"; }
 clear_screen() { printf '\033[H\033[2J'; }
+
+# Ask i3mux where the session of SHELL is, and follow it (see the header).
+# The last word read is the exit status of reattach, so a reattach that
+# fails or is cut while it prints is never taken for a move. Returns when
+# the window stays on HOST.
+follow() {
+    local word key answer follow_status next
+    while :; do
+        answer=()
+        while IFS= read -r -d '' word; do
+            answer+=("$word")
+        done < <("$i3mux" reattach ${options[@]+"${options[@]}"} --shell "$shell" --from "$host"
+            printf '%s\0' "$?")
+        follow_status=${answer[${#answer[@]}-1]}
+        next=("${answer[@]:0:${#answer[@]}-1}")
+        if [ "$follow_status" = 0 ] && [ "${#next[@]}" -gt 0 ]; then
+            exec "${next[@]}"
+        fi
+        [ "$follow_status" = "$follow_wait" ] || return 0
+        say "The session of $shell moved to a host that does not answer. Next try in 5 s."
+        say "Enter: retry now   q: close window"
+        if IFS= read -rsn1 -t 5 key; then
+            case $key in q | Q) exit "$status" ;; esac
+        elif [ $? -le 128 ]; then
+            exit "$status" # end of input: the terminal is gone
+        fi
+        clear_screen
+    done
+}
 
 # Whether stdin is a terminal with rows and columns, within a second (a new
 # window may draw late). Not a terminal and no character device (a pipe):
@@ -180,6 +229,7 @@ while :; do
     if [ -z "$remote" ]; then
         "${argv[@]}"
         status=$?
+        follow
         break
     fi
     read_unit
@@ -188,8 +238,11 @@ while :; do
     # remote shell's output reaches the terminal through the pty on stdout.
     { ssh_error=$("${argv[@]}" 2>&1 >&3 3>&-); } 3>&1
     status=$?
+    follow
     if [ "$status" -eq 255 ]; then
         recover || exit "$status"
+        # The session may have moved while the link was down.
+        follow
         argv=("${reattach[@]}")
         clear_screen
         continue

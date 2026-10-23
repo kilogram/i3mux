@@ -341,32 +341,26 @@ impl FakeLauncher {
 }
 
 impl Launcher for FakeLauncher {
-    fn spawn(
-        &self,
-        app_id: &str,
-        _title: &str,
-        command: &WindowCommand,
-        options: WrapperOptions,
-    ) -> Result<()> {
+    fn spawn(&self, mark: &Mark, command: &WindowCommand, options: WrapperOptions) -> Result<()> {
         let mut launches = self.launches.lock().unwrap();
         if self.fail_after.is_some_and(|n| launches.len() >= n) {
             anyhow::bail!("terminal crashed");
         }
         launches.push(command.clone());
         self.options.lock().unwrap().push(options);
-        let mark = Mark::parse(app_id).unwrap();
         self.host.add_shell(&mark.terminal().to_string(), true);
-        self.sway.open(&self.workspace, app_id);
+        self.sway.open(&self.workspace, &mark.app_id());
         Ok(())
     }
 
+    /// `[OPTIONS, TITLE, ARGV...]`, so a test sees what reaches the window.
     fn program_argv(
         &self,
-        title: &str,
+        mark: &Mark,
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Vec<String> {
-        let mut argv = vec![format!("{options:?}"), title.to_owned()];
+        let mut argv = vec![format!("{options:?}"), mark.title()];
         argv.extend_from_slice(command.argv());
         argv
     }
@@ -908,6 +902,138 @@ fn rebind_refuses_a_session_bound_nowhere_or_twice() {
     );
     assert_eq!(failure_status(&err), 1, "any other refusal");
     assert!(world.sway.commands().is_empty());
+}
+
+// ------------------------------------------------------------- reattach
+
+/// PLAN-migrate decision 9: a window whose session is bound to another
+/// host that has its shell follows it. The argv is the wrapper's attach of
+/// the same shell there, with the window's options and without `--force`;
+/// the new host's master starts first. The window's own host is never
+/// asked (the world's host factory knows only the new host).
+#[test]
+fn reattach_follows_a_session_bound_to_another_host_that_has_the_shell() {
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-002", false);
+    let options = WrapperOptions {
+        no_hold: true,
+        attach_only: true,
+    };
+
+    let Reattach::Follow(follow) =
+        reattach(&world.ports(), &t("ws4", 2), &Host::Local, options).unwrap()
+    else {
+        panic!("no follow")
+    };
+
+    assert_eq!(follow.mark, Mark::new(deepthought(), t("ws4", 2)));
+    assert_eq!(
+        follow.argv[..2],
+        [format!("{options:?}"), follow.mark.title()]
+    );
+    assert_eq!(follow.argv[follow.argv.len() - 2..], ["attach", "ws4-002"]);
+    assert_eq!(
+        world.fakes.ensured(),
+        [dt(), dt()],
+        "the list, then the window's master"
+    );
+    assert!(world.launches().is_empty(), "it opens no window");
+    assert!(world.sway.commands().is_empty(), "it marks nothing");
+}
+
+/// A new host that does not answer, or whose master does not start, makes
+/// the window wait: it must not attach on its old host meanwhile.
+#[test]
+fn reattach_waits_while_the_new_host_does_not_answer() {
+    let world = World::new(deepthought());
+    world.bind("4", "ws4");
+    world.host.add_shell("ws4-002", false);
+    world.host.state.lock().unwrap().unreachable = true;
+    let wait = reattach(
+        &world.ports(),
+        &t("ws4", 2),
+        &Host::Local,
+        WrapperOptions::default(),
+    );
+    assert!(
+        matches!(wait, Ok(Reattach::Wait { ref host, .. }) if *host == deepthought()),
+        "{wait:?}"
+    );
+
+    world.host.state.lock().unwrap().unreachable = false;
+    world.fakes.log.lock().unwrap().fail_start = true;
+    let wait = reattach(
+        &world.ports(),
+        &t("ws4", 2),
+        &Host::Local,
+        WrapperOptions::default(),
+    );
+    assert!(matches!(wait, Ok(Reattach::Wait { .. })), "{wait:?}");
+    let outcome = cmd_reattach(
+        &world.ports(),
+        &t("ws4", 2),
+        &Host::Local,
+        WrapperOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Exit(code) if code == ExitCode::from(EXIT_FOLLOW_WAIT)),
+        "{outcome:?}"
+    );
+}
+
+/// The window stays when its session did not move, is bound nowhere or on
+/// two other hosts, or moved to a host that lacks the shell. A session
+/// that did not move contacts no host.
+#[test]
+fn reattach_stays_unless_the_session_moved_to_a_host_with_the_shell() {
+    let stays = |world: &World, from: &Host| {
+        let outcome = reattach(
+            &world.ports(),
+            &t("ws4", 2),
+            from,
+            WrapperOptions::default(),
+        );
+        matches!(outcome, Ok(Reattach::Stay))
+    };
+    let world = World::new(deepthought());
+    world.host.add_shell("ws4-002", false);
+    assert!(stays(&world, &Host::Local), "bound nowhere");
+    world.bind("4", "ws4");
+    assert!(stays(&world, &deepthought()), "not moved");
+    assert!(
+        world.fakes.events().is_empty(),
+        "{:?}",
+        world.fakes.events()
+    );
+    world.host.state.lock().unwrap().shells.clear();
+    assert!(stays(&world, &Host::Local), "the new host lacks the shell");
+    let elsewhere = WorkspaceState::new(Host::Ssh(RemoteHost::new("other").unwrap()), name("ws4"));
+    world
+        .store
+        .with_lock(|s| Ok(s.bind("5", elsewhere)?))
+        .unwrap();
+    assert!(stays(&world, &Host::Local), "bound on two other hosts");
+    let outcome = cmd_reattach(
+        &world.ports(),
+        &t("ws4", 2),
+        &Host::Local,
+        WrapperOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Exit(code) if code == ExitCode::from(EXIT_STAY)),
+        "{outcome:?}"
+    );
+}
+
+/// The wrapper reads the argv as NUL-terminated words; a word may hold
+/// newlines, as the shpool prelude does.
+#[test]
+fn a_follow_prints_each_word_nul_terminated() {
+    let words = ["sh".to_owned(), "a\nb".to_owned(), String::new()];
+    assert_eq!(nul_terminated(&words), b"sh\0a\nb\0\0");
 }
 
 // ------------------------------------------------------- terminal --here
@@ -2306,7 +2432,7 @@ fn remote_window_goes_through_the_hosts_master() {
         panic!("{launches:?}")
     };
     assert_eq!(remote.unit, FakeMasters::unit());
-    assert_eq!((&remote.host, &remote.shell), (&dt(), &t("ws4", 1)));
+    assert_eq!(world.window_numbers("ws4"), [1], "marked with its host");
     assert_eq!(remote.argv[remote.argv.len() - 2..], ["attach", "ws4-001"]);
     assert_eq!(
         remote.reattach[remote.reattach.len() - 3..],
@@ -2580,6 +2706,25 @@ fn here_options_need_here_and_shell_takes_no_new_shell() {
     ])
     .is_ok());
     assert!(parse(&["--here", "--window-command", "w {shell}", "-e", "htop"]).is_ok());
+}
+
+/// `reattach` is hidden: it is the wrapper's, not the user's.
+#[test]
+fn reattach_is_a_hidden_command_of_the_wrapper() {
+    use clap::CommandFactory;
+    let parsed = Cli::try_parse_from([
+        "i3mux",
+        "reattach",
+        "--no-hold",
+        "--shell",
+        "ws4-002",
+        "--from",
+        "local",
+    ]);
+    assert!(parsed.is_ok());
+    assert!(Cli::try_parse_from(["i3mux", "reattach", "--shell", "ws4-002"]).is_err());
+    let help = Cli::command().render_help().to_string();
+    assert!(!help.contains("reattach"), "{help}");
 }
 
 #[test]

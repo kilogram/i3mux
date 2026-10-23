@@ -62,6 +62,12 @@ impl Mark {
     pub fn app_id(&self) -> String {
         self.to_string()
     }
+
+    /// `i3mux:{host}:{terminal}`: the title the wrapper gives the window.
+    #[must_use]
+    pub fn title(&self) -> String {
+        format!("i3mux:{}:{}", self.host, self.terminal)
+    }
 }
 
 impl fmt::Display for Mark {
@@ -320,6 +326,10 @@ mod tests {
         assert_eq!(
             mark(&Host::Local, "ws1", 1).to_string(),
             "_i3mux:local:ws1-001"
+        );
+        assert_eq!(
+            mark(&remote("dev-box"), "ws1", 1).title(),
+            "i3mux:dev-box:ws1-001"
         );
         assert_eq!(
             mark(&remote("user@server.lan"), "ws2", 3).to_string(),

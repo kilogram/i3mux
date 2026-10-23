@@ -176,15 +176,16 @@ impl Scratch {
 
     /// Run what an i3mux window runs: the real wrapper script with the
     /// attach argv, in a new pty. (Run with `bash`, not exec'd: a freshly
-    /// written file can be ETXTBSY in a multi-threaded test process.)
+    /// written file can be ETXTBSY in a multi-threaded test process.) Its
+    /// i3mux is `false`: every `reattach` fails, so the window stays.
     fn attach_in_wrapper(&self, name: &TerminalName) -> PtyClient {
-        let wrapper = self.path().join("wrapper.sh");
-        std::fs::write(&wrapper, crate::launch::WRAPPER).unwrap();
+        use crate::launch::{Launcher as _, TerminalLauncher, WindowCommand, WrapperOptions};
+        let launcher =
+            TerminalLauncher::install("foot".into(), "false".into(), self.path()).unwrap();
+        let mark = crate::window::Mark::new(Host::Local, name.clone());
+        let attach = WindowCommand::Plain(attach_argv(&self.runner, name, false, None));
         let mut command = Command::new("bash");
-        command
-            .arg(&wrapper)
-            .arg(format!("i3mux:local:{name}"))
-            .args(attach_argv(&self.runner, name, false, None));
+        command.args(launcher.program_argv(&mark, &attach, WrapperOptions::default()));
         self.env(&mut command);
         PtyClient::spawn(command)
     }

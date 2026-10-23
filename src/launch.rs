@@ -3,8 +3,8 @@
 //! An i3mux window runs the wrapper in `$TERMINAL`:
 //!
 //! ```text
-//! wrapper.sh [--no-hold] [--attach-only] TITLE ARGV...
-//! wrapper.sh [--no-hold] [--attach-only] --remote HOST SHELL UNIT N REATTACH... TITLE ARGV...
+//! wrapper.sh [--no-hold] [--attach-only] I3MUX HOST SHELL TITLE ARGV...
+//! wrapper.sh [--no-hold] [--attach-only] I3MUX HOST SHELL --remote UNIT N REATTACH... TITLE ARGV...
 //! ```
 //!
 //! The wrapper sets the title once, runs ARGV with no shell, and keeps the
@@ -13,8 +13,18 @@
 //! also recovers from a lost ssh connection: it shows a landing page while
 //! UNIT, the host's ssh master, reconnects, then runs REATTACH, the N-word
 //! argv that attaches SHELL with `--force` (plan-ssh-recovery rules 7-11).
-//! [`wrapper_argv`] is the only code that builds this command line. Every
-//! word reaches the wrapper as one argument, so nothing is quoted.
+//!
+//! Every window follows its session to another host (PLAN-migrate decision
+//! 9). Before each rerun of its attach, and after its last end, the wrapper
+//! asks `I3MUX reattach --shell SHELL --from HOST` where the session is.
+//! HOST is a host label: `local`, or the remote host. When the session
+//! moved to a host that has SHELL, reattach prints a wrapper argv for that
+//! host and the wrapper execs it. While that host does not answer
+//! ([`EXIT_FOLLOW_WAIT`]), the wrapper waits and never attaches on HOST.
+//!
+//! [`TerminalLauncher::wrapper_argv`] is the only code that builds this
+//! command line. Every word reaches the wrapper as one argument, so nothing
+//! is quoted.
 //!
 //! Spawned terminals get no stdin, stdout or stderr from i3mux and run in
 //! their own process group. A caller that captures i3mux's output (the rofi
@@ -30,11 +40,23 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::master::UnitName;
-use crate::types::{RemoteHost, TerminalName};
+use crate::window::Mark;
 
 /// The wrapper script, written to the private runtime directory.
 pub const WRAPPER: &str = include_str!("wrapper.sh");
 const WRAPPER_FILE: &str = "wrapper.sh";
+
+/// Exit status of `i3mux reattach` when the window's session moved to a
+/// host that does not answer. The wrapper then waits for that host, and
+/// never attaches on its own host (the literal `follow_wait=6` in the
+/// wrapper).
+pub const EXIT_FOLLOW_WAIT: u8 = 6;
+
+/// Exit status of `i3mux reattach` when the window stays on its host: the
+/// session did not move, or moved to a host that lacks the window's shell.
+/// The wrapper then takes its usual path. It treats every status other
+/// than 0 and [`EXIT_FOLLOW_WAIT`] the same way.
+pub const EXIT_STAY: u8 = 7;
 
 /// What an i3mux window runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +84,7 @@ impl WindowCommand {
 }
 
 /// A remote window, and what it needs to recover from a lost connection.
+/// Its host and its shell are those of the window's mark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAttach {
     /// The attach argv.
@@ -69,10 +92,8 @@ pub struct RemoteAttach {
     /// The attach argv with `--force`, run once the connection is back: the
     /// host may still count the lost client as attached.
     pub reattach: Vec<String>,
-    /// The ssh master unit of `host`, which the window watches.
+    /// The ssh master unit of the window's host, which the window watches.
     pub unit: UnitName,
-    pub host: RemoteHost,
-    pub shell: TerminalName,
 }
 
 /// How the wrapper ends a window. The default keeps today's behaviour.
@@ -91,26 +112,21 @@ pub struct WrapperOptions {
 /// Opens terminal windows. [`TerminalLauncher`] is the real one; tests use
 /// fakes that add windows to a fake Sway.
 pub trait Launcher {
-    /// Start a window with `app_id` and `title` that runs `command` through
-    /// the wrapper, with `options`. Returns once the terminal process has
-    /// started.
+    /// Start the window of `mark`, with the mark's app id and title, that
+    /// runs `command` through the wrapper, with `options`. Returns once the
+    /// terminal process has started.
     ///
     /// # Errors
     /// If the terminal cannot be started.
-    fn spawn(
-        &self,
-        app_id: &str,
-        title: &str,
-        command: &WindowCommand,
-        options: WrapperOptions,
-    ) -> Result<()>;
+    fn spawn(&self, mark: &Mark, command: &WindowCommand, options: WrapperOptions) -> Result<()>;
 
-    /// The argv that a window runs to show `command`: the wrapper with
-    /// `title` and `options`, or a window command as it is. `spawn` runs it
-    /// in a new terminal, and `terminal --here` execs it.
+    /// The argv that the window of `mark` runs to show `command`: the
+    /// wrapper with `options`, or a window command as it is. `spawn` runs
+    /// it in a new terminal, `terminal --here` execs it, and a wrapper
+    /// execs it when the window follows its session to another host.
     fn program_argv(
         &self,
-        title: &str,
+        mark: &Mark,
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Vec<String>;
@@ -181,40 +197,79 @@ fn window_argv(
 pub struct TerminalLauncher {
     program: String,
     wrapper: PathBuf,
+    /// The i3mux binary that each wrapper asks where its session is.
+    i3mux: PathBuf,
 }
 
 impl TerminalLauncher {
     /// Write the wrapper into `private_dir` (created 0700 by the caller) and
-    /// return a launcher for `program`.
+    /// return a launcher for `program`, whose wrappers run `i3mux`.
     ///
     /// # Errors
     /// If the wrapper cannot be written.
-    pub fn install(program: String, private_dir: &Path) -> Result<Self> {
+    pub fn install(program: String, i3mux: PathBuf, private_dir: &Path) -> Result<Self> {
         let wrapper = private_dir.join(WRAPPER_FILE);
         if fs::read_to_string(&wrapper).ok().as_deref() != Some(WRAPPER) {
             write_executable(&wrapper, WRAPPER)?;
         }
-        Ok(Self { program, wrapper })
+        Ok(Self {
+            program,
+            wrapper,
+            i3mux,
+        })
     }
 
-    /// The terminal's argv for a window with `app_id`. A window of the
+    /// The terminal's argv for the window of `mark`. A window of the
     /// binding's window command gets no title flag: alacritty and kitty
     /// lock a title given on their command line, and the window command
     /// may run `terminal --here`, which finds its window by a title it sets
     /// (PLAN-terminal-here). i3mux finds the window by its app id.
     fn terminal_argv(
         &self,
-        app_id: &str,
-        title: &str,
+        mark: &Mark,
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Vec<String> {
-        let argv = self.program_argv(title, command, options);
+        let argv = self.program_argv(mark, command, options);
         let title = match command {
             WindowCommand::Custom(_) => None,
-            WindowCommand::Plain(_) | WindowCommand::Remote(_) => Some(title),
+            WindowCommand::Plain(_) | WindowCommand::Remote(_) => Some(mark.title()),
         };
-        window_argv(&self.program, Some(app_id), title, &argv)
+        window_argv(&self.program, Some(&mark.app_id()), title.as_deref(), &argv)
+    }
+
+    /// `wrapper.sh [--no-hold] [--attach-only] I3MUX HOST SHELL [--remote
+    /// UNIT N REATTACH...] TITLE ARGV...`: the wrapper's only command line
+    /// (see the module docs).
+    fn wrapper_argv(
+        &self,
+        mark: &Mark,
+        command: &WindowCommand,
+        options: WrapperOptions,
+    ) -> Vec<String> {
+        let mut argv = vec![self.wrapper.display().to_string()];
+        if options.no_hold {
+            argv.push("--no-hold".to_owned());
+        }
+        if options.attach_only {
+            argv.push("--attach-only".to_owned());
+        }
+        argv.extend([
+            self.i3mux.display().to_string(),
+            mark.host().to_string(),
+            mark.terminal().to_string(),
+        ]);
+        if let WindowCommand::Remote(remote) = command {
+            argv.extend([
+                "--remote".to_owned(),
+                remote.unit.to_string(),
+                remote.reattach.len().to_string(),
+            ]);
+            argv.extend_from_slice(&remote.reattach);
+        }
+        argv.push(mark.title());
+        argv.extend_from_slice(command.argv());
+        argv
     }
 
     /// Start a plain terminal (no i3mux) that runs `cmd` with `sh -c`, or
@@ -231,60 +286,23 @@ impl TerminalLauncher {
 }
 
 impl Launcher for TerminalLauncher {
-    fn spawn(
-        &self,
-        app_id: &str,
-        title: &str,
-        command: &WindowCommand,
-        options: WrapperOptions,
-    ) -> Result<()> {
-        spawn_detached(&self.terminal_argv(app_id, title, command, options))
+    fn spawn(&self, mark: &Mark, command: &WindowCommand, options: WrapperOptions) -> Result<()> {
+        spawn_detached(&self.terminal_argv(mark, command, options))
     }
 
     fn program_argv(
         &self,
-        title: &str,
+        mark: &Mark,
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Vec<String> {
         match command {
             WindowCommand::Custom(argv) => argv.clone(),
             WindowCommand::Plain(_) | WindowCommand::Remote(_) => {
-                wrapper_argv(&self.wrapper, title, command, options)
+                self.wrapper_argv(mark, command, options)
             }
         }
     }
-}
-
-/// `wrapper.sh [--no-hold] [--attach-only] [--remote HOST SHELL UNIT N
-/// REATTACH...] TITLE ARGV...`, the wrapper's only command line (see the
-/// module docs).
-fn wrapper_argv(
-    wrapper: &Path,
-    title: &str,
-    command: &WindowCommand,
-    options: WrapperOptions,
-) -> Vec<String> {
-    let mut argv = vec![wrapper.display().to_string()];
-    if options.no_hold {
-        argv.push("--no-hold".to_owned());
-    }
-    if options.attach_only {
-        argv.push("--attach-only".to_owned());
-    }
-    if let WindowCommand::Remote(remote) = command {
-        argv.extend([
-            "--remote".to_owned(),
-            remote.host.to_string(),
-            remote.shell.to_string(),
-            remote.unit.to_string(),
-            remote.reattach.len().to_string(),
-        ]);
-        argv.extend_from_slice(&remote.reattach);
-    }
-    argv.push(title.to_owned());
-    argv.extend_from_slice(command.argv());
-    argv
 }
 
 fn spawn_detached(argv: &[String]) -> Result<()> {
@@ -320,9 +338,29 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Host, RemoteHost, SessionName, TerminalName};
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The window of shell `ws4-002` on `host`.
+    fn mark_on(host: &str) -> Mark {
+        let ws4 = SessionName::new("ws4").unwrap();
+        Mark::new(
+            Host::Ssh(RemoteHost::new(host).unwrap()),
+            TerminalName::new(&ws4, 2),
+        )
+    }
+
+    /// A launcher whose wrapper and i3mux are at fixed paths, for argv
+    /// tests that run nothing.
+    fn fixed_launcher(program: &str) -> TerminalLauncher {
+        TerminalLauncher {
+            program: program.to_owned(),
+            wrapper: "/w.sh".into(),
+            i3mux: "/bin/i3mux".into(),
+        }
     }
 
     #[test]
@@ -370,15 +408,15 @@ mod tests {
     /// window (found by handoff's done-when test, real alacritty).
     #[test]
     fn a_window_commands_window_gets_no_title_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let launcher = TerminalLauncher::install("alacritty".into(), dir.path()).unwrap();
+        let launcher = fixed_launcher("alacritty");
+        let mark = mark_on("deepthought");
         let custom = WindowCommand::Custom(strings(&["handoff", "window", "ws3", "ws3-002"]));
         assert_eq!(
-            launcher.terminal_argv("id", "t", &custom, WrapperOptions::default()),
+            launcher.terminal_argv(&mark, &custom, WrapperOptions::default()),
             strings(&[
                 "alacritty",
                 "--class",
-                "id",
+                "_i3mux:deepthought:ws4-002",
                 "-e",
                 "handoff",
                 "window",
@@ -387,10 +425,16 @@ mod tests {
             ])
         );
         let plain = WindowCommand::Plain(strings(&["shpool"]));
-        let argv = launcher.terminal_argv("id", "t", &plain, WrapperOptions::default());
+        let argv = launcher.terminal_argv(&mark, &plain, WrapperOptions::default());
         assert_eq!(
             argv[..5],
-            strings(&["alacritty", "--class", "id", "-T", "t"])
+            strings(&[
+                "alacritty",
+                "--class",
+                "_i3mux:deepthought:ws4-002",
+                "-T",
+                "i3mux:deepthought:ws4-002"
+            ])
         );
     }
 
@@ -399,10 +443,24 @@ mod tests {
         assert_eq!(window_argv("foot", None, None, &[]), ["foot"]);
     }
 
+    /// The wrapper's wait status is the one that `i3mux reattach` exits
+    /// with: a mismatch would make a window attach on its old host while
+    /// the session's new host does not answer.
+    #[test]
+    fn the_wrapper_waits_on_the_status_that_reattach_exits_with() {
+        assert!(
+            WRAPPER.contains(&format!("\nfollow_wait={EXIT_FOLLOW_WAIT}\n")),
+            "wrapper.sh and EXIT_FOLLOW_WAIT disagree"
+        );
+        assert_ne!(EXIT_STAY, EXIT_FOLLOW_WAIT);
+        assert_ne!(EXIT_STAY, 0);
+    }
+
     #[test]
     fn install_writes_private_executable_wrapper() {
         let dir = tempfile::tempdir().unwrap();
-        let launcher = TerminalLauncher::install("foot".into(), dir.path()).unwrap();
+        let launcher =
+            TerminalLauncher::install("foot".into(), "/bin/i3mux".into(), dir.path()).unwrap();
         let mode = fs::metadata(&launcher.wrapper)
             .unwrap()
             .permissions()
@@ -411,7 +469,7 @@ mod tests {
         assert_eq!(mode, 0o700);
         assert_eq!(fs::read_to_string(&launcher.wrapper).unwrap(), WRAPPER);
         // A second install leaves the file alone.
-        TerminalLauncher::install("foot".into(), dir.path()).unwrap();
+        TerminalLauncher::install("foot".into(), "/bin/i3mux".into(), dir.path()).unwrap();
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
@@ -433,6 +491,20 @@ cat "$FAKE/journal" 2>/dev/null
 exit 0
 "#;
 
+    /// Fake `i3mux`: logs its arguments to `$FAKE/runs`, among the
+    /// attaches. On its Nth call it answers with `$FAKE/follow.N`: the
+    /// first line is its exit status, each further line one word it
+    /// prints, NUL-terminated. With no such file the window stays (7).
+    const FAKE_I3MUX: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE/runs"
+n=$(( $(cat "$FAKE/follows" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$FAKE/follows"
+answer="$FAKE/follow.$n"
+[ -e "$answer" ] || exit 7
+tail -n +2 "$answer" | tr '\n' '\0'
+exit "$(head -n 1 "$answer")"
+"#;
+
     /// Write an executable from a child process: a write descriptor held by
     /// this multi-threaded test process could leak into another test's fork
     /// and make exec fail with ETXTBSY.
@@ -448,12 +520,16 @@ exit 0
         assert!(status.success());
     }
 
-    /// The installed wrapper, fake `systemctl` and `journalctl` first on
-    /// `PATH`, and the files they read (`$FAKE/unit*`, `$FAKE/journal`) and
-    /// write (`$FAKE/calls`). Test commands log their runs to `$FAKE/runs`.
+    /// The installed wrapper of the window of `ws4-002` on deepthought,
+    /// fake `systemctl` and `journalctl` first on `PATH`, a fake `i3mux`
+    /// that the wrapper runs, and the files they read (`$FAKE/unit*`,
+    /// `$FAKE/journal`, `$FAKE/follow.*`) and write (`$FAKE/calls`). Test
+    /// commands and the fake `i3mux` log their runs to `$FAKE/runs`.
     struct WrapperWorld {
         dir: tempfile::TempDir,
-        wrapper: PathBuf,
+        launcher: TerminalLauncher,
+        /// The window's mark.
+        mark: Mark,
         /// The options the window runs with.
         options: WrapperOptions,
     }
@@ -461,23 +537,52 @@ exit 0
     impl WrapperWorld {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let wrapper = TerminalLauncher::install("foot".into(), dir.path())
-                .unwrap()
-                .wrapper;
             let bin = dir.path().join("bin");
             fs::create_dir_all(&bin).unwrap();
             fs::create_dir_all(dir.path().join("fake")).unwrap();
             write_script(&bin.join("systemctl"), FAKE_SYSTEMCTL);
             write_script(&bin.join("journalctl"), FAKE_JOURNALCTL);
+            write_script(&bin.join("i3mux"), FAKE_I3MUX);
+            let launcher =
+                TerminalLauncher::install("foot".into(), bin.join("i3mux"), dir.path()).unwrap();
             Self {
                 dir,
-                wrapper,
+                launcher,
+                mark: mark_on("deepthought"),
                 options: WrapperOptions::default(),
             }
         }
 
         fn fake(&self, file: &str) -> PathBuf {
             self.dir.path().join("fake").join(file)
+        }
+
+        /// The argv that runs the wrapper of `mark`, with this world's
+        /// options, through bash (ETXTBSY, as in `write_script`).
+        fn wrapper_argv(&self, mark: &Mark, command: &WindowCommand) -> Vec<String> {
+            let mut argv = vec!["bash".to_owned()];
+            argv.extend(self.launcher.wrapper_argv(mark, command, self.options));
+            argv
+        }
+
+        /// `i3mux reattach` call number `call` exits with `status`, after
+        /// it printed `words`.
+        fn answer_reattach(&self, call: u32, status: u8, words: &[String]) {
+            let mut text = format!("{status}\n");
+            for word in words {
+                assert!(!word.contains('\n'), "one line per word: {word:?}");
+                text.push_str(word);
+                text.push('\n');
+            }
+            fs::write(self.fake(&format!("follow.{call}")), text).unwrap();
+        }
+
+        /// The runs logged, without the calls of the fake `i3mux`.
+        fn attaches(&self) -> String {
+            self.read("runs")
+                .split_inclusive('\n')
+                .filter(|line| !line.starts_with("reattach "))
+                .collect()
         }
 
         /// The unit's properties for `show` call number `call`, or for every
@@ -515,9 +620,9 @@ exit 0
                 self.dir.path().join("bin").display(),
                 std::env::var("PATH").unwrap_or_default()
             );
-            // Run it with bash rather than exec it: ETXTBSY, as above.
-            let mut child = Command::new("bash")
-                .args(wrapper_argv(&self.wrapper, "t", command, self.options))
+            let argv = self.wrapper_argv(&self.mark, command);
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
                 .env("FAKE", self.dir.path().join("fake"))
                 .env("PATH", path)
                 .stdin(Stdio::piped())
@@ -546,15 +651,17 @@ exit 0
         ]
     }
 
-    fn remote(argv: Vec<String>, reattach: Vec<String>) -> WindowCommand {
-        let ws4 = crate::types::SessionName::new("ws4").unwrap();
+    /// A remote window through the master of `unit_host`.
+    fn remote_on(unit_host: &str, argv: Vec<String>, reattach: Vec<String>) -> WindowCommand {
         WindowCommand::Remote(RemoteAttach {
             argv,
             reattach,
-            unit: UnitName::from_escaped_host("deepthought").unwrap(),
-            host: RemoteHost::new("deepthought").unwrap(),
-            shell: TerminalName::new(&ws4, 2),
+            unit: UnitName::from_escaped_host(unit_host).unwrap(),
         })
+    }
+
+    fn remote(argv: Vec<String>, reattach: Vec<String>) -> WindowCommand {
+        remote_on("deepthought", argv, reattach)
     }
 
     fn text(bytes: &[u8]) -> String {
@@ -564,21 +671,24 @@ exit 0
     use std::time::Duration;
     const AT_ONCE: Duration = Duration::ZERO;
 
+    /// What the fake `i3mux` logs for the window of `ws4-002` on `host`.
+    fn reattach_from(host: &str) -> String {
+        format!("reattach --shell ws4-002 --from {host}\n")
+    }
+
     #[test]
     fn remote_window_puts_its_recovery_words_before_the_title() {
+        let launcher = fixed_launcher("foot");
+        let mark = mark_on("deepthought");
         let command = remote(strings(&["ssh", "a b"]), strings(&["ssh", "-f", "c'd"]));
         assert_eq!(
-            wrapper_argv(
-                Path::new("/w.sh"),
-                "i3mux:deepthought:ws4-002",
-                &command,
-                WrapperOptions::default()
-            ),
+            launcher.wrapper_argv(&mark, &command, WrapperOptions::default()),
             strings(&[
                 "/w.sh",
-                "--remote",
+                "/bin/i3mux",
                 "deepthought",
                 "ws4-002",
+                "--remote",
                 "i3mux-ssh-deepthought.service",
                 "3",
                 "ssh",
@@ -589,10 +699,18 @@ exit 0
                 "a b",
             ])
         );
+        let local = Mark::new(Host::Local, mark.terminal().clone());
         let plain = WindowCommand::Plain(strings(&["x"]));
         assert_eq!(
-            wrapper_argv(Path::new("/w.sh"), "t", &plain, WrapperOptions::default()),
-            ["/w.sh", "t", "x"]
+            launcher.wrapper_argv(&local, &plain, WrapperOptions::default()),
+            [
+                "/w.sh",
+                "/bin/i3mux",
+                "local",
+                "ws4-002",
+                "i3mux:local:ws4-002",
+                "x"
+            ]
         );
     }
 
@@ -603,7 +721,10 @@ exit 0
         let out = world.run(&WindowCommand::Plain(argv), "", AT_ONCE);
         assert!(out.status.success());
         let text = text(&out.stdout);
-        assert!(text.starts_with("\x1b]0;t\x07a'b \"$HOME\"\n"), "{text:?}");
+        assert!(
+            text.starts_with("\x1b]0;i3mux:deepthought:ws4-002\x07a'b \"$HOME\"\n"),
+            "{text:?}"
+        );
     }
 
     #[test]
@@ -652,8 +773,9 @@ exit 0
         };
         let pty = openpty(&size, None).unwrap();
         let command = WindowCommand::Plain(attach("plain", "sleep 30"));
-        let out = Command::new("bash")
-            .args(wrapper_argv(&world.wrapper, "t", &command, world.options))
+        let argv = world.wrapper_argv(&world.mark, &command);
+        let out = Command::new(&argv[0])
+            .args(&argv[1..])
             .env("FAKE", world.dir.path().join("fake"))
             .stdin(std::fs::File::from(pty.slave))
             .stdout(Stdio::piped())
@@ -678,8 +800,9 @@ exit 0
         use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
         let world = WrapperWorld::new();
         let command = WindowCommand::Plain(attach("plain", "sleep 30"));
-        let mut child = Command::new("bash")
-            .args(wrapper_argv(&world.wrapper, "t", &command, world.options))
+        let argv = world.wrapper_argv(&world.mark, &command);
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
             .env("FAKE", world.dir.path().join("fake"))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -718,7 +841,7 @@ exit 0
         let argv = strings(&["sleep", "2"]);
         let out = world.run(&WindowCommand::Plain(argv), "", AT_ONCE);
         assert!(out.status.success());
-        assert_eq!(text(&out.stdout), "\x1b]0;t\x07");
+        assert_eq!(text(&out.stdout), "\x1b]0;i3mux:deepthought:ws4-002\x07");
     }
 
     #[test]
@@ -732,6 +855,9 @@ exit 0
         assert_eq!(world.read("calls"), "");
     }
 
+    /// PLAN-migrate decision 9: the wrapper asks reattach after every end
+    /// of its attach, and again after ssh recovery, before REATTACH. Here
+    /// the session never moves, so the window does what it did before.
     #[test]
     fn remote_window_reattaches_with_force_once_the_master_restarted() {
         // Rule 8: exit 255 and a new InvocationID mean that the link dropped.
@@ -745,7 +871,11 @@ exit 0
         );
         let out = world.run(&command, "", AT_ONCE);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
-        assert_eq!(world.read("runs"), "plain\nforce a'b \"$HOME\"\n");
+        let asked = reattach_from("deepthought");
+        assert_eq!(
+            world.read("runs"),
+            format!("plain\n{asked}{asked}force a'b \"$HOME\"\n{asked}")
+        );
         assert!(!text(&out.stdout).contains("lost"), "no landing page");
     }
 
@@ -765,7 +895,7 @@ exit 0
         );
         let out = world.run(&command, "", Duration::from_millis(2500));
         assert_eq!(out.status.code(), Some(255));
-        assert_eq!(world.read("runs"), "plain\n", "no reattach without a key");
+        assert_eq!(world.attaches(), "plain\n", "no reattach without a key");
         let text = text(&out.stdout);
         for line in [
             "[i3mux] ssh to deepthought failed with exit status 255.",
@@ -793,7 +923,7 @@ exit 0
         let command = remote(attach("plain", "exit 255"), attach("force", "sleep 2"));
         let out = world.run(&command, "", Duration::from_secs(10));
         assert_eq!(out.status.code(), Some(0));
-        assert_eq!(world.read("runs"), "plain\nforce\n");
+        assert_eq!(world.attaches(), "plain\nforce\n");
         let text = text(&out.stdout);
         for line in [
             "[i3mux] Connection to deepthought lost. Shell ws4-002 is safe on the host.\n",
@@ -818,7 +948,7 @@ exit 0
         let command = remote(attach("plain", "exit 255"), attach("force", "exit 0"));
         let out = world.run(&command, "\nq", Duration::from_secs(5));
         assert_eq!(out.status.code(), Some(255));
-        assert_eq!(world.read("runs"), "plain\n");
+        assert_eq!(world.attaches(), "plain\n");
         let calls = world.read("calls");
         assert_eq!(calls.matches(" restart ").count(), 1, "{calls}");
         assert!(
@@ -836,7 +966,7 @@ exit 0
         let command = remote(attach("plain", "exit 75"), attach("force", "exit 0"));
         let out = world.run(&command, "\n", AT_ONCE);
         assert_eq!(out.status.code(), Some(75));
-        assert_eq!(world.read("runs"), "plain\nplain\n");
+        assert_eq!(world.attaches(), "plain\nplain\n");
         let text = text(&out.stdout);
         assert!(
             text.contains("[i3mux] Starting a new shell in this window.\n"),
@@ -884,20 +1014,33 @@ exit 0
         let command = remote(attach("plain", "exit 75"), attach("force", "exit 0"));
         let out = world.run(&command, "", AT_ONCE);
         assert_eq!(out.status.code(), Some(75));
-        assert_eq!(world.read("runs"), "plain\n");
+        // reattach gets the window's options, so a followed window keeps
+        // them.
+        assert_eq!(
+            world.read("runs"),
+            "plain\nreattach --no-hold --attach-only --shell ws4-002 --from deepthought\n"
+        );
         assert!(!text(&out.stdout).contains("Starting a new shell"));
     }
 
     #[test]
-    fn the_options_come_before_the_remote_words() {
+    fn the_options_come_before_the_window_words() {
         let command = remote(strings(&["ssh", "a"]), strings(&["ssh", "-f"]));
         let options = WrapperOptions {
             no_hold: true,
             attach_only: true,
         };
         assert_eq!(
-            wrapper_argv(Path::new("/w.sh"), "t", &command, options)[..4],
-            strings(&["/w.sh", "--no-hold", "--attach-only", "--remote"])
+            fixed_launcher("foot").wrapper_argv(&mark_on("h"), &command, options)[..7],
+            strings(&[
+                "/w.sh",
+                "--no-hold",
+                "--attach-only",
+                "/bin/i3mux",
+                "h",
+                "ws4-002",
+                "--remote"
+            ])
         );
     }
 
@@ -915,11 +1058,143 @@ exit 0
         );
         let out = world.run(&command, "\n", AT_ONCE);
         assert_eq!(out.status.code(), Some(1));
-        assert_eq!(world.read("runs"), "plain\n");
+        assert_eq!(world.attaches(), "plain\n");
         let stdout = text(&out.stdout);
         assert!(stdout.contains("with exit status 1."), "{stdout}");
         assert!(stdout.contains("'i3mux terminal --force'"), "{stdout}");
         assert!(text(&out.stderr).contains("Shared connection to deepthought closed."));
         assert!(!world.read("calls").contains("restart"));
+    }
+
+    // PLAN-migrate decision 9: a window follows its session to another host.
+
+    /// When reattach prints a wrapper argv and exits 0, the window execs
+    /// it: no hint for the shell that ended. The new wrapper asks again,
+    /// from the new host, when its own attach ends.
+    #[test]
+    fn a_window_follows_its_session_to_the_wrapper_that_reattach_prints() {
+        let world = WrapperWorld::new();
+        let next = world.wrapper_argv(
+            &mark_on("dev-box"),
+            &WindowCommand::Plain(attach("new", "sleep 2")),
+        );
+        world.answer_reattach(1, 0, &next);
+
+        let out = world.run(&WindowCommand::Plain(attach("old", "exit 0")), "", AT_ONCE);
+
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        assert_eq!(
+            world.read("runs"),
+            format!(
+                "old\n{}new\n{}",
+                reattach_from("deepthought"),
+                reattach_from("dev-box")
+            )
+        );
+        let stdout = text(&out.stdout);
+        assert!(
+            stdout.contains("\x1b]0;i3mux:dev-box:ws4-002\x07"),
+            "{stdout:?}"
+        );
+        assert!(!stdout.contains("Press Enter"), "{stdout}");
+    }
+
+    /// Rule 3 in the wrapper, after a migration. The old host's ssh exits
+    /// 75: the window asks reattach before it would start a new shell
+    /// there, waits while the new host does not answer, then follows.
+    /// There ssh exits 255: the window asks again, before and after the
+    /// recovery. The old host gets one attach, the one before the move.
+    #[test]
+    fn after_a_move_a_window_never_attaches_on_its_old_host() {
+        let world = WrapperWorld::new();
+        // Show 1: the old wrapper. Show 2: the new one, before its attach.
+        // Show 3 on: the new host's link is back.
+        world.set_unit(Some(1), "active", "running", "A", 0);
+        world.set_unit(Some(2), "active", "running", "A", 0);
+        world.set_unit(None, "active", "running", "B", 1);
+        let there = remote_on(
+            "dev-box",
+            attach("new", "exit 255"),
+            attach("new-force", "sleep 2"),
+        );
+        world.answer_reattach(1, EXIT_FOLLOW_WAIT, &[]);
+        world.answer_reattach(2, 0, &world.wrapper_argv(&mark_on("dev-box"), &there));
+        let command = remote(attach("old", "exit 75"), attach("old-force", "exit 0"));
+
+        // Enter: the waiting window asks again at once.
+        let out = world.run(&command, "\n", Duration::from_secs(10));
+
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        let (old, new) = (reattach_from("deepthought"), reattach_from("dev-box"));
+        assert_eq!(
+            world.read("runs"),
+            format!("old\n{old}{old}new\n{new}{new}new-force\n{new}")
+        );
+        let stdout = text(&out.stdout);
+        assert!(
+            stdout.contains("[i3mux] The session of ws4-002 moved to a host that does not answer."),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("Starting a new shell"), "{stdout}");
+    }
+
+    /// After ssh recovery, a session that moved while the link was down is
+    /// followed before REATTACH runs: the old host gets no `--force`
+    /// attach.
+    #[test]
+    fn a_window_follows_a_move_made_while_its_link_was_down() {
+        let world = WrapperWorld::new();
+        world.set_unit(Some(1), "active", "running", "A", 0);
+        world.set_unit(None, "active", "running", "B", 1);
+        let next = world.wrapper_argv(
+            &mark_on("dev-box"),
+            &WindowCommand::Plain(attach("new", "sleep 2")),
+        );
+        world.answer_reattach(2, 0, &next);
+        let command = remote(attach("old", "exit 255"), attach("old-force", "exit 0"));
+
+        let out = world.run(&command, "", AT_ONCE);
+
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+        let old = reattach_from("deepthought");
+        assert_eq!(
+            world.read("runs"),
+            format!("old\n{old}{old}new\n{}", reattach_from("dev-box"))
+        );
+    }
+
+    /// While the new host does not answer, q closes the window with the
+    /// status of the attach that ended, and nothing attaches anywhere.
+    #[test]
+    fn a_waiting_window_closes_on_q() {
+        let world = WrapperWorld::new();
+        world.answer_reattach(1, EXIT_FOLLOW_WAIT, &[]);
+        let command = WindowCommand::Plain(attach("old", "exit 4"));
+
+        let out = world.run(&command, "q", Duration::from_secs(5));
+
+        assert_eq!(out.status.code(), Some(4), "{}", text(&out.stdout));
+        assert_eq!(
+            world.read("runs"),
+            format!("old\n{}", reattach_from("deepthought"))
+        );
+    }
+
+    /// A reattach that exits 0 but prints nothing, or prints an argv but
+    /// fails, moves nothing: the window takes its usual path.
+    #[test]
+    fn a_failed_or_empty_reattach_is_no_move() {
+        for (status, words) in [(0, vec![]), (1, strings(&["bash", "-c", "echo moved"]))] {
+            let world = WrapperWorld::new();
+            world.answer_reattach(1, status, &words);
+            let command = WindowCommand::Plain(strings(&["sh", "-c", "exit 3"]));
+
+            let out = world.run(&command, "\n", AT_ONCE);
+
+            assert_eq!(out.status.code(), Some(3));
+            let stdout = text(&out.stdout);
+            assert!(stdout.contains("with exit status 3."), "{stdout}");
+            assert!(!stdout.contains("moved"), "{stdout}");
+        }
     }
 }
