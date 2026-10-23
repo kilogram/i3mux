@@ -28,6 +28,7 @@ mod infrastructure;
 mod layout_basic;
 mod layout_nested;
 mod layout_tabbed;
+mod migrate;
 mod sessions;
 mod terminal;
 mod window_command;
