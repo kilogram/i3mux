@@ -110,6 +110,17 @@ It replaces `attach --rebind-only`, which moved only the binding.
 
 ## Later (TODO)
 
+- **Reconnects never make a shell** (kg, 2026-10-23). After ssh loss
+  (REATTACH, `shpool attach --force`) or a replaced daemon (exit 75), the
+  wrapper's attach can create the shell again, because `shpool attach`
+  creates a missing name. A reconnect should only attach, and say so when
+  the shell is gone. Only `terminal`, `attach` and `--migrate` make shells.
+  This changes today's recovery after a host reboot (a fresh shell in the
+  window).
+- **Window identity without titles** (kg, 2026-10-23). `terminal --here`
+  finds its window by a nonce title, and alacritty and kitty lock titles
+  given with `-T`. Find another identity, or say per terminal what works.
+
 - **Review all copy** (messages, previews, help) for clarity and
   concision, with handoff's, in one pass (kg, 2026-10-23).
 
