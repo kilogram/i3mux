@@ -333,6 +333,8 @@ struct FakeLauncher {
     launches: Mutex<Vec<WindowCommand>>,
     /// The wrapper options of each launch, in order.
     options: Mutex<Vec<WrapperOptions>>,
+    /// What each `program_argv` call was asked to show, in order.
+    programs: Mutex<Vec<WindowCommand>>,
     fail_after: Option<usize>,
 }
 
@@ -364,6 +366,7 @@ impl Launcher for FakeLauncher {
         command: &WindowCommand,
         options: WrapperOptions,
     ) -> Vec<String> {
+        self.programs.lock().unwrap().push(command.clone());
         let mut argv = vec![format!("{options:?}"), mark.title()];
         argv.extend_from_slice(command.argv());
         argv
@@ -398,6 +401,7 @@ impl World {
             workspace: "4".into(),
             launches: Mutex::default(),
             options: Mutex::default(),
+            programs: Mutex::default(),
             fail_after: None,
         };
         let fake = host.clone();
@@ -1514,15 +1518,14 @@ fn sessions_and_status_show_a_pending_cleanup_and_how_to_finish_it() {
 // ------------------------------------------------------------- reattach
 
 /// PLAN-migrate decision 9: a window whose session is bound to another
-/// host that has its shell follows it. The argv is the wrapper's attach of
-/// the same shell there, with the window's options and without `--force`;
-/// the new host's master starts first. The window's own host is never
-/// asked (the world's host factory knows only the new host).
+/// host follows it. The argv is the wrapper's attach of the same shell
+/// there, with the window's options and without `--force`; the new host's
+/// master starts first. The window's own host is never asked (the world's
+/// host factory knows only the new host).
 #[test]
-fn reattach_follows_a_session_bound_to_another_host_that_has_the_shell() {
+fn reattach_follows_a_session_bound_to_another_host() {
     let world = World::new(deepthought());
     world.bind("4", "ws4");
-    world.host.add_shell("ws4-002", false);
     let options = WrapperOptions {
         no_hold: true,
         attach_only: true,
@@ -1540,61 +1543,45 @@ fn reattach_follows_a_session_bound_to_another_host_that_has_the_shell() {
         [format!("{options:?}"), follow.mark.title()]
     );
     assert_eq!(follow.argv[follow.argv.len() - 2..], ["attach", "ws4-002"]);
-    assert_eq!(
-        world.fakes.ensured(),
-        [dt(), dt()],
-        "the list, then the window's master"
-    );
+    assert_eq!(world.fakes.ensured(), [dt()], "only the window's master");
     assert!(world.launches().is_empty(), "it opens no window");
     assert!(world.sway.commands().is_empty(), "it marks nothing");
 }
 
-/// A new host that does not answer, or whose master does not start, makes
-/// the window wait: it must not attach on its old host meanwhile.
+/// PLAN-migrate decision 9, draft 4: a new host that does not answer is
+/// still followed. reattach runs no command there, and a master that does
+/// not start gives the window its unit, so the new wrapper's ssh recovery
+/// waits for that host.
 #[test]
-fn reattach_waits_while_the_new_host_does_not_answer() {
+fn reattach_follows_a_new_host_that_does_not_answer() {
     let world = World::new(deepthought());
     world.bind("4", "ws4");
-    world.host.add_shell("ws4-002", false);
     world.host.state.lock().unwrap().unreachable = true;
-    let wait = reattach(
+    world.fakes.log.lock().unwrap().fail_start = true;
+
+    let followed = reattach(
         &world.ports(),
         &t("ws4", 2),
         &Host::Local,
         WrapperOptions::default(),
-    );
-    assert!(
-        matches!(wait, Ok(Reattach::Wait { ref host, .. }) if *host == deepthought()),
-        "{wait:?}"
     );
 
-    world.host.state.lock().unwrap().unreachable = false;
-    world.fakes.log.lock().unwrap().fail_start = true;
-    let wait = reattach(
-        &world.ports(),
-        &t("ws4", 2),
-        &Host::Local,
-        WrapperOptions::default(),
-    );
-    assert!(matches!(wait, Ok(Reattach::Wait { .. })), "{wait:?}");
-    let outcome = cmd_reattach(
-        &world.ports(),
-        &t("ws4", 2),
-        &Host::Local,
-        WrapperOptions::default(),
-    )
-    .unwrap();
-    assert!(
-        matches!(outcome, Outcome::Exit(code) if code == ExitCode::from(EXIT_FOLLOW_WAIT)),
-        "{outcome:?}"
+    assert!(matches!(followed, Ok(Reattach::Follow(_))), "{followed:?}");
+    let programs = world.launcher.programs.lock().unwrap().clone();
+    let [WindowCommand::Remote(remote)] = programs.as_slice() else {
+        panic!("{programs:?}")
+    };
+    assert_eq!(remote.unit, FakeMasters::unit());
+    assert_eq!(
+        remote.reattach[remote.reattach.len() - 3..],
+        ["attach", "-f", "ws4-002"]
     );
 }
 
-/// The window stays when its session did not move, is bound nowhere or on
-/// two other hosts, or moved to a host that lacks the shell. A session
-/// that did not move contacts no host.
+/// The window stays when its session did not move, or is bound nowhere or
+/// on two other hosts. Then it contacts no host.
 #[test]
-fn reattach_stays_unless_the_session_moved_to_a_host_with_the_shell() {
+fn reattach_stays_unless_the_session_moved() {
     let stays = |world: &World, from: &Host| {
         let outcome = reattach(
             &world.ports(),
@@ -1609,19 +1596,17 @@ fn reattach_stays_unless_the_session_moved_to_a_host_with_the_shell() {
     assert!(stays(&world, &Host::Local), "bound nowhere");
     world.bind("4", "ws4");
     assert!(stays(&world, &deepthought()), "not moved");
-    assert!(
-        world.fakes.events().is_empty(),
-        "{:?}",
-        world.fakes.events()
-    );
-    world.host.state.lock().unwrap().shells.clear();
-    assert!(stays(&world, &Host::Local), "the new host lacks the shell");
     let elsewhere = WorkspaceState::new(Host::Ssh(RemoteHost::new("other").unwrap()), name("ws4"));
     world
         .store
         .with_lock(|s| Ok(s.bind("5", elsewhere)?))
         .unwrap();
     assert!(stays(&world, &Host::Local), "bound on two other hosts");
+    assert!(
+        world.fakes.events().is_empty(),
+        "{:?}",
+        world.fakes.events()
+    );
     let outcome = cmd_reattach(
         &world.ports(),
         &t("ws4", 2),

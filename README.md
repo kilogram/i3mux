@@ -94,11 +94,11 @@ its shell while its terminal has 0 rows or 0 columns, or is gone: shpool
 
 A window follows its session to a new host (see "Move a session to
 another host"). Each time its attach ends, it asks i3mux where its
-session is bound. If that is another host, which has the window's shell,
-the window says so and attaches the shell there. While that host does
-not answer, the window waits for it and never attaches on its old host.
-A window that runs a window command does not do this: its command
-decides.
+session is bound. If that is another host, the window says so and
+attaches its shell there. If that host does not answer, the window
+reconnects to it as to any remote host (see "Remote hosts"), and never
+attaches on its old host. A window that runs a window command does not
+do this: its command decides.
 
 ## Window commands
 
@@ -310,15 +310,13 @@ Measurements and the full design are in
 | 3 | `status`: the focused workspace is not bound |
 | 4 | The shell the command names does not exist on its host |
 | 5 | No workspace is bound to the session the command names |
-| 6 | `reattach`: the window's session moved to a host that does not answer |
 | 7 | `reattach`: the window stays on its host |
 
 Statuses 4 and 5 let a program branch without reading the message: a
 window command can end when its shell is gone, and a mover can treat a
-move of an unbound session as nothing to do. Statuses 6 and 7 are for
-a window's wrapper only. It runs the hidden command `i3mux reattach`
-each time its attach ends. After status 6 it waits for the new host, and
-after 7 it goes on as before.
+move of an unbound session as nothing to do. Status 7 is for a window's
+wrapper only. It runs the hidden command `i3mux reattach` each time its
+attach ends, and after status 7 it goes on as before.
 
 ## Development
 

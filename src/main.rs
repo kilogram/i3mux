@@ -38,12 +38,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use host::{HostExec, HostRunner, RunnerConfig};
-use launch::{
-    Launcher, RemoteAttach, TerminalLauncher, WindowCommand, WrapperOptions, EXIT_FOLLOW_WAIT,
-    EXIT_STAY,
-};
+use launch::{Launcher, RemoteAttach, TerminalLauncher, WindowCommand, WrapperOptions, EXIT_STAY};
 use layout::Step;
-use master::{DirectSsh, Link, MasterState, Masters, SystemdMasters, TrackedMasters};
+use master::{DirectSsh, Link, MasterError, MasterState, Masters, SystemdMasters, TrackedMasters};
 use mux::{Choice, Shell};
 use serde_json::Value;
 use session::{SavedSession, SessionError};
@@ -80,7 +77,7 @@ const DISCONNECT_POLL: Duration = Duration::from_millis(100);
     about = "Persistent terminal sessions for Sway workspaces",
     after_help = "Exit status: 0 success, 1 error, 2 usage error or (attach) several sessions to choose from, \
                   3 (status) the focused workspace is not bound, 4 the shell named does not exist on its host, \
-                  5 no workspace is bound to the session named. See the README for 6 and 7."
+                  5 no workspace is bound to the session named. See the README for 7."
 )]
 struct Cli {
     /// Print what i3mux does on stderr
@@ -192,8 +189,8 @@ enum CliCommand {
         session: Option<String>,
     },
     /// Run by a window's wrapper: print the wrapper argv that attaches the
-    /// window's shell where its session moved (exit 0), or exit 6 (that
-    /// host does not answer) or 7 (the window stays)
+    /// window's shell where its session moved (exit 0), or exit 7 (the
+    /// window stays)
     #[command(hide = true)]
     Reattach {
         /// The window's shell
@@ -1414,32 +1411,42 @@ fn window_command(
     force: bool,
     command: Option<&str>,
 ) -> Result<WindowCommand> {
-    let argv = mux::attach_argv(host, terminal, force, command);
-    let Host::Ssh(remote) = host.host() else {
-        return Ok(WindowCommand::Plain(argv));
+    let link = match host.host() {
+        Host::Local => Link::Direct,
+        Host::Ssh(remote) => ports.masters.ensure_started(remote)?,
     };
-    Ok(match ports.masters.ensure_started(remote)? {
+    Ok(attach_command(host, terminal, force, command, link))
+}
+
+/// The wrapper's attach of `terminal` over `link`: through the master's
+/// unit, with the `--force` argv for after a dropped connection, or plain.
+fn attach_command(
+    host: &dyn HostExec,
+    terminal: &TerminalName,
+    force: bool,
+    command: Option<&str>,
+    link: Link,
+) -> WindowCommand {
+    let argv = mux::attach_argv(host, terminal, force, command);
+    match link {
         Link::Direct => WindowCommand::Plain(argv),
         Link::Shared(unit) => WindowCommand::Remote(RemoteAttach {
             argv,
             reattach: mux::attach_argv(host, terminal, true, command),
             unit,
         }),
-    })
+    }
 }
 
 /// Where a window goes when its attach ends (`i3mux reattach`,
 /// PLAN-migrate decision 9).
 #[derive(Debug)]
 enum Reattach {
-    /// The session moved to a host that has the window's shell: the window
-    /// runs `argv`, the wrapper's attach of the shell there.
+    /// The session is bound to another host: the window runs `argv`, the
+    /// wrapper's attach of the shell there.
     Follow(Follow),
-    /// The session moved to `host`, which does not answer. The window waits
-    /// for it, and never attaches on its old host.
-    Wait { host: Host, error: anyhow::Error },
-    /// The window stays on its host: the session did not move, is bound
-    /// nowhere or twice, or moved to a host that lacks the shell.
+    /// The window stays on its host: the session is bound there, nowhere,
+    /// or on two other hosts.
     Stay,
 }
 
@@ -1456,11 +1463,14 @@ struct Follow {
 ///
 /// It reads the binding, not the window, so it needs no title. The
 /// session moved when no binding of it names `from` and one binding names
-/// another host. Only then does it contact that host: to see that it has
-/// the shell, and to start its ssh master, which the window then uses. It
-/// changes nothing, so it takes no lock, and it never contacts `from`. The
-/// wrapper argv keeps the window's `options`; its attach never takes the
-/// shell from another client (no `--force`).
+/// another host. Then the window follows, whether that host answers or
+/// not: it runs no command there, and only starts the host's ssh master.
+/// A master that does not start keeps retrying under systemd, so the
+/// window gets its unit and recovers as from any lost connection
+/// (plan-ssh-recovery rule 7). It changes nothing, so it takes no lock,
+/// and it never contacts `from`. The wrapper argv keeps the window's
+/// `options`; its attach never takes the shell from another client (no
+/// `--force`).
 fn reattach(
     ports: &Ports,
     shell: &TerminalName,
@@ -1477,30 +1487,23 @@ fn reattach(
         [to] if *to != from => (*to).clone(),
         _ => return Ok(Reattach::Stay),
     };
+    let link = match &to {
+        Host::Local => Link::Direct,
+        Host::Ssh(remote) => match ports.masters.ensure_started(remote) {
+            Ok(link) => link,
+            Err(MasterError::StartFailed { unit, .. }) => Link::Shared(unit),
+            Err(err) => return Err(err.into()),
+        },
+    };
     let exec = (ports.hosts)(&to);
-    let shells = match mux::list(exec.as_ref()) {
-        Ok(shells) => shells,
-        Err(err) => {
-            return Ok(Reattach::Wait {
-                host: to,
-                error: err.into(),
-            })
-        }
-    };
-    if !shells.iter().any(|s| s.name() == shell) {
-        return Ok(Reattach::Stay);
-    }
-    let command = match window_command(ports, exec.as_ref(), shell, false, None) {
-        Ok(command) => command,
-        Err(error) => return Ok(Reattach::Wait { host: to, error }),
-    };
+    let command = attach_command(exec.as_ref(), shell, false, None, link);
     let mark = Mark::new(to, shell.clone());
     let argv = ports.launcher.program_argv(&mark, &command, options);
     Ok(Reattach::Follow(Follow { mark, argv }))
 }
 
 /// `i3mux reattach`: a window that follows prints after the masters'
-/// stop ([`print_follow`]); one that waits says why on stderr.
+/// stop ([`print_follow`]).
 fn cmd_reattach(
     ports: &Ports,
     shell: &TerminalName,
@@ -1509,13 +1512,6 @@ fn cmd_reattach(
 ) -> Result<Outcome> {
     Ok(match reattach(ports, shell, from, options)? {
         Reattach::Follow(follow) => Outcome::Follow(Box::new(follow)),
-        Reattach::Wait { host, error } => {
-            eprintln!(
-                "i3mux: session '{}' moved to {host}, which does not answer: {error:#}",
-                shell.session()
-            );
-            Outcome::Exit(ExitCode::from(EXIT_FOLLOW_WAIT))
-        }
         Reattach::Stay => Outcome::Exit(ExitCode::from(EXIT_STAY)),
     })
 }

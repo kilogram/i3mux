@@ -18,11 +18,10 @@
 # whatever the exit status, it runs `I3MUX reattach --shell SHELL --from
 # HOST`, which never execs:
 #
-#   exit 0    The session moved to a host that has SHELL. reattach printed
-#             its line on stderr and the wrapper argv for that host, as
-#             NUL-terminated words, on stdout. Exec that argv.
-#   exit 6    The session moved to a host that does not answer. Wait for
-#             it, asking again every 5 s, and never attach on HOST again.
+#   exit 0    The session is bound to another host. reattach printed its
+#             line on stderr and the wrapper argv for that host, as
+#             NUL-terminated words, on stdout. Exec that argv. If that host
+#             does not answer, the new wrapper's ssh recovery waits for it.
 #   other     The window stays on HOST: go on as below.
 #
 # A remote window (--remote) attaches SHELL on HOST through the ssh master
@@ -72,10 +71,6 @@ title=$1
 shift
 argv=("$@")
 
-# The status of `i3mux reattach` for a session that moved to a host that
-# does not answer (EXIT_FOLLOW_WAIT in launch.rs).
-follow_wait=6
-
 say() { printf '[i3mux] %s\n' "$*"; }
 clear_screen() { printf '\033[H\033[2J'; }
 
@@ -84,28 +79,16 @@ clear_screen() { printf '\033[H\033[2J'; }
 # fails or is cut while it prints is never taken for a move. Returns when
 # the window stays on HOST.
 follow() {
-    local word key answer follow_status next
-    while :; do
-        answer=()
-        while IFS= read -r -d '' word; do
-            answer+=("$word")
-        done < <("$i3mux" reattach ${options[@]+"${options[@]}"} --shell "$shell" --from "$host"
-            printf '%s\0' "$?")
-        follow_status=${answer[${#answer[@]}-1]}
-        next=("${answer[@]:0:${#answer[@]}-1}")
-        if [ "$follow_status" = 0 ] && [ "${#next[@]}" -gt 0 ]; then
-            exec "${next[@]}"
-        fi
-        [ "$follow_status" = "$follow_wait" ] || return 0
-        say "The session of $shell moved to a host that does not answer. Next try in 5 s."
-        say "Enter: retry now   q: close window"
-        if IFS= read -rsn1 -t 5 key; then
-            case $key in q | Q) exit "$status" ;; esac
-        elif [ $? -le 128 ]; then
-            exit "$status" # end of input: the terminal is gone
-        fi
-        clear_screen
-    done
+    local word answer=() follow_status next
+    while IFS= read -r -d '' word; do
+        answer+=("$word")
+    done < <("$i3mux" reattach ${options[@]+"${options[@]}"} --shell "$shell" --from "$host"
+        printf '%s\0' "$?")
+    follow_status=${answer[${#answer[@]}-1]}
+    next=("${answer[@]:0:${#answer[@]}-1}")
+    if [ "$follow_status" = 0 ] && [ "${#next[@]}" -gt 0 ]; then
+        exec "${next[@]}"
+    fi
 }
 
 # Whether stdin is a terminal with rows and columns, within a second (a new

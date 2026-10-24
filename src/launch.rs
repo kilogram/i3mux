@@ -17,10 +17,11 @@
 //! Every window follows its session to another host (PLAN-migrate decision
 //! 9). Before each rerun of its attach, and after its last end, the wrapper
 //! asks `I3MUX reattach --shell SHELL --from HOST` where the session is.
-//! HOST is a host label: `local`, or the remote host. When the session
-//! moved to a host that has SHELL, reattach prints a wrapper argv for that
-//! host and the wrapper execs it. While that host does not answer
-//! ([`EXIT_FOLLOW_WAIT`]), the wrapper waits and never attaches on HOST.
+//! HOST is a host label: `local`, or the remote host. When the session is
+//! bound to another host, reattach prints a wrapper argv for that host and
+//! the wrapper execs it. If that host does not answer, the new wrapper's
+//! own ssh recovery waits for it. Any other status ([`EXIT_STAY`]) keeps
+//! the window on HOST.
 //!
 //! [`TerminalLauncher::wrapper_argv`] is the only code that builds this
 //! command line. Every word reaches the wrapper as one argument, so nothing
@@ -46,16 +47,10 @@ use crate::window::Mark;
 pub const WRAPPER: &str = include_str!("wrapper.sh");
 const WRAPPER_FILE: &str = "wrapper.sh";
 
-/// Exit status of `i3mux reattach` when the window's session moved to a
-/// host that does not answer. The wrapper then waits for that host, and
-/// never attaches on its own host (the literal `follow_wait=6` in the
-/// wrapper).
-pub const EXIT_FOLLOW_WAIT: u8 = 6;
-
-/// Exit status of `i3mux reattach` when the window stays on its host: the
-/// session did not move, or moved to a host that lacks the window's shell.
-/// The wrapper then takes its usual path. It treats every status other
-/// than 0 and [`EXIT_FOLLOW_WAIT`] the same way.
+/// Exit status of `i3mux reattach` when the window stays on its host: its
+/// session is bound there, nowhere, or on two other hosts. The wrapper
+/// then takes its usual path. It treats every status other than 0 the
+/// same way.
 pub const EXIT_STAY: u8 = 7;
 
 /// What an i3mux window runs.
@@ -441,19 +436,6 @@ mod tests {
     #[test]
     fn plain_terminal_without_command_has_no_options() {
         assert_eq!(window_argv("foot", None, None, &[]), ["foot"]);
-    }
-
-    /// The wrapper's wait status is the one that `i3mux reattach` exits
-    /// with: a mismatch would make a window attach on its old host while
-    /// the session's new host does not answer.
-    #[test]
-    fn the_wrapper_waits_on_the_status_that_reattach_exits_with() {
-        assert!(
-            WRAPPER.contains(&format!("\nfollow_wait={EXIT_FOLLOW_WAIT}\n")),
-            "wrapper.sh and EXIT_FOLLOW_WAIT disagree"
-        );
-        assert_ne!(EXIT_STAY, EXIT_FOLLOW_WAIT);
-        assert_ne!(EXIT_STAY, 0);
     }
 
     #[test]
@@ -1101,38 +1083,39 @@ exit "$(head -n 1 "$answer")"
 
     /// Rule 3 in the wrapper, after a migration. The old host's ssh exits
     /// 75: the window asks reattach before it would start a new shell
-    /// there, waits while the new host does not answer, then follows.
-    /// There ssh exits 255: the window asks again, before and after the
-    /// recovery. The old host gets one attach, the one before the move.
+    /// there, and follows. The new host does not answer: its ssh exits 255,
+    /// the window asks again, then shows the landing page of the new host
+    /// until its link is back, asks once more, and reattaches there. The
+    /// old host gets one attach, the one before the move.
     #[test]
     fn after_a_move_a_window_never_attaches_on_its_old_host() {
         let world = WrapperWorld::new();
         // Show 1: the old wrapper. Show 2: the new one, before its attach.
-        // Show 3 on: the new host's link is back.
+        // Show 3: the new host's link is down. Show 4 on: it is back.
         world.set_unit(Some(1), "active", "running", "A", 0);
         world.set_unit(Some(2), "active", "running", "A", 0);
+        world.set_unit(Some(3), "activating", "auto-restart", "A", 0);
         world.set_unit(None, "active", "running", "B", 1);
         let there = remote_on(
             "dev-box",
             attach("new", "exit 255"),
             attach("new-force", "sleep 2"),
         );
-        world.answer_reattach(1, EXIT_FOLLOW_WAIT, &[]);
-        world.answer_reattach(2, 0, &world.wrapper_argv(&mark_on("dev-box"), &there));
+        world.answer_reattach(1, 0, &world.wrapper_argv(&mark_on("dev-box"), &there));
         let command = remote(attach("old", "exit 75"), attach("old-force", "exit 0"));
 
-        // Enter: the waiting window asks again at once.
-        let out = world.run(&command, "\n", Duration::from_secs(10));
+        let out = world.run(&command, "", Duration::from_secs(10));
 
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
         let (old, new) = (reattach_from("deepthought"), reattach_from("dev-box"));
         assert_eq!(
             world.read("runs"),
-            format!("old\n{old}{old}new\n{new}{new}new-force\n{new}")
+            format!("old\n{old}new\n{new}{new}new-force\n{new}")
         );
         let stdout = text(&out.stdout);
         assert!(
-            stdout.contains("[i3mux] The session of ws4-002 moved to a host that does not answer."),
+            stdout
+                .contains("[i3mux] Connection to dev-box lost. Shell ws4-002 is safe on the host."),
             "{stdout}"
         );
         assert!(!stdout.contains("Starting a new shell"), "{stdout}");
@@ -1163,28 +1146,13 @@ exit "$(head -n 1 "$answer")"
         );
     }
 
-    /// While the new host does not answer, q closes the window with the
-    /// status of the attach that ended, and nothing attaches anywhere.
-    #[test]
-    fn a_waiting_window_closes_on_q() {
-        let world = WrapperWorld::new();
-        world.answer_reattach(1, EXIT_FOLLOW_WAIT, &[]);
-        let command = WindowCommand::Plain(attach("old", "exit 4"));
-
-        let out = world.run(&command, "q", Duration::from_secs(5));
-
-        assert_eq!(out.status.code(), Some(4), "{}", text(&out.stdout));
-        assert_eq!(
-            world.read("runs"),
-            format!("old\n{}", reattach_from("deepthought"))
-        );
-    }
-
     /// A reattach that exits 0 but prints nothing, or prints an argv but
-    /// fails, moves nothing: the window takes its usual path.
+    /// fails (also with the status 6 that an earlier reattach had), moves
+    /// nothing: the window takes its usual path.
     #[test]
     fn a_failed_or_empty_reattach_is_no_move() {
-        for (status, words) in [(0, vec![]), (1, strings(&["bash", "-c", "echo moved"]))] {
+        let moved = strings(&["bash", "-c", "echo moved"]);
+        for (status, words) in [(0, vec![]), (1, moved.clone()), (6, moved)] {
             let world = WrapperWorld::new();
             world.answer_reattach(1, status, &words);
             let command = WindowCommand::Plain(strings(&["sh", "-c", "exit 3"]));
