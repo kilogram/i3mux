@@ -157,6 +157,14 @@ enum CliCommand {
         /// ~, then end the shells on the old host (programs there end)
         #[arg(long, requires = "session", conflicts_with = "force")]
         migrate: bool,
+        /// With --migrate: run CMD on this machine once for each shell of
+        /// the session, and wait for it, instead of starting login shells.
+        /// CMD is split into words as a window command is; {session} and
+        /// {shell} become the names. It must leave that shell in i3mux's
+        /// shpool daemon on the new host, and must not run i3mux, whose
+        /// lock the move holds
+        #[arg(short = 'e', long = "exec", value_name = "CMD", requires = "migrate")]
+        exec: Option<String>,
     },
     /// List the sessions on a host
     Sessions {
@@ -555,13 +563,15 @@ fn dispatch_exit(
             session,
             force,
             migrate: false,
+            ..
         } => cmd_attach(ports, wm, remote, session, force),
         CliCommand::Attach {
             remote,
             session,
             migrate: true,
+            exec,
             ..
-        } => cmd_migrate(ports, remote, session),
+        } => cmd_migrate(ports, remote, session, exec),
         CliCommand::Sessions { remote, all } => cmd_sessions(ports, remote, all),
         CliCommand::Status => cmd_status(ports, wm),
         CliCommand::Open {
@@ -794,14 +804,20 @@ fn cmd_attach(
     }
 }
 
-/// `attach --migrate`: the preview line goes to stderr before anything
-/// changes (PLAN-migrate decision 3), the result to stdout.
-fn cmd_migrate(ports: &Ports, remote: Option<String>, session: Option<String>) -> Result<ExitCode> {
+/// `attach --migrate [-e CMD]`: the preview line goes to stderr before
+/// anything changes (PLAN-migrate decision 3), the result to stdout.
+fn cmd_migrate(
+    ports: &Ports,
+    remote: Option<String>,
+    session: Option<String>,
+    exec: Option<String>,
+) -> Result<ExitCode> {
     let host = Host::from_remote_arg(remote)?;
     let session = parse_session(session)?
         .context("i3mux bug: clap lets --migrate through without --session")?;
+    let command = exec.map(WindowTemplate::new).transpose()?;
     let mut announce = |preview: &Preview| eprintln!("i3mux: {}", format_preview(preview));
-    match migrate(ports, &host, &session, &mut announce)? {
+    match migrate(ports, &host, &session, command.as_ref(), &mut announce)? {
         Migration::AlreadyThere => println!("{session} is already on {host}"),
         Migration::Moved { from, done } => println!(
             "✓ Moved session '{session}' from {from} to {host}: {} of {} started there; {}",
@@ -834,19 +850,20 @@ fn format_preview(preview: &Preview) -> String {
             session,
             from,
             to,
-            missing,
             shells,
+            maker,
         } => {
-            let starts = if *missing == 1 {
-                "starts again there as a login shell"
-            } else {
-                "start again there as login shells"
+            let shells = count(*shells, "shell", "shells");
+            let made = match maker {
+                Maker::LoginShells(1) => {
+                    format!("1 of {shells} starts again there as a login shell in ~")
+                }
+                Maker::LoginShells(missing) => {
+                    format!("{missing} of {shells} start again there as login shells in ~")
+                }
+                Maker::Command => format!("the -e command runs here for each of its {shells}"),
             };
-            format!(
-                "moving {session} from {from} to {to}: {missing} of {} {starts} in ~; \
-                 programs running on {from} end.",
-                count(*shells, "shell", "shells")
-            )
+            format!("moving {session} from {from} to {to}: {made}; programs running on {from} end.")
         }
         Preview::Finish { session, from, to } => format!(
             "finishing the move of {session} from {from} to {to}: programs running on {from} end."
@@ -1794,14 +1811,13 @@ enum Pick {
 /// decision 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Preview {
-    /// A move from `from`: `missing` of its `shells` there start again on
-    /// `to`.
+    /// A move of `shells` shells from `from`, which `maker` makes on `to`.
     Move {
         session: SessionName,
         from: Host,
         to: Host,
-        missing: usize,
         shells: usize,
+        maker: Maker,
     },
     /// A rerun ends the shells that an earlier move left on `from`.
     Finish {
@@ -1809,6 +1825,17 @@ enum Preview {
         from: Host,
         to: Host,
     },
+}
+
+/// Who makes the shells of a move on the new host (PLAN-migrate decision
+/// 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Maker {
+    /// i3mux makes the shells that the new host lacks, this many, as login
+    /// shells.
+    LoginShells(usize),
+    /// The `-e` command, once for each shell of the session.
+    Command,
 }
 
 /// What `attach --migrate` did.
@@ -1828,7 +1855,7 @@ enum Migration {
 struct MoveDone {
     /// The session's shells on the old host, when the move checked.
     shells: usize,
-    /// Of those, the ones the new host lacked and got as login shells.
+    /// Of those, the ones the new host lacked, which it has now.
     started: usize,
     /// The windows that now carry the new host in their mark.
     remarked: usize,
@@ -1841,22 +1868,24 @@ struct MoveDone {
 /// first check to the end (decision 1).
 ///
 /// Every refusal comes before any change (decision 2). Then `announce`
-/// gets the preview, once (decision 3). Step 4 keeps the shells that `to`
-/// has and makes the missing ones as login shells in the home directory;
-/// a failure there ends the shells it made and changes nothing else. Step
-/// 5 moves the binding and records the old host as a pending cleanup, in
-/// one state write, then re-marks the windows. Step 6 ([`clean_up`]) ends
-/// the session on the old host.
+/// gets the preview, once (decision 3). Step 4 ([`make_shells`]) makes
+/// the shells on `to`: `command` (`-e`) runs here once per shell, or else
+/// i3mux keeps the shells that `to` has and makes the missing ones as
+/// login shells in the home directory. A failure there ends the shells it
+/// made and changes nothing else. Step 5 moves the binding and records the
+/// old host as a pending cleanup, in one state write, then re-marks the
+/// windows. Step 6 ([`clean_up`]) ends the session on the old host.
 ///
 /// Each step is safe to repeat, so a rerun after a cut at any point
 /// reaches the same end (decision 7): before step 5 it keeps the shells
-/// made already; after it, it re-marks the windows left and runs step 6.
-/// A move to the host of a pending cleanup cancels that cleanup and keeps
-/// that host's shells.
+/// made already (and runs `command` again); after it, it re-marks the
+/// windows left and runs step 6, without `command`. A move to the host of
+/// a pending cleanup cancels that cleanup and keeps that host's shells.
 fn migrate(
     ports: &Ports,
     to: &Host,
     session: &SessionName,
+    command: Option<&WindowTemplate>,
     announce: &mut dyn FnMut(&Preview),
 ) -> Result<Migration> {
     let mut lock = ports.store.lock()?;
@@ -1872,6 +1901,7 @@ fn migrate(
             session,
             from: left,
             to,
+            command,
         };
         return finish_move(ports, &mut lock, &request, announce);
     }
@@ -1888,6 +1918,7 @@ fn migrate(
         session,
         from: bound,
         to,
+        command,
     };
     move_session(ports, &mut lock, &request, left.is_some(), announce)
 }
@@ -1898,6 +1929,8 @@ struct Move<'a> {
     session: &'a SessionName,
     from: &'a Host,
     to: &'a Host,
+    /// `-e`: what makes the shells on `to`, run here once per shell.
+    command: Option<&'a WindowTemplate>,
 }
 
 /// A rerun of a move whose cleanup of `from` is pending (PLAN-migrate
@@ -1950,7 +1983,11 @@ fn move_session(
         .map(|s| s.name().clone())
         .filter(|name| name.session() == session)
         .collect();
-    let there = answers(new.as_ref(), session)?;
+    let there: Vec<TerminalName> = answers(new.as_ref(), session)?
+        .into_iter()
+        .map(|s| s.name().clone())
+        .filter(|name| name.session() == session)
+        .collect();
     if !returning && session::list(new.as_ref())?.contains(session) {
         return Err(CommandError::MoveTargetSaved {
             session: session.clone(),
@@ -1958,24 +1995,23 @@ fn move_session(
         }
         .into());
     }
-    let missing: Vec<TerminalName> = shells
-        .iter()
-        .filter(|name| !there.iter().any(|s| s.name() == *name))
-        .cloned()
-        .collect();
+    let missing = shells.iter().filter(|name| !there.contains(name)).count();
     announce(&Preview::Move {
         session: session.clone(),
         from: request.from.clone(),
         to: to.clone(),
-        missing: missing.len(),
         shells: shells.len(),
+        maker: match request.command {
+            Some(_) => Maker::Command,
+            None => Maker::LoginShells(missing),
+        },
     });
-    make_shells(new.as_ref(), session, &shells, &missing)?;
+    make_shells(ports, new.as_ref(), request, &shells, &there)?;
     lock.state_mut().migrate(request.workspace, to)?;
     lock.commit()?;
     let done = MoveDone {
         shells: shells.len(),
-        started: missing.len(),
+        started: missing,
         remarked: remark_session(ports, request)?,
         ended: clean_up(lock, request.workspace, old.as_ref(), new.as_ref(), session)?,
     };
@@ -2032,23 +2068,85 @@ fn binding_to_move(
     }
 }
 
-/// Step 4 of a move (PLAN-migrate decision 4): make each shell of
-/// `missing` on `host` as a login shell in the home directory (`shpool
-/// attach -b`, which starts it in `$HOME`), then check that every shell of
-/// `wanted` exists there. On failure, end the shells made here: nothing
-/// else has changed.
+/// Step 4 of a move (PLAN-migrate decision 4): make the shells `wanted`
+/// on `new`, whose shells of the session were `there`, then check that
+/// every shell of `wanted` exists there. With `-e`, the command runs here
+/// once for each shell, and i3mux waits for it; it holds the state lock
+/// meanwhile, so the command must not run i3mux. Without `-e`, i3mux makes
+/// each shell that `new` lacks as a login shell in the home directory
+/// (`shpool attach -b`, which starts it in `$HOME`). On failure, the
+/// session's shells on `new` that were not `there` end: nothing else has
+/// changed.
 fn make_shells(
-    host: &dyn HostExec,
-    session: &SessionName,
+    ports: &Ports,
+    new: &dyn HostExec,
+    request: &Move,
     wanted: &[TerminalName],
-    missing: &[TerminalName],
+    there: &[TerminalName],
 ) -> Result<()> {
-    let mut made = Vec::new();
-    let Err(err) = make_and_check(host, wanted, missing, &mut made) else {
+    let Err(err) = make_and_check(ports, new, request.command, wanted, there) else {
         return Ok(());
     };
+    Err(end_made_shells(new, request.session, there, err))
+}
+
+/// [`make_shells`] up to its check.
+fn make_and_check(
+    ports: &Ports,
+    new: &dyn HostExec,
+    command: Option<&WindowTemplate>,
+    wanted: &[TerminalName],
+    there: &[TerminalName],
+) -> Result<()> {
+    if let Some(command) = command {
+        let here = (ports.hosts)(&Host::Local);
+        for name in wanted {
+            here.run(&command.argv(name), None)
+                .with_context(|| format!("the -e command for shell {name} failed"))?;
+        }
+    } else {
+        for name in wanted.iter().filter(|name| !there.contains(name)) {
+            mux::create(new, name, None)
+                .with_context(|| format!("cannot start shell {name} on {}", new.host()))?;
+        }
+    }
+    let alive = mux::list(new)?;
+    if let Some(gone) = wanted
+        .iter()
+        .find(|name| !alive.iter().any(|s| s.name() == *name))
+    {
+        return Err(CommandError::MoveShellMissing {
+            shell: gone.clone(),
+            host: new.host().clone(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// After step 4 failed with `err`: end the shells of `session` on `host`
+/// that were not `there` before it, and say so in the error.
+fn end_made_shells(
+    host: &dyn HostExec,
+    session: &SessionName,
+    there: &[TerminalName],
+    err: anyhow::Error,
+) -> anyhow::Error {
     let stopped = format!("the move of session '{session}' to {} stopped", host.host());
-    Err(match mux::kill(host, &made) {
+    let made: Vec<TerminalName> = match mux::list(host) {
+        Ok(shells) => shells
+            .into_iter()
+            .map(|s| s.name().clone())
+            .filter(|name| name.session() == session && !there.contains(name))
+            .collect(),
+        Err(list_err) => {
+            return err.context(format!(
+                "{stopped}, and i3mux cannot list the shells there to end the ones it made: \
+                 {list_err:#}"
+            ))
+        }
+    };
+    match mux::kill(host, &made) {
         Ok(()) => err.context(format!(
             "{stopped}: i3mux ended the {} it made there; nothing else changed",
             count(made.len(), "shell", "shells")
@@ -2060,33 +2158,7 @@ fn make_shells(
                 names.join(", ")
             ))
         }
-    })
-}
-
-/// [`make_shells`] up to its check; `made` collects each shell it made.
-fn make_and_check(
-    host: &dyn HostExec,
-    wanted: &[TerminalName],
-    missing: &[TerminalName],
-    made: &mut Vec<TerminalName>,
-) -> Result<()> {
-    for name in missing {
-        mux::create(host, name, None)
-            .with_context(|| format!("cannot start shell {name} on {}", host.host()))?;
-        made.push(name.clone());
     }
-    let alive = mux::list(host)?;
-    if let Some(gone) = wanted
-        .iter()
-        .find(|name| !alive.iter().any(|s| s.name() == *name))
-    {
-        return Err(CommandError::MoveShellMissing {
-            shell: gone.clone(),
-            host: host.host().clone(),
-        }
-        .into());
-    }
-    Ok(())
 }
 
 /// Mark every window of the session on `from` as a window of `to`, on any

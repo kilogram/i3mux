@@ -41,7 +41,13 @@ struct HostState {
     /// Like shpool, a shell that `attach -b` made lists as attached for
     /// this many `list` calls, while its client leaves.
     create_lag: usize,
+    /// Other programs on this host, such as a move's `-e` command: an
+    /// argv it answers for, it runs first.
+    programs: Option<Programs>,
 }
+
+/// Programs of a fake host: `Some` result for an argv they run.
+type Programs = Arc<dyn Fn(&[String]) -> Option<Result<String, HostError>> + Send + Sync>;
 
 impl HostState {
     /// One `list` call passes: lagging detaches take effect.
@@ -131,6 +137,10 @@ impl HostExec for FakeHost {
 
     fn run(&self, argv: &[String], _stdin: Option<&str>) -> Result<String, HostError> {
         self.connect()?;
+        let programs = self.state.lock().unwrap().programs.clone();
+        if let Some(result) = programs.and_then(|run| run(argv)) {
+            return result;
+        }
         let mut state = self.state.lock().unwrap();
         if argv.ends_with(&["list".to_owned(), "--json".to_owned()]) {
             state.advance_detaches();
@@ -922,7 +932,23 @@ struct Moving {
     cut: Arc<Cut>,
     sway: CutSway,
     hosts: Box<HostFactory>,
+    /// The move's `-e` command, if any ([`Moving::with_make`]).
+    command: Option<WindowTemplate>,
 }
+
+/// What the fake `-e` command `make` does for one shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Make {
+    /// Makes it on the new host.
+    Shell,
+    /// Exits 0 and makes nothing.
+    Nothing,
+    /// Fails.
+    Fail,
+}
+
+/// What the fake `make` does, by the shell it gets.
+type MakeOutcome = fn(&str) -> Make;
 
 impl Moving {
     fn new() -> Self {
@@ -968,6 +994,7 @@ impl Moving {
             cut,
             sway,
             hosts,
+            command: None,
         }
     }
 
@@ -979,12 +1006,49 @@ impl Moving {
         }
     }
 
-    /// `attach --migrate` of ws4 to `to`, and the previews it announced.
+    /// A move whose `-e` command is `make {session} {shell}`. It runs on
+    /// this machine, and makes the shell on deepthought unless `outcome`
+    /// says otherwise for that shell. Also returns the argv of each run.
+    fn with_make(outcome: MakeOutcome) -> (Self, Arc<Mutex<Vec<Vec<String>>>>) {
+        let mut moving = Self::new();
+        let runs: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let (new, log) = (moving.new.clone(), Arc::clone(&runs));
+        let programs: Programs = Arc::new(move |argv: &[String]| {
+            if argv.first().map(String::as_str) != Some("make") {
+                return None;
+            }
+            log.lock().unwrap().push(argv.to_vec());
+            let shell = argv.get(2).cloned().unwrap_or_default();
+            Some(match outcome(&shell) {
+                Make::Shell => {
+                    new.add_shell(&shell, false);
+                    Ok(String::new())
+                }
+                Make::Nothing => Ok(String::new()),
+                Make::Fail => Err(HostError::Failed {
+                    host: Host::Local,
+                    code: Some(3),
+                    stderr: "make: no room".into(),
+                    command: argv.join(" "),
+                }),
+            })
+        });
+        moving.world.host.state.lock().unwrap().programs = Some(programs);
+        moving.command = Some(template("make {session} {shell}"));
+        (moving, runs)
+    }
+
+    /// `attach --migrate` of ws4 to `to`, with this world's `-e` command,
+    /// and the previews it announced.
     fn migrate(&self, to: &Host) -> (Result<Migration>, Vec<Preview>) {
         let mut previews = Vec::new();
-        let moved = migrate(&self.ports(), to, &name("ws4"), &mut |p: &Preview| {
-            previews.push(p.clone());
-        });
+        let moved = migrate(
+            &self.ports(),
+            to,
+            &name("ws4"),
+            self.command.as_ref(),
+            &mut |p: &Preview| previews.push(p.clone()),
+        );
         (moved, previews)
     }
 
@@ -1092,20 +1156,25 @@ fn migrate_moves_a_session_and_its_windows_to_the_new_host() {
     assert!(moving.world.launches().is_empty());
 }
 
-/// The preview's wording for one shell, and for a rerun.
+/// The preview's wording for one shell, for `-e`, and for a rerun.
 #[test]
 fn a_move_says_what_will_happen() {
-    let one = Preview::Move {
+    let preview = |maker| Preview::Move {
         session: name("ws3"),
         from: Host::Ssh(RemoteHost::new("s0nny-box").unwrap()),
         to: Host::Ssh(RemoteHost::new("dev-box").unwrap()),
-        missing: 1,
         shells: 2,
+        maker,
     };
     assert_eq!(
-        format_preview(&one),
+        format_preview(&preview(Maker::LoginShells(1))),
         "moving ws3 from s0nny-box to dev-box: 1 of 2 shells starts again there as a login \
          shell in ~; programs running on s0nny-box end."
+    );
+    assert_eq!(
+        format_preview(&preview(Maker::Command)),
+        "moving ws3 from s0nny-box to dev-box: the -e command runs here for each of its 2 \
+         shells; programs running on s0nny-box end."
     );
     let finish = Preview::Finish {
         session: name("ws3"),
@@ -1122,17 +1191,26 @@ fn a_move_says_what_will_happen() {
 /// and Sway operation, then run it again. Every rerun reaches the end of
 /// a whole move. Before the binding moves, only shells on the new host
 /// have changed; once it moved, every shell of the session on the old host
-/// exists on the new one.
+/// exists on the new one. Without `-e`, and with it.
 #[test]
 fn a_move_cut_at_any_step_then_run_again_reaches_the_same_end() {
-    let whole = Moving::new();
+    let world: [fn() -> Moving; 2] = [Moving::new, || Moving::with_make(|_| Make::Shell).0];
+    for moving in world {
+        cut_at_every_step(moving);
+    }
+}
+
+/// The body of [`a_move_cut_at_any_step_then_run_again_reaches_the_same_end`]
+/// for the worlds that `world` makes.
+fn cut_at_every_step(world: fn() -> Moving) {
+    let whole = world();
     whole.migrate(&deepthought()).0.unwrap();
     let operations = whole.cut.ran();
     assert!(operations > 10, "{operations}");
-    let start = Moving::new().end_state();
+    let start = world().end_state();
 
     for cut_at in 0..operations {
-        let moving = Moving::new();
+        let moving = world();
         moving.cut.at(Some(cut_at));
         let (cut_run, _) = moving.migrate(&deepthought());
         assert!(cut_run.is_err(), "cut at {cut_at} of {operations}");
@@ -1374,7 +1452,14 @@ fn a_move_with_a_host_that_does_not_answer_is_refused() {
 fn a_move_of_a_session_bound_nowhere_or_twice_is_refused() {
     let world = World::new(Host::Local);
     let mut ignore = |_: &Preview| {};
-    let err = migrate(&world.ports(), &deepthought(), &name("ws4"), &mut ignore).unwrap_err();
+    let err = migrate(
+        &world.ports(),
+        &deepthought(),
+        &name("ws4"),
+        None,
+        &mut ignore,
+    )
+    .unwrap_err();
     assert!(matches!(
         command_error(&err),
         CommandError::NothingToMove(_)
@@ -1385,7 +1470,14 @@ fn a_move_of_a_session_bound_nowhere_or_twice_is_refused() {
     world.bind("4", "ws4");
     let third = WorkspaceState::new(Host::Ssh(RemoteHost::new("third").unwrap()), name("ws4"));
     world.store.with_lock(|s| Ok(s.bind("5", third)?)).unwrap();
-    let err = migrate(&world.ports(), &deepthought(), &name("ws4"), &mut ignore).unwrap_err();
+    let err = migrate(
+        &world.ports(),
+        &deepthought(),
+        &name("ws4"),
+        None,
+        &mut ignore,
+    )
+    .unwrap_err();
     assert!(
         err.to_string()
             .starts_with("Session 'ws4' is bound in workspaces 4 and 5"),
@@ -1410,8 +1502,8 @@ fn a_shell_that_does_not_start_ends_the_ones_made_and_changes_nothing_else() {
         text.contains("Shell ws4-003 did not start on deepthought"),
         "{text}"
     );
-    // ws4-001 and ws4-003, whose `attach -b` worked before it ended.
-    assert!(text.contains("ended the 2 shells it made there"), "{text}");
+    // ws4-001; ws4-003 ended by itself.
+    assert!(text.contains("ended the 1 shell it made there"), "{text}");
     assert_eq!(moving.end_state(), before);
 
     let failing = Moving::new();
@@ -1423,6 +1515,85 @@ fn a_shell_that_does_not_start_ends_the_ones_made_and_changes_nothing_else() {
         "{err:#}"
     );
     assert_eq!(failing.end_state(), before);
+}
+
+/// PLAN-migrate decision 4, `-e`: the command runs here once for each
+/// shell of the session, also for one that the new host has already, with
+/// the names put in; i3mux makes no shell itself. Then the move goes on as
+/// without `-e`.
+#[test]
+fn a_move_with_e_runs_the_command_here_for_each_shell() {
+    let (moving, runs) = Moving::with_make(|_| Make::Shell);
+
+    let (moved, previews) = moving.migrate(&deepthought());
+
+    assert_eq!(
+        moved.unwrap(),
+        Migration::Moved {
+            from: Host::Local,
+            done: MoveDone {
+                shells: 3,
+                started: 2,
+                remarked: 2,
+                ended: 3
+            }
+        }
+    );
+    let make = |shell: &str| strings(&["make", "ws4", shell]);
+    assert_eq!(
+        *runs.lock().unwrap(),
+        [make("ws4-001"), make("ws4-002"), make("ws4-003")]
+    );
+    assert!(moving.created_on_new().is_empty(), "no login shell");
+    assert_eq!(
+        previews.iter().map(format_preview).collect::<Vec<_>>(),
+        [
+            "moving ws4 from local to deepthought: the -e command runs here for each of its \
+             3 shells; programs running on local end."
+        ]
+    );
+    assert_eq!(moving.end_state(), moved_end());
+}
+
+/// PLAN-migrate decision 4 and rule 1, `-e`: a command that fails, or
+/// that leaves no shell, stops the move. The shells of the session that
+/// the new host did not have before end; the one it had stays, and
+/// nothing else changes.
+#[test]
+fn a_failing_e_command_ends_the_shells_made_and_changes_nothing_else() {
+    let cases: [(MakeOutcome, &str); 2] = [
+        (
+            |shell| {
+                if shell == "ws4-003" {
+                    Make::Fail
+                } else {
+                    Make::Shell
+                }
+            },
+            "the -e command for shell ws4-003 failed",
+        ),
+        (
+            |shell| {
+                if shell == "ws4-003" {
+                    Make::Nothing
+                } else {
+                    Make::Shell
+                }
+            },
+            "Shell ws4-003 did not start on deepthought",
+        ),
+    ];
+    for (outcome, says) in cases {
+        let (moving, _) = Moving::with_make(outcome);
+        let before = moving.end_state();
+
+        let err = moving.migrate(&deepthought()).0.unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(text.contains(says), "{text}");
+        assert!(text.contains("ended the 1 shell it made there"), "{text}");
+        assert_eq!(moving.end_state(), before, "{text}");
+    }
 }
 
 /// A move whose binding has been moved by `LocalState::migrate` and whose
@@ -1441,6 +1612,7 @@ fn moved_with_pending_cleanup() -> Moving {
         session: &name("ws4"),
         from: &Host::Local,
         to: &deepthought(),
+        command: None,
     };
     remark_session(&moving.ports(), &request).unwrap();
     moving
@@ -2281,7 +2453,7 @@ fn a_move_away_from_a_remote_host_stops_its_master() {
     };
 
     with_unused_masters_stopped(&world.store, &world.masters, world.sway.as_ref(), || {
-        migrate(&ports, &Host::Local, &name("ws4"), &mut |_| {})
+        migrate(&ports, &Host::Local, &name("ws4"), None, &mut |_| {})
     })
     .unwrap();
 
@@ -3268,8 +3440,8 @@ fn cli_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
-/// `--migrate` names its session and takes no `--force`; `--rebind-only`
-/// is gone (PLAN-migrate: it replaces it).
+/// `--migrate` names its session and takes no `--force`; `-e` belongs to
+/// it; `--rebind-only` is gone (PLAN-migrate: it replaces it).
 #[test]
 fn migrate_needs_a_session_and_takes_no_force() {
     let parse = |args: &[&str]| Cli::try_parse_from([&["i3mux", "attach"], args].concat());
@@ -3277,6 +3449,8 @@ fn migrate_needs_a_session_and_takes_no_force() {
     assert!(parse(&["--migrate", "--session", "s", "--force"]).is_err());
     assert!(parse(&["--migrate", "--remote", "h", "--session", "s"]).is_ok());
     assert!(parse(&["--migrate", "--session", "s"]).is_ok());
+    assert!(parse(&["--migrate", "--session", "s", "-e", "make {shell}"]).is_ok());
+    assert!(parse(&["--session", "s", "-e", "make {shell}"]).is_err());
     assert!(parse(&["--rebind-only", "--remote", "h", "--session", "s"]).is_err());
 }
 

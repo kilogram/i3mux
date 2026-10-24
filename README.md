@@ -190,6 +190,7 @@ i3mux terminal --here --shell ws3-002           # attach that existing shell her
 
 ```bash
 i3mux attach --remote dev-box --session ws3 --migrate
+i3mux attach --remote dev-box --session ws3 --migrate -e 'make-shell {session} {shell}'
 ```
 
 This moves session `ws3`, in whatever workspace has it, to `dev-box` (no
@@ -225,7 +226,27 @@ behaves as if it had always been on `dev-box`: `detach`, `attach`,
   dev-box` and changes nothing.
 - A program that wants its own shells on the new host, such as shells
   that run a job, makes them there first (see "Shells made by other
-  programs"). The move keeps them.
+  programs"). The move keeps them. Or the move runs it: see `-e`.
+
+### `-e CMD`: a command makes the shells
+
+With `-e CMD`, i3mux makes no shell on the new host. For each shell of
+the session on the old host, it runs CMD on this machine and waits for
+it to end, before the check above.
+
+- CMD is split into words as a window command is, with no shell. In
+  each word, `{session}` becomes the session name (`ws3`) and `{shell}`
+  the name of the shell (`ws3-002`).
+- CMD must leave that shell in i3mux's shpool daemon on the new host
+  (see "Shells made by other programs"). It runs also for a shell that
+  the new host has already, and must then keep that shell or replace it.
+- CMD must not run i3mux. The move holds i3mux's lock until it ends, so
+  i3mux in CMD waits forever.
+- If CMD fails, or a shell is missing on the new host afterwards, the
+  move ends the session's shells there that were not there before it
+  started, and changes nothing else.
+- A rerun that finishes a move whose binding moved already does not
+  run CMD.
 
 ## Shells made by other programs
 
