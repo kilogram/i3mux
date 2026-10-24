@@ -1,11 +1,10 @@
 # Plan: migrate a session to another host
 
-Date: 2026-10-23. Status: draft 2, after architecture and design review.
-kg chose the feature. Open: whether `-e` stays (see Open).
+Date: 2026-10-23. Status: draft 4. kg restored `-e` (decision 4) and cut status 6.
 
 ## Goal
 
-`i3mux attach --session S --remote NEW --migrate` moves session S to host
+`i3mux attach --session S --remote NEW --migrate [-e CMD]` moves session S to host
 NEW while its windows stay open. Afterwards S behaves as if it had always
 been on NEW: `detach`, `attach`, `sessions`, `status` and `kill` find it
 there. Processes do not move. Each shell that NEW lacks starts again there
@@ -30,10 +29,16 @@ It replaces `attach --rebind-only`, which moved only the binding.
 3. **It says what will happen.** One line on stderr first, for example
    `i3mux: moving ws3 from s0nny-box to dev-box: 1 of 2 shells starts
    again there as a login shell in ~; programs running on s0nny-box end.`
-4. **Shells on NEW.** For each shell N of S on the old host, i3mux keeps
-   an N that NEW already has. It makes a missing N as a login shell in the
-   home directory (`shpool attach -b N`). Then it checks that every N
-   exists on NEW. A failure ends the shells that this command made on NEW,
+4. **Shells on NEW.** For each shell N of S on the old host:
+   - With `-e CMD`, i3mux runs CMD here and waits for it. CMD is split into
+     words as a window command is, with no shell. `{session}` becomes S and
+     `{shell}` becomes N. CMD must leave a shell N in i3mux's shpool daemon
+     on NEW ("Shells made by other programs"). It must not run i3mux,
+     which holds its lock.
+   - Without `-e`, i3mux keeps an N that NEW already has, and makes a
+     missing N as a login shell in the home directory (`shpool attach -b
+     N`).
+   Then it checks that every N exists on NEW. A failure ends the shells that this command made on NEW,
    and nothing else changes.
 5. **Commit.** i3mux moves the binding to NEW and records the old host as
    a pending cleanup, in one state write. Then it re-marks the windows.
@@ -52,12 +57,11 @@ It replaces `attach --rebind-only`, which moved only the binding.
    first. That is after every end, for any exit status, and again after
    ssh recovery, before REATTACH. It reads the binding, not the window,
    so it needs no title. It never execs:
-   - Bound to another host that has N: it prints `[i3mux] ws3 moved to
-     dev-box. Attaching ws3-001.` and the new wrapper argv, and exits 0.
-     The wrapper execs that argv.
-   - Bound to another host that does not answer: a distinct status. The
-     wrapper waits for that host, and never attaches on its old host.
-   - Otherwise: a third status. The wrapper takes today's path (ssh
+   - Bound to another host: it prints `[i3mux] ws3 moved to dev-box.
+     Attaching ws3-001.` and the new wrapper argv, and exits 0. The wrapper
+     execs that argv. A new host that does not answer is then the
+     wrapper's usual ssh recovery, on the new host.
+   - Otherwise it exits 7, and the wrapper takes today's path (ssh
      recovery, a replaced daemon, the hint, or `--no-hold`).
 10. **Window commands are their own.** Decision 9 does not change a window
     that runs a window command. That command decides, as before.
@@ -104,14 +108,10 @@ It replaces `attach --rebind-only`, which moved only the binding.
 - The exit status table, for the reattach statuses.
 - The README does not name handoff.
 
-## Open
-
-- **`-e CMD`** (kg proposed it). A program that wants its own shells on NEW
-  can make them first, and `--migrate` keeps them (decision 4). If `-e`
-  comes back, it runs CMD once per shell, with `{session}` and `{shell}`,
-  before the check of decision 4.
-
 ## Later (TODO)
+
+- **Review all copy** (messages, previews, help) for clarity and
+  concision, with handoff's, in one pass (kg, 2026-10-23).
 
 - **Shell command per binding**, like tmux's `default-command` (kg,
   2026-10-23). Every shell that i3mux makes for the session runs it, with
